@@ -1,0 +1,60 @@
+﻿# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.eggs/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Local databases / runtime data
+*.db
+*.sqlite
+*.sqlite3
+
+# Build / dist
+build/
+dist/
+
+# Node / frontend
+node_modules/
+coverage/
+.npm/
+.pnpm-store/
+
+# Misc temp files
+.tmp/
+tmp/
+*.tmp
