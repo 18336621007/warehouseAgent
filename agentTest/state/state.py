@@ -1,4 +1,4 @@
-from agentTest.state.xcom_record import XComRecord
+﻿from agentTest.state.xcom_record import XComRecord
 
 
 class AgentState:
@@ -9,12 +9,20 @@ class AgentState:
         self.query = ""
 
         # DAG Plan
+        self.current_plan = [] #当前计划
+        self.xcom: dict[str, XComRecord] = {} #结果快照
+        self.step_status = {} #该步骤状态
+        self.trace = [] #记录路径
+        self.step_retry = {} #重试次数
+
+
+
+
+    def reset_run(self):
+        """重置状态，这些是每轮对话独享的"""
+        self.query = ""
         self.current_plan = []
-
-        #XCom(跨step数据通信)
-        self.xcom :dict[str, XComRecord] = {}
-
-        # step状态，生命后期c
+        self.xcom = {}
         self.step_status = {}
 
         # 执行轨迹

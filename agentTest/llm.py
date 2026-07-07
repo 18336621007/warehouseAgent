@@ -21,3 +21,14 @@ class LLM:
         )
         return response.choices[0].message.content
 
+
+    def testchat(self, question: str):
+        # 关键：包裹成数组，带上role标识
+        messages = [
+            {"role": "user", "content": question}
+        ]
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+        )
+        return response.choices[0].message.content

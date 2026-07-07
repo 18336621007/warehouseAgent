@@ -49,69 +49,118 @@ class Agent:
             f"step={observation['step_id']} status={observation['status']}"
         )
 
-    def run_execution_loop(self):
-        results = []
-        max_round = 100
-        round_count = 0
-        while round_count < max_round:
-            batch = self.scheduler.get_ready_batch(self.state)
-            if not batch:
-                break
+    def apply_observation(self, observation):
+        """根据step结果更新状态，成功更新XCom记录快照，失败标记失败。最后记录trace"""
+        step_id = observation["step_id"]
+        status = observation["status"]
 
+        self.state.step_status[step_id] = status
+
+        if status == StepStatus.SUCCESS:
+            record = XComRecord(
+                step_id=observation["step_id"],
+                tool=observation["tool"],
+                input_args=observation["input_args"],
+                output=observation["output"],
+                status=observation["status"],
+            )
+            self.state.xcom[step_id] = record
+
+        elif status == StepStatus.FAILED:
+            self.scheduler.mark_failed_propagation(step_id, self.state)
+
+        elif status == StepStatus.RETRY:
+                pass
+
+        self.state.trace.append({
+            "step_id": observation["step_id"],
+            "name": observation["name"],
+            "tool": observation["tool"],
+            "input_args": observation["input_args"],
+            "output": observation["output"],
+            "error": observation["error"],
+            "status": observation["status"]
+        })
+
+
+
+    def build_result_item(self, observation):
+        return {
+            "step_id": observation["step_id"],
+            "name": observation["name"],
+            "tool": observation["tool"],
+            "output": observation["output"],
+            "error": observation["error"],
+            "status": observation["status"]
+        }
+
+    def run_execution_loop(self):
+        """
+            执行工作流主循环，批量调度、执行步骤并更新全局状态，限制最大执行轮次防止死循环
+
+            执行逻辑：
+            1. 循环获取当前就绪可执行的步骤批次；
+            2. 无就绪批次时校验全部任务是否完成，未完成则抛出流程卡死异常；
+            3. 批量执行就绪步骤，获取执行观测结果；
+            4. 依次记录观测、更新状态、组装结果存入列表；
+            5. 达到最大轮次或全部步骤执行完毕后退出循环，返回完整执行结果。
+
+            Returns:
+                list: 所有步骤执行完成后组装的结果条目列表
+
+            Raises:
+                RuntimeError: 无就绪步骤但仍存在未完成任务，工作流发生阻塞卡死
+        """
+        results = []
+        max_round = 100 #最大轮次
+        round_count = 0 #当前轮次
+        while round_count < max_round:
+            # 1. 获取当前就绪可执行的步骤批次
+            batch = self.scheduler.get_ready_batch(self.state)
+
+            # 2. 无就绪批次时校验全部任务是否完成，未完成则抛出流程卡死异常
+            if not batch:
+                if self.scheduler.all_steps_finished(self.state):
+                    break
+
+                unfinished_steps = self.scheduler.get_unfinished_steps(self.state)
+                raise RuntimeError(f"workflow stalled, unfinished steps: {unfinished_steps}")
+
+            # 3. 批量执行就绪步骤，获取执行观测结果
             observations = self.execute_batch(batch, self.state)
 
+            #4.依次记录观测、更新状态、组装结果存入列表
             for obs in observations:
                 self.observe(obs)
+                self.apply_observation(obs)
+                results.append(self.build_result_item(obs))
 
-                if obs["status"] == StepStatus.FAILED:
-                    self.scheduler.mark_failed_propagation(obs["step_id"], self.state)
-
-                if obs["status"] == StepStatus.SUCCESS:
-                    record = XComRecord(
-                        step_id=obs["step_id"],
-                        tool=obs["tool"],
-                        input_args=obs["input_args"],
-                        output=obs["output"],
-                        status=obs["status"],
-                    )
-                    self.state.xcom[obs["step_id"]] = record
-
-                self.state.trace.append({
-                    "step_id": obs["step_id"],
-                    "name": obs["name"],
-                    "tool": obs["tool"],
-                    "input_args": obs["input_args"],
-                    "output": obs["output"],
-                    "error": obs["error"],
-                    "status": obs["status"]
-                })
-
-                results.append({
-                    "step": obs["step_id"],
-                    "name": obs["name"],
-                    "tool": obs["tool"],
-                    "result": obs["output"],
-                    "error": obs["error"],
-                    "status": obs["status"]
-                })
             round_count += 1
 
         return results
 
     def chat(self, text):
-        self.conversation.add_user(text)
+        self.state.reset_run() # 清空状态，保证本轮对话的状态是干净的
+        self.state.query = text
+        self.conversation.add_user(text) # 用户对话加入到conversation
 
+        # 1.生成plan提示词
         messages = self.prompt_builder.build_planner_prompt(
             query=text,
             tools=TOOLS
         )
+        # 2.LLM生成plan，解析为json，并合法性检查
         plan_raw = self.llm.chat(messages)
-        plan = safe_parse_json(plan_raw)
-        plan = validate_plan(plan)
-        self.state.current_plan = plan
+        plan_json = safe_parse_json(plan_raw) #解析为json
+        plan_step_list = validate_plan(plan_json)
+        self.state.current_plan = plan_step_list
 
-        self.scheduler.init(plan, self.state)
+
+        # 3.初始化scheduler
+        self.scheduler.init(plan_step_list, self.state)
+        #4. 执行
         results = self.run_execution_loop()
+
 
         summary_prompt = self.prompt_builder.build_summary_prompt(results)
         answer = self.llm.chat(summary_prompt)
