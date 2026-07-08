@@ -1,6 +1,8 @@
 ﻿from agentTest.state.step_status import StepStatus
 # from agentTest.tools.tool_router import ToolRouter
 import time
+import logging
+logger = logging.getLogger(__name__)
 
 class Executor:
 
@@ -55,6 +57,9 @@ class Executor:
         step_name = plan_step.name
         tool = plan_step.tool
         start_time = time.time()
+        logger.info(
+            f"[STEP_START] step_id={step_id} name={step_name} tool={tool} start_time={start_time}"
+        )
         if not tool:
             raise Exception(f"step {step_id} missing tool")
         #TODO 2. 根据步骤与全局状态构建工具入参

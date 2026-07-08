@@ -13,7 +13,9 @@ from prompt_builder import PromptBuilder
 from executor.executor import Executor
 from shceduler import Scheduler
 from concurrent.futures import ThreadPoolExecutor
+import logging
 
+logger = logging.getLogger(__name__)
 
 class Agent:
 
@@ -65,12 +67,24 @@ class Agent:
                 status=observation["status"],
             )
             self.state.xcom[step_id] = record
+            logger.info(
+                f"[STEP_END] step_id={step_id} status={status} tool={observation['tool']} duration_ms={observation['duration_ms']}")
 
         elif status == StepStatus.FAILED:
             self.scheduler.mark_failed_propagation(step_id, self.state)
-
+            # 简单异常分类
+            error = observation["error"]
+            if error is None:
+                error_type = None
+            elif "missing dependency output" in error:
+                error_type = "dependency_error"
+            else:
+                error_type = "tool_execution_error"
+            logger.error(
+                f"[STEP_FAILED] step_id={step_id} error_type={error_type} error={error}")
         elif status == StepStatus.RETRY:
-                pass
+            logger.warning(
+                f"[STEP_RETRY] step_id={step_id} retry_count={observation['retry_count']} error={observation['error']}")
 
         #简单异常分类
         error = observation["error"]
@@ -170,6 +184,9 @@ class Agent:
                     break
 
                 unfinished_steps = self.scheduler.get_unfinished_steps(self.state)
+                logger.error(
+                    f"[RUN_STALLED] unfinished_steps={unfinished_steps}"
+                )
                 raise RuntimeError(f"workflow stalled, unfinished steps: {unfinished_steps}")
 
             # 3. 批量执行就绪步骤，获取执行观测结果
@@ -188,6 +205,7 @@ class Agent:
     def chat(self, text):
         self.state.reset_run() # 清空状态，保证本轮对话的状态是干净的
         self.state.query = text
+        logger.info((f"[RUN_START] query={text}"))
         self.conversation.add_user(text) # 用户对话加入到conversation
 
         # 1.生成plan提示词
@@ -200,7 +218,10 @@ class Agent:
         plan_json = safe_parse_json(plan_raw) #解析为json
         plan_step_list = validate_plan(plan_json)
         self.state.current_plan = plan_step_list
-
+        logger.info(
+            f"[PLAN_READY] step_count={len(plan_step_list)} "
+            f"steps={[f'{step.id}:{step.name}' for step in plan_step_list]}"
+        )
 
         # 3.初始化scheduler
         self.scheduler.init(plan_step_list, self.state)
@@ -208,8 +229,17 @@ class Agent:
         results = self.run_execution_loop()
 
         self.state.run_summary = self.build_run_summary()
+        logger.info(f"[SUMMARY_INPUT] results={results}")
         summary_prompt = self.prompt_builder.build_summary_prompt(results)
         answer = self.llm.chat(summary_prompt)
+        logger.info(f"[SUMMARY_OUTPUT] answer={answer}")
+        logger.info(
+            f"[RUN_END] run_status={self.state.run_summary['run_status']} "
+            f"total_steps={self.state.run_summary['total_steps']} "
+            f"success_steps={self.state.run_summary['success_steps']} "
+            f"failed_steps={self.state.run_summary['failed_steps']} "
+            f"skipped_steps={self.state.run_summary['skipped_steps']}"
+        )
 
         self.conversation.add_assistant(answer)
 
