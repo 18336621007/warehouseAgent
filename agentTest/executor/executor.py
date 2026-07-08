@@ -1,12 +1,12 @@
 ﻿from agentTest.state.step_status import StepStatus
-from agentTest.tools.tool_router import ToolRouter
-
+# from agentTest.tools.tool_router import ToolRouter
+import time
 
 class Executor:
 
     def __init__(self, tool_registry):
         self.tool_registry = tool_registry
-        self.tool_router = ToolRouter()
+        # self.tool_router = ToolRouter()
 
     def build_args(self, plan_step, state):
         args = {}
@@ -54,6 +54,7 @@ class Executor:
         step_id = plan_step.id
         step_name = plan_step.name
         tool = plan_step.tool
+        start_time = time.time()
         if not tool:
             raise Exception(f"step {step_id} missing tool")
         #TODO 2. 根据步骤与全局状态构建工具入参
@@ -62,6 +63,7 @@ class Executor:
         #TODO 3. 调用工具注册表执行对应工具，成功返回SUCCESS状态结果
         try:
             result = self.tool_registry.execute(tool, args)
+            duration_ms = round((time.time() - start_time) * 1000, 2)
             return {
                 "step_id": step_id,
                 "name": step_name,
@@ -70,12 +72,15 @@ class Executor:
                 "output": result,
                 "error": None,
                 "status": StepStatus.SUCCESS,
+                "duration_ms": duration_ms,
+                "retry_count": state.step_retry.get(step_id, 0)
             }
         # TODO 4. 执行捕获异常：记录重试次数，不足3次标记RETRY等待重跑；达到3次则标记FAILED永久失败。
         except Exception as error:
             retry_count = state.step_retry.get(step_id, 0) + 1
             state.step_retry[step_id] = retry_count
             if retry_count < 3:
+                duration_ms = round((time.time() - start_time) * 1000, 2)
                 return {
                     "step_id": step_id,
                     "name": step_name,
@@ -84,14 +89,19 @@ class Executor:
                     "output": None,
                     "error": str(error),
                     "status": StepStatus.RETRY,
+                    "duration_ms": duration_ms,
+                    "retry_count": retry_count
                 }
-
-            return {
-                "step_id": step_id,
-                "name": step_name,
-                "tool": tool,
-                "input_args": args,
-                "output": None,
-                "error": str(error),
-                "status": StepStatus.FAILED,
-            }
+            else:
+                duration_ms = round((time.time() - start_time) * 1000, 2)
+                return {
+                    "step_id": step_id,
+                    "name": step_name,
+                    "tool": tool,
+                    "input_args": args,
+                    "output": None,
+                    "error": str(error),
+                    "status": StepStatus.FAILED,
+                    "duration_ms": duration_ms,
+                    "retry_count": retry_count
+                }

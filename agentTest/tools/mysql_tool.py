@@ -1,8 +1,8 @@
-import time
-import random
-import sqlite3
-import os
-
+from agentTest.db.db_config import get_mysql_config
+from agentTest.validate.sql_validate import is_read_only_sql
+import pymysql
+from decimal import Decimal
+from datetime import date, datetime, time
 
 class MySQLTool:
 
@@ -10,28 +10,58 @@ class MySQLTool:
 
         # 1.获取参数中的sql
         sql = args.get("sql")
+        isOK, msg = is_read_only_sql(sql)
         if not sql:
             raise Exception(f"[MySQLTool] 缺少sql参数")
+        if not isOK:
+            raise Exception(f"[MySQLTool] {msg}")
 
         # 2.建立连接
-        conn = sqlite3.connect('D:\\code\\Project\\test\\agentTest\\db\\test.db')
+        db_cfg = get_mysql_config()
+        conn = pymysql.connect(
+            host=db_cfg["host"],
+            port=db_cfg["port"],
+            user=db_cfg["user"],
+            password=db_cfg["password"],
+            database=db_cfg["database"],
+            charset=db_cfg["charset"]
+        )
         cursor = conn.cursor()
-        print(f"[MySQLTool] connect to {sql}")
 
-        #3. 执行sql
-        cursor.execute(sql)# 执行sql
-        rows = cursor.fetchall() #取出查询的全部行数据，返回元组列表
+        try:
+            # 3. 执行查询SQL
+            cursor.execute(sql)
+            # 获取字段名
+            columns = [col[0] for col in cursor.description]
+            # 获取所有数据行
+            rows = cursor.fetchall()
 
-        # cursor.description会返回查询字段的元组信息，desc[0]取出每一列的字段名，得到字段名列表["id","name"]
-        columns = [desc[0] for desc in cursor.description]
+            result_rows = []
+            for row in rows:
+                row_dict = {}
+                for column, value in zip(columns, row):
+                    row_dict[column] = normalize_value(value)
+                result_rows.append(row_dict)
 
-
-        result = [
-            dict(zip(columns, row)) #zip(字段列表，单行数据)，变成[{"id":1, "name":"张三"}]
-            for row in rows
-        ]
-
-        conn.close()
+            result = {
+                "columns": columns,
+                "rows": result_rows,
+                "row_count": len(result_rows),
+            }
+        finally:
+            # 无论是否报错，都关闭游标与连接
+            cursor.close()
+            conn.close()
 
         return result
 
+def normalize_value(value):
+    #Decimal转string
+    if isinstance(value, Decimal):
+        return str(value)
+
+    # (datetime, date, time)转
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+
+    return value

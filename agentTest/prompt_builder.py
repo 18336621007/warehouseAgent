@@ -49,7 +49,7 @@ class PromptBuilder:
                     "step": "query_orders",
                     "tool": "mysql_query",
                     "inputs": {{
-                      "table": "orders"
+                      "table": "ods_order_info"
                     }},
                     "depends_on": []
                   }}

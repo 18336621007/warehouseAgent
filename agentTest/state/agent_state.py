@@ -11,9 +11,11 @@ class AgentState:
         # DAG Plan
         self.current_plan = [] #当前计划
         self.xcom: dict[str, XComRecord] = {} #结果快照
-        self.step_status = {} #该步骤状态
+        self.step_status = {} #各个步骤状态
         self.trace = [] #记录路径
-        self.step_retry = {} #重试次数
+        self.step_retry = {} #各个步骤的重试次数
+
+        self.run_summary = {}
 
 
 
@@ -30,4 +32,7 @@ class AgentState:
 
         #重试次数
         self.step_retry = {}
+        self.run_summary = {}
+
+
 

@@ -5,7 +5,7 @@ from agentTest.validate.validator import validate_plan
 from config.tools import TOOLS
 from conversation import Conversation
 from llm import LLM
-from agentTest.state.state import AgentState
+from agentTest.state.agent_state import AgentState
 from tools.mysql_tool import MySQLTool
 from tools.python_tool import PythonTool
 from agentTest.registry.tool_registry import ToolRegistry
@@ -72,6 +72,15 @@ class Agent:
         elif status == StepStatus.RETRY:
                 pass
 
+        #简单异常分类
+        error = observation["error"]
+        if error is None:
+            error_type = None
+        elif "missing dependency output" in error:
+            error_type = "dependency_error"
+        else:
+            error_type = "tool_execution_error"
+
         self.state.trace.append({
             "step_id": observation["step_id"],
             "name": observation["name"],
@@ -79,7 +88,10 @@ class Agent:
             "input_args": observation["input_args"],
             "output": observation["output"],
             "error": observation["error"],
-            "status": observation["status"]
+            "status": observation["status"],
+            "retry_count": observation["retry_count"],
+            "duration_ms": observation["duration_ms"],
+            "error_type": error_type
         })
 
 
@@ -92,6 +104,40 @@ class Agent:
             "output": observation["output"],
             "error": observation["error"],
             "status": observation["status"]
+        }
+
+    def build_run_summary(self):
+
+        statuses = list(self.state.step_status.values())
+
+        total_steps = len(statuses)
+        success_steps = sum(1 for status in statuses if status == StepStatus.SUCCESS)
+        failed_steps = sum(1 for status in statuses if status == StepStatus.FAILED)
+        skipped_steps = sum(1 for status in statuses if status == StepStatus.SKIPPED)
+
+        retry_steps = len({
+            item["step_id"]
+            for item in self.state.trace
+            if item["status"] == StepStatus.RETRY
+        })
+
+        if failed_steps > 0:
+            run_status = "failed"
+        elif skipped_steps > 0:
+            run_status = "partial_success"
+        elif total_steps > 0 and success_steps == total_steps:
+            run_status = "success"
+        else:
+            run_status = "running"
+
+        return {
+            "query": self.state.query,
+            "total_steps": total_steps,
+            "success_steps": success_steps,
+            "failed_steps": failed_steps,
+            "skipped_steps": skipped_steps,
+            "retry_steps": retry_steps,
+            "run_status": run_status
         }
 
     def run_execution_loop(self):
@@ -161,7 +207,7 @@ class Agent:
         #4. 执行
         results = self.run_execution_loop()
 
-
+        self.state.run_summary = self.build_run_summary()
         summary_prompt = self.prompt_builder.build_summary_prompt(results)
         answer = self.llm.chat(summary_prompt)
 

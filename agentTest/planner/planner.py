@@ -13,7 +13,7 @@ class RulePlanner:
                     tool="mysql_query",
                     depends_on=[],
                     inputs={
-                        "sql": "SELECT * FROM orders",
+                        "sql": "SELECT * FROM ods_order_info",
                     },
                 )
             ]
@@ -26,7 +26,7 @@ class RulePlanner:
                     tool="mysql_query",
                     depends_on=[],
                     inputs={
-                        "sql": "SELECT * FROM orders",
+                        "sql": "SELECT * FROM ods_order_info",
                     },
                 ),
                 PlanStep(
@@ -35,7 +35,7 @@ class RulePlanner:
                     tool="mysql_query",
                     depends_on=[],
                     inputs={
-                        "sql": "SELECT * FROM users",
+                        "sql": "SELECT * FROM ods_user_info",
                     },
                 ),
                 PlanStep(
