@@ -16,6 +16,8 @@ from shceduler import Scheduler
 from concurrent.futures import ThreadPoolExecutor
 from agentTest.utils.run_dumper import dump_run
 import logging
+from agentTest.datasource.mock_datasource import MockDataSource
+from agentTest.tools.schema_tool import SchemaTool
 
 
 logger = logging.getLogger(__name__)
@@ -26,18 +28,21 @@ class Agent:
         self.llm = LLM()
         self.conversation = Conversation()
         self.state = AgentState()
-        self.mysql_tool = MySQLTool()
-        self.python_tool = PythonTool()
-        self.tool_registry = ToolRegistry(TOOLS)
-
-        self.tool_registry.register("mysql_query", self.mysql_tool)
-        self.tool_registry.register("python_tool", self.python_tool)
 
         self.prompt_builder = PromptBuilder()
-        self.executor = Executor(self.tool_registry)
         self.scheduler = Scheduler()
 
-        self.schema_context_builder = SchemaContextBuilder()
+        #数据源
+        self.datasource = MockDataSource()
+        self.mysql_tool = MySQLTool(self.datasource)
+        self.python_tool = PythonTool()
+        self.schema_tool = SchemaTool(self.datasource)
+        self.schema_context_builder = SchemaContextBuilder(self.schema_tool)
+        #注册工具
+        self.tool_registry = ToolRegistry(TOOLS)
+        self.tool_registry.register("mysql_query", self.mysql_tool)
+        self.tool_registry.register("python_tool", self.python_tool)
+        self.executor = Executor(self.tool_registry)
 
     def execute_batch(self, steps, state):
         results = []

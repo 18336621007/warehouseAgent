@@ -20,8 +20,8 @@ from agentTest.tools.schema_tool import SchemaTool
 }
 """
 class SchemaContextBuilder:
-    def __init__(self):
-        self.schema_tool = SchemaTool()
+    def __init__(self, schema_tool):
+        self.schema_tool = schema_tool
         self.table_retriever = TableRetriever()
         self.column_retriever = ColumnRetriever()
 
