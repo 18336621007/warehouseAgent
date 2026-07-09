@@ -6,7 +6,7 @@ dotenv.load_dotenv()
 
 def get_mysql_config():
     host = os.getenv("MYSQL_HOST")
-    port_raw = os.getenv("MYSQL_PORT", "3306")
+    port = os.getenv("MYSQL_PORT", "3306")
     user = os.getenv("MYSQL_USER")
     password = os.getenv("MYSQL_PASSWORD")
     database = os.getenv("MYSQL_DATABASE")
@@ -27,7 +27,7 @@ def get_mysql_config():
         )
 
     try:
-        port = int(port_raw)
+        port = int(port)
     except ValueError:
         raise ValueError("MYSQL_PORT must be an integer")
 

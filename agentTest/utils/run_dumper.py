@@ -2,6 +2,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+from decimal import Decimal
+from datetime import datetime, date
 
 
 
@@ -40,6 +42,27 @@ def dump_run(query, schema_context, current_plan, trace, run_summary, answer=Non
     output_file = run_dir / f"{run_id}.json"
 
     with output_file.open("w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
+        safe_payload = to_jsonable(payload)
+        json.dump(safe_payload, file, ensure_ascii=False, indent=2)
 
     return str(output_file)
+
+def to_jsonable(value):
+    # 将运行结果递归转换为可 JSON 序列化的基础类型
+    if isinstance(value, Decimal):
+        # 金额类字段建议转 float，便于后续查看
+        return float(value)
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, dict):
+        return {
+            str(key): to_jsonable(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+
+    return value

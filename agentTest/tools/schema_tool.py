@@ -9,16 +9,16 @@ from agentTest.schema.schema_models import (
 
 
 class SchemaTool:
-    # 当前阶段改为基于数据源接口获取 schema 信息
+    # 基于元数据提供者的 schema 工具，向上层统一提供表与字段结构能力
 
-    def __init__(self, datasource):
-        self.datasource = datasource
+    def __init__(self, meta_provider):
+        self.meta_provider = meta_provider
 
     def list_tables(self):
-        return self.datasource.list_tables()
+        return self.meta_provider.list_tables()
 
     def describe_table(self, table_name: str):
-        return self.datasource.describe_table(table_name)
+        return self.meta_provider.describe_table(table_name)
 
     def run(self, args):
         action = args.get("action")

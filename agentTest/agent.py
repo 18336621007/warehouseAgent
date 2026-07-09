@@ -1,4 +1,6 @@
-﻿from agentTest.schema.schema_context_builder import SchemaContextBuilder
+﻿from agentTest.datasource.mysql_datasource import MySQLDataSource
+from agentTest.metadata.mock_metadata_provider import MockMetadataProvider
+from agentTest.schema.schema_context_builder import SchemaContextBuilder
 from agentTest.state.step_status import StepStatus
 from agentTest.state.xcom_record import XComRecord
 from agentTest.validate.safe_parse_json import safe_parse_json
@@ -33,16 +35,19 @@ class Agent:
         self.scheduler = Scheduler()
 
         #数据源
-        self.datasource = MockDataSource()
+        self.datasource = MySQLDataSource()
+        # 元数据
+        self.metadata_provider = MockMetadataProvider()
         self.mysql_tool = MySQLTool(self.datasource)
         self.python_tool = PythonTool()
-        self.schema_tool = SchemaTool(self.datasource)
+        self.schema_tool = SchemaTool(self.metadata_provider)
         self.schema_context_builder = SchemaContextBuilder(self.schema_tool)
         #注册工具
         self.tool_registry = ToolRegistry(TOOLS)
         self.tool_registry.register("mysql_query", self.mysql_tool)
         self.tool_registry.register("python_tool", self.python_tool)
         self.executor = Executor(self.tool_registry)
+
 
     def execute_batch(self, steps, state):
         results = []
