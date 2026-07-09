@@ -56,9 +56,10 @@ class Executor:
         step_id = plan_step.id
         step_name = plan_step.name
         tool = plan_step.tool
+        inputs = plan_step.inputs
         start_time = time.time()
         logger.info(
-            f"[STEP_START] step_id={step_id} name={step_name} tool={tool} start_time={start_time}"
+            f"[STEP_START] step_id={step_id} name={step_name} tool={tool} inputs = {inputs} start_time={start_time}"
         )
         if not tool:
             raise Exception(f"step {step_id} missing tool")

@@ -221,10 +221,10 @@ class Agent:
             tools=TOOLS,
             schema_context = schema_context
         )
-        # 2.LLM生成plan，解析为json，并合法性检查
-        plan_raw = self.llm.chat(messages)
-        plan_json = safe_parse_json(plan_raw) #解析为json
-        plan_step_list = validate_plan(plan_json)
+        # 2.LLM生成plan，解析为json，再解析为PlanStep列表
+        plan_raw = self.llm.chat(messages) # 模型生成plan，预期是json
+        plan_json = safe_parse_json(plan_raw) #把文本解析为json
+        plan_step_list = validate_plan(plan_json) # 把json解析成PlanStep
         self.state.current_plan = plan_step_list
         logger.info(
             f"[PLAN_READY] step_count={len(plan_step_list)} "

@@ -2,6 +2,7 @@ import json
 import re
 
 def safe_parse_json(text: str):
+    """文本解析为json，无法解析就返回空列表"""
     if not text:
         return []
 
