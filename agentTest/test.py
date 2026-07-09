@@ -1,6 +1,9 @@
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from agentTest.tools.schema_tool import SchemaTool
+
 # from agent import Agent
 # from agentTest.llm import LLM
 #
@@ -24,13 +27,3 @@ from openai import OpenAI
 #         print("\nLLM:", answer)
 #
 # if __name__ == "__main__":
-from dotenv import load_dotenv
-from agentTest.tools.mysql_tool import MySQLTool
-
-load_dotenv()
-args = {"sql": ""}
-
-mysql_tool = MySQLTool()
-result = mysql_tool.run(args)
-for row in result["rows"]:
-    print(row,"\n")

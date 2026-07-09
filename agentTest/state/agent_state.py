@@ -16,7 +16,7 @@ class AgentState:
         self.step_retry = {} #各个步骤的重试次数
 
         self.run_summary = {}
-
+        self.schema_context = {}
 
 
 
@@ -33,6 +33,8 @@ class AgentState:
         #重试次数
         self.step_retry = {}
         self.run_summary = {}
+
+        self.schema_context = {}
 
 
 

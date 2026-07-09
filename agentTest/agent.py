@@ -1,4 +1,5 @@
-﻿from agentTest.state.step_status import StepStatus
+﻿from agentTest.schema.schema_context_builder import SchemaContextBuilder
+from agentTest.state.step_status import StepStatus
 from agentTest.state.xcom_record import XComRecord
 from agentTest.validate.safe_parse_json import safe_parse_json
 from agentTest.validate.validator import validate_plan
@@ -33,6 +34,8 @@ class Agent:
         self.prompt_builder = PromptBuilder()
         self.executor = Executor(self.tool_registry)
         self.scheduler = Scheduler()
+
+        self.schema_context_builder = SchemaContextBuilder()
 
     def execute_batch(self, steps, state):
         results = []
@@ -205,13 +208,18 @@ class Agent:
     def chat(self, text):
         self.state.reset_run() # 清空状态，保证本轮对话的状态是干净的
         self.state.query = text
+
         logger.info((f"[RUN_START] query={text}"))
         self.conversation.add_user(text) # 用户对话加入到conversation
+
+        schema_context = self.schema_context_builder.build(text)
+        self.state.schema_context = schema_context
 
         # 1.生成plan提示词
         messages = self.prompt_builder.build_planner_prompt(
             query=text,
-            tools=TOOLS
+            tools=TOOLS,
+            schema_context = schema_context
         )
         # 2.LLM生成plan，解析为json，并合法性检查
         plan_raw = self.llm.chat(messages)
