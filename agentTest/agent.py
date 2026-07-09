@@ -14,7 +14,9 @@ from prompt_builder import PromptBuilder
 from executor.executor import Executor
 from shceduler import Scheduler
 from concurrent.futures import ThreadPoolExecutor
+from agentTest.utils.run_dumper import dump_run
 import logging
+
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +250,17 @@ class Agent:
             f"failed_steps={self.state.run_summary['failed_steps']} "
             f"skipped_steps={self.state.run_summary['skipped_steps']}"
         )
+
+        # 将本轮运行信息落盘，便于后续 debug 和问题复盘
+        dump_file = dump_run(
+            query=self.state.query,
+            schema_context=self.state.schema_context,
+            current_plan=self.state.current_plan,
+            trace=self.state.trace,
+            run_summary=self.state.run_summary,
+            answer=answer
+        )
+        logger.info(f"[RUN_DUMPED] file={dump_file}")
 
         self.conversation.add_assistant(answer)
 

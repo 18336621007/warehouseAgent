@@ -1,4 +1,6 @@
-from utils import Utils
+from agentTest.validate_args import validate_args
+
+
 class ToolRegistry(object):
     def __init__(self, tools_schema):
         self.tools = {}
@@ -13,7 +15,7 @@ class ToolRegistry(object):
 
         #加工具参数校验
         schema  = self.schema[name]["args_schema"]
-        ok, msg = Utils.validate_args(args, schema)
+        ok, msg = validate_args(args, schema)
 
         if not ok:
             raise Exception(f"参数错误:{msg}")
