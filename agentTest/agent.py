@@ -1,5 +1,6 @@
 ﻿from agentTest.datasource.mysql_datasource import MySQLDataSource
 from agentTest.metadata.mock_metadata_provider import MockMetadataProvider
+from agentTest.metadata.mysql_metadata_provider import MySQLMetadataProvider
 from agentTest.schema.schema_context_builder import SchemaContextBuilder
 from agentTest.state.step_status import StepStatus
 from agentTest.state.xcom_record import XComRecord
@@ -37,7 +38,7 @@ class Agent:
         #数据源
         self.datasource = MySQLDataSource()
         # 元数据
-        self.metadata_provider = MockMetadataProvider()
+        self.metadata_provider = MySQLMetadataProvider()
         self.mysql_tool = MySQLTool(self.datasource)
         self.python_tool = PythonTool()
         self.schema_tool = SchemaTool(self.metadata_provider)
