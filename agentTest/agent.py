@@ -35,7 +35,7 @@ class Agent:
         self.prompt_builder = PromptBuilder()
         self.scheduler = Scheduler()
 
-        #数据源
+        #数据源,只负责执行sql
         self.datasource = MySQLDataSource()
         # 元数据
         self.metadata_provider = MySQLMetadataProvider()
@@ -224,8 +224,8 @@ class Agent:
 
         logger.info((f"[RUN_START] query={text}"))
         self.conversation.add_user(text) # 用户对话加入到conversation
-
-        schema_context = self.schema_context_builder.build(text)
+        # 0.获取候选元数据
+        schema_context = self.schema_context_builder.build(text) # 获取候选表/列
         self.state.schema_context = schema_context
 
         # 1.生成plan提示词

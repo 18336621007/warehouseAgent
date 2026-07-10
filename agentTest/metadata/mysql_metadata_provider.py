@@ -19,6 +19,13 @@ class MySQLMetadataProvider(BaseMetadataProvider):
         )
 
     def list_tables(self):
+        """
+        列出所有表
+        :return: {
+                    "table_name": row[0],
+                    "table_comment": row[1] or "",
+                }
+        """
         db_cfg = get_mysql_config()
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -45,6 +52,20 @@ class MySQLMetadataProvider(BaseMetadataProvider):
             conn.close()
 
     def describe_table(self, table_name: str):
+        """
+        解释该表
+        :param table_name: 表名
+        :return: {
+                "table_name": 表名,
+                "table_comment": 表说明,
+                "columns": [
+                    {
+                        "name": 列名,
+                        "type": 类型,
+                        "comment": 列说明,
+                    }
+                ],
+        """
         db_cfg = get_mysql_config()
         conn = self._get_connection()
         cursor = conn.cursor()

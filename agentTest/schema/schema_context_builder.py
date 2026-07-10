@@ -20,6 +20,7 @@ from agentTest.tools.schema_tool import SchemaTool
 }
 """
 class SchemaContextBuilder:
+    """根据元数据获取候选表/列"""
     def __init__(self, schema_tool):
         self.schema_tool = schema_tool
         self.table_retriever = TableRetriever()
