@@ -3,7 +3,7 @@ from agentTest.metadata.base_metadata_provider import BaseMetadataProvider
 from pyhive import hive
 
 class HiveMetadataProvider(BaseMetadataProvider):
-    # Hive 元数据提供者，后续负责读取指定库下的表和字段结构信息
+    # Hive 元数据提供者，后续负责读取指定库下的表和字段结构信息,拿原始meta信息
 
     def __init__(self):
         self.config = get_hive_config()
@@ -28,9 +28,10 @@ class HiveMetadataProvider(BaseMetadataProvider):
             rows = cursor.fetchall()
 
             return [
-                {
+                {   "database_name": self.config["database"],
                     "table_name": row[0],
                     "table_comment": "",
+                    "table_type": ""
                 }
                 for row in rows
             ]
@@ -63,11 +64,15 @@ class HiveMetadataProvider(BaseMetadataProvider):
                     "name": column_name,
                     "type": data_type,
                     "comment": comment or "",
+                    "nullable": None,
+                    "partition_key": False,
                 })
 
             return {
+                "database_name": self.config["database"],
                 "table_name": table_name,
                 "table_comment": "",
+                "table_type": "",
                 "columns": columns,
             }
         finally:

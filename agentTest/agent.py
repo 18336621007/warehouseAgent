@@ -1,4 +1,6 @@
-﻿from agentTest.datasource.mysql_datasource import MySQLDataSource
+﻿from agentTest.datasource.hive_datasource import HiveDataSource
+from agentTest.datasource.mysql_datasource import MySQLDataSource
+from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.metadata.mock_metadata_provider import MockMetadataProvider
 from agentTest.metadata.mysql_metadata_provider import MySQLMetadataProvider
 from agentTest.schema.schema_context_builder import SchemaContextBuilder
@@ -10,7 +12,7 @@ from config.tools import TOOLS
 from conversation import Conversation
 from llm import LLM
 from agentTest.state.agent_state import AgentState
-from tools.mysql_tool import MySQLTool
+from tools.sql_query_tool import SQLQueryTool
 from tools.python_tool import PythonTool
 from agentTest.registry.tool_registry import ToolRegistry
 from prompt_builder import PromptBuilder
@@ -19,6 +21,7 @@ from shceduler import Scheduler
 from concurrent.futures import ThreadPoolExecutor
 from agentTest.utils.run_dumper import dump_run
 import logging
+import os
 from agentTest.datasource.mock_datasource import MockDataSource
 from agentTest.tools.schema_tool import SchemaTool
 
@@ -34,12 +37,17 @@ class Agent:
 
         self.prompt_builder = PromptBuilder()
         self.scheduler = Scheduler()
+        #数据源
+        data_source_type = os.getenv("DATA_SOURCE_TYPE", "mysql").lower()
+        if data_source_type == "hive":
+            self.datasource = HiveDataSource()
+            self.metadata_provider = HiveMetadataProvider()
+        else:
+            self.datasource = MySQLDataSource()
+            self.metadata_provider = MySQLMetadataProvider()
 
-        #数据源,只负责执行sql
-        self.datasource = MySQLDataSource()
-        # 元数据
-        self.metadata_provider = MySQLMetadataProvider()
-        self.mysql_tool = MySQLTool(self.datasource)
+        #声明工具
+        self.mysql_tool = SQLQueryTool(self.datasource)
         self.python_tool = PythonTool()
         self.schema_tool = SchemaTool(self.metadata_provider)
         self.schema_context_builder = SchemaContextBuilder(self.schema_tool)
