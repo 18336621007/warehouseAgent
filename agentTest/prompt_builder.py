@@ -2,10 +2,12 @@
 
 
 class PromptBuilder:
-    # 该类负责构造 planner 和 summary 所需的提示词
+    # 该类负责构造两类提示词：
+    # 1. planner prompt：让模型把用户问题拆成可执行步骤
+    # 2. answer prompt：让模型基于执行结果生成最终回答
 
     def format_schema_context(self, schema_context):
-        # 把候选表和字段上下文格式化成可读文本
+        # 将结构化的候选表/字段上下文格式化成可读文本，供 planner 参考
         if not schema_context or not schema_context.get("candidate_tables"):
             return "未找到明显相关的表结构信息。"
 
@@ -27,7 +29,7 @@ class PromptBuilder:
         return "\n".join(lines)
 
     def _format_schema_rag_context(self, schema_rag_context: list[dict]):
-        # 把 schema RAG 命中文档格式化成简洁提示词片段
+        # 将 schema RAG 命中的文档型上下文压缩成简洁文本，供 planner 做 grounding
         if not schema_rag_context:
             return "无可用的 schema RAG 信息。"
 
@@ -49,7 +51,11 @@ class PromptBuilder:
         return "\n".join(lines)
 
     def build_planner_prompt(self, query, tools, schema_context=None, schema_rag_context=None):
-        # 构造 planner 使用的 messages，显式注入 schema_context 和 schema_rag_context
+        # 组装 planner prompt：
+        # - query：用户问题
+        # - tools：系统允许使用的工具白名单
+        # - schema_context：结构化候选表/字段
+        # - schema_rag_context：文档型 schema 检索结果
         tools_str = json.dumps(tools, ensure_ascii=False, indent=2)
         schema_text = self.format_schema_context(schema_context)
         schema_rag_text = self._format_schema_rag_context(schema_rag_context)
@@ -71,7 +77,8 @@ class PromptBuilder:
 
                 2. tool 必须来自工具列表。
                 3. 生成查库步骤时，优先参考提供的 Schema 上下文选择表和字段。
-                4. 如果无法拆解，返回 []。
+                4. 生成查询步骤时，优先使用 sql_query 工具，不要输出 mysql_tool，也尽量不要输出 mysql_query。
+                5. 如果无法拆解，返回 []。
                 ---
                 工具列表：
                 {tools_str}
@@ -105,7 +112,7 @@ class PromptBuilder:
         ]
 
     def build_summary_prompt(self, results):
-        # 根据执行结果构造总结提示词
+        # 根据执行结果构造总结提示词，要求模型只依据真实执行结果回答
         return [
             {
                 "role": "system",
@@ -124,5 +131,5 @@ class PromptBuilder:
         ]
 
     def build_answer_prompt(self, state):
-        # 复用总结提示词，基于执行痕迹生成最终回答
+        # 从全局 state 中取执行 trace，复用 summary prompt 生成最终回答提示词
         return self.build_summary_prompt(state.trace)
