@@ -17,6 +17,8 @@ class AgentState:
 
         self.run_summary = {}
         self.schema_context = {}
+        #保存检索出来的shcema documents
+        self.schema_rag_context = []
 
 
 
@@ -35,6 +37,7 @@ class AgentState:
         self.run_summary = {}
 
         self.schema_context = {}
+        self.schema_rag_context = []
 
 
 

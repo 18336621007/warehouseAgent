@@ -1,13 +1,12 @@
-import json
-from datetime import datetime
+﻿import json
+from datetime import datetime, date
 from pathlib import Path
 from uuid import uuid4
 from decimal import Decimal
-from datetime import datetime, date
 
 
 
-def dump_run(query, schema_context, current_plan, trace, run_summary, answer=None):
+def dump_run(query, trace, schema_context=None, schema_rag_context=None, plan=None, run_summary=None, answer=None):
     # 生成本轮运行唯一 id，便于后续排查问题
     run_id = uuid4().hex
 
@@ -20,21 +19,22 @@ def dump_run(query, schema_context, current_plan, trace, run_summary, answer=Non
 
     # 将 PlanStep 对象转换为可序列化字典
     serialized_plan = []
-    for step in current_plan or []:
+    for step in plan or []:
         if hasattr(step, "to_dict"):
             serialized_plan.append(step.to_dict())
         else:
             serialized_plan.append(step)
 
-    # 组装最终落盘内容
+    # 组装最终落盘内容，保留 schema_context 和 schema_rag_context 便于回放分析
     payload = {
         "run_id": run_id,
         "created_at": created_at,
         "query": query,
-        "schema_context": schema_context,
+        "schema_context": schema_context or {},
+        "schema_rag_context": schema_rag_context or [],
         "current_plan": serialized_plan,
-        "trace": trace,
-        "run_summary": run_summary,
+        "trace": trace or [],
+        "run_summary": run_summary or {},
         "answer": answer
     }
 
@@ -47,10 +47,10 @@ def dump_run(query, schema_context, current_plan, trace, run_summary, answer=Non
 
     return str(output_file)
 
+
 def to_jsonable(value):
     # 将运行结果递归转换为可 JSON 序列化的基础类型
     if isinstance(value, Decimal):
-        # 金额类字段建议转 float，便于后续查看
         return float(value)
 
     if isinstance(value, (datetime, date)):

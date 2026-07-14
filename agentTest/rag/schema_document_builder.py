@@ -1,21 +1,14 @@
-"""
-{
-    "doc_id": "hive:test.agent_order_demo",
-    "source": "hive_metadata",
-    "database_name": "test",
-    "table_name": "agent_order_demo",
-    "table_comment": "",
-    "summary": "test.agent_order_demo，包含字段：order_id、pay_amt、pay_time、city、order_status",
-    "content": "数据库: test\n表名: agent_order_demo\n表说明: 无\n字段列表:\n- order_id string 订单ID\n- pay_amt decimal(10,2) 支付金额\n- pay_time string 支付时间\n- city string 城市\n- order_status string 订单状态",
-    "column_count": 5,
-    "columns": [...],
-    "keywords": ["test", "agent_order_demo", "order_id", "pay_amt", "pay_time", "city", "order_status"]
-}
+﻿"""
+该文件负责把单表 schema 转成可供 RAG 使用的文档。
+文档内容会被后续检索器和 planner 共同消费。
 """
 
+
 class SchemaDocumentBuilder:
-    """负责把单标schema转成可供RAG使用的文档"""
+    """负责把单表 schema 转成可供 RAG 使用的文档。"""
+
     def build_table_document(self, table_schema: dict):
+        # 提取单表基础信息，构造稳定的文档结构
         database_name = table_schema.get("database_name", "")
         table_name = table_schema.get("table_name", "")
         table_comment = table_schema.get("table_comment", "")
@@ -23,8 +16,10 @@ class SchemaDocumentBuilder:
         doc_id = f"hive:{database_name}.{table_name}"
 
         if table_comment:
+            # 有表注释时优先使用表注释作为摘要
             summary = f"{database_name}.{table_name}，{table_comment}"
         else:
+            # 没有表注释时用前几个字段名生成兜底摘要
             preview_columns = [column.get("name", "") for column in columns[:5]]
             preview_text = "、".join([name for name in preview_columns if name])
             summary = f"{database_name}.{table_name}，包含字段：{preview_text}"
@@ -43,15 +38,15 @@ class SchemaDocumentBuilder:
 
         content = "\n".join(lines)
 
-
-        # 检索可用，表名，数据库名，字段名
+        # 检索可用关键词包含数据库名、表名和字段名
         keywords = [database_name, table_name]
 
         for column in columns:
             column_name = column.get("name", "")
             if column_name:
                 keywords.append(column_name)
-        #去重
+
+        # 去重并去除空字符串，保证关键词列表干净
         keywords = list(dict.fromkeys([keyword for keyword in keywords if keyword]))
 
         return {

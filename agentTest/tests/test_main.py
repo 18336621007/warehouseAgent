@@ -1,4 +1,6 @@
-﻿from agentTest.tests.test_hive_sql_guardrails import run_hive_sql_guardrails_tests
+﻿from agentTest.tests.test_agent_schema_rag import run_agent_schema_rag_tests
+from agentTest.tests.test_hive_sql_guardrails import run_hive_sql_guardrails_tests
+from agentTest.tests.test_planner_prompt_schema_rag import run_planner_prompt_schema_rag_tests
 from agentTest.tests.test_planner_validation import run_planner_validation_tests
 from agentTest.tests.test_schema_context import run_schema_context_tests
 from agentTest.tests.test_tool_validation import run_tool_validation_tests
@@ -60,7 +62,15 @@ def main():
     # total_count += count
 
     #schema document 检索测试
-    passed, count = run_schema_document_retriever_tests()
+    # passed, count = run_schema_document_retriever_tests()
+    # total_passed += passed
+    # total_count += count
+
+    # passed, count = run_agent_schema_rag_tests()
+    # total_passed += passed
+    # total_count += count
+
+    passed, count = run_planner_prompt_schema_rag_tests()
     total_passed += passed
     total_count += count
 

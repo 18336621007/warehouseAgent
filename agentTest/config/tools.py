@@ -1,5 +1,5 @@
 ﻿TOOLS = {
-    "mysql_query": {
+    "sql_query": {
         "description": "只读SQL查询工具，返回标准结构化查询结果",
         "args_schema": {
             "type": "object",
@@ -11,22 +11,6 @@
             },
             "required": ["sql"]
         }
-    },
-    "python_tool": {
-        "description": "执行Python数据处理逻辑（用于聚合、计算、join等）",
-        "args_schema": {
-            "type": "object",
-            "properties": {
-                "data": {
-                    "type": "object",
-                    "description": "输入数据，来自上游step_results"
-                },
-                "expression": {
-                    "type": "string",
-                    "description": "计算逻辑描述（可选）"
-                }
-            },
-            "required": ["data"]
-        }
     }
+
 }
