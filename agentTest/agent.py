@@ -44,7 +44,6 @@ class Agent:
         self.llm = LLM()
         self.conversation = Conversation()
         self.state = AgentState()
-
         self.prompt_builder = PromptBuilder()
         self.scheduler = Scheduler()
 
@@ -60,10 +59,11 @@ class Agent:
             self.metadata_provider = MySQLMetadataProvider()
 
         # 3. 初始化 schema 能力组件：
-        # - SchemaContextBuilder：生成候选表/字段上下文
-        # - SchemaDocumentBuilder：把表结构转成 schema documents
-        # - SchemaSnapshotService：批量构建 schema 文档快照
-        # - SchemaDocumentRetriever：按 query 检索相关 schema 文档
+        # - SchemaTool：元数据访问适配层
+        # - SchemaContextBuilder：生成最相关的候选表/字段集合，返回供 planner 使用的结构化 schema 上下文
+        # - SchemaDocumentBuilder：把表结构转成rag可用的 schema documents
+        # - SchemaSnapshotService：批量构建 schema documents快照
+        # - SchemaDocumentRetriever：按 query 检索相关 schema documents
         self.schema_tool = SchemaTool(self.metadata_provider)
         self.schema_context_builder = SchemaContextBuilder(self.schema_tool)
         self.schema_document_builder = SchemaDocumentBuilder()
@@ -72,18 +72,15 @@ class Agent:
 
         # 4. 初始化工具执行链路：
         # - SQLQueryTool：执行只读 SQL
-        # - PythonTool：执行 Python 数据处理逻辑
         # - ToolRegistry：按工具名注册和路由工具
         # - Executor：执行单个计划步骤
         self.sql_query_tool = SQLQueryTool(self.datasource)
-        self.python_tool = PythonTool()
         self.tool_registry = ToolRegistry(TOOLS)
 
         # 当前先保留 sql_query 和 mysql_query 的兼容注册，
         # 避免模型偶尔输出旧工具名时直接导致执行失败。
         self.tool_registry.register("sql_query", self.sql_query_tool)
         self.tool_registry.register("mysql_query", self.sql_query_tool)
-        self.tool_registry.register("python_tool", self.python_tool)
         self.executor = Executor(self.tool_registry)
 
     def execute_batch(self, steps, state):

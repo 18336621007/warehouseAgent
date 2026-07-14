@@ -27,6 +27,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
         return table_name in ALLOWED_HIVE_TABLES
 
     def list_tables(self):
+        # 列出所有表
         conn = self._get_connection()
         cursor = conn.cursor()
 

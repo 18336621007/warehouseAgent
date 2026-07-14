@@ -1,6 +1,9 @@
 ﻿from agentTest.schema.column_retriever import ColumnRetriever
 from agentTest.schema.table_retriever import TableRetriever
-
+# SchemaContextBuilder 负责根据用户问题构建结构化 schema 上下文。
+# 它会先从 SchemaTool 获取当前可见表的原始元数据，再通过表召回和字段召回，
+# 将全量元数据压缩成当前 query 最相关的候选表/字段集合，
+# 供 planner 在生成步骤时优先参考。
 
 class SchemaContextBuilder:
     # 根据元数据获取候选表和候选字段，为 planner 提供稳定 schema 上下文
@@ -10,7 +13,11 @@ class SchemaContextBuilder:
         self.column_retriever = ColumnRetriever()
 
     def build(self, query: str):
-        # 获取所有表，再基于问题召回候选表
+        # 根据 query 构建结构化 schema_context：
+        # 1. 获取当前可见表列表
+        # 2. 召回最相关的候选表
+        # 3. 获取候选表结构并召回候选字段
+        # 4. 返回供 planner 使用的结构化 schema 上下文
         tables = self.schema_tool.list_tables()
         candidate_tables = self.table_retriever.retrieve(query, tables)
 

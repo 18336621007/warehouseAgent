@@ -5,9 +5,13 @@ logger = logging.getLogger(__name__)
 
 
 class Executor:
+    # Executor 负责执行单个计划步骤，不负责调度顺序：
+    # - 根据 step inputs 构造工具入参
+    # - 通过 ToolRegistry 执行工具
+    # - 将执行结果封装成统一的 observation
 
     def __init__(self, tool_registry):
-        # Executor 只负责执行单个计划步骤，不负责调度步骤先后顺序
+        # tool_registry 负责按工具名查找工具并执行
         self.tool_registry = tool_registry
 
     def _is_step_reference(self, value: str):

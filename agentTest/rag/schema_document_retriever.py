@@ -1,4 +1,7 @@
-﻿class SchemaDocumentRetriever:
+﻿# SchemaDocumentRetriever 负责从 schema documents 中召回与当前问题最相关的文档。
+# 它是当前第一版 schema RAG 的核心检索器，主要基于关键词和多字段打分，
+# 返回最相关的 top_k schema 文档，供 planner prompt 做 grounding。
+class SchemaDocumentRetriever:
     # 该类负责从 schema documents 中召回和问题最相关的文档
     """documents 的结构
     return {
@@ -25,10 +28,12 @@
     }
 
     def _normalize(self, text: str):
-        # 统一转小写字符串，避免空值和大小写影响匹配
+        # 统一文本格式，避免空值和大小写影响匹配结果。
         return str(text or "").strip().lower()
 
     def _score_document(self, query: str, document: dict):
+        # 计算单条 schema document 与 query 的相关性分数。
+        # 当前第一版主要参考 table_name、summary、content、keywords 四类信息。
         # 计算单条 document 的匹配分数
         table_name = self._normalize(document.get("table_name", ""))
         summary = self._normalize(document.get("summary", ""))
@@ -56,6 +61,11 @@
         return score
 
     def retrieve(self, query: str, documents: list[dict], top_k: int = 3):
+        # 根据 query 从 schema documents 中检索最相关的 top_k 文档：
+        # 1. 对每个 document 计算匹配分数
+        # 2. 过滤掉无命中的文档
+        # 3. 按 score 排序返回 top_k
+        # 4. 无明显命中时返回极少量兜底文档
         # 按 query 对 documents 打分并返回前 top_k 条结果
         normalized_query = self._normalize(query)
         scored_documents = []
