@@ -61,7 +61,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
             # 在 metadata 层执行白名单过滤，避免上层拿到非白名单表
             result = [table for table in tables if self._is_allowed_table(table["table_name"])]
             self._tables_cache = result #缓存
-            return list(self._tables_cache)
+            return  [dict(table) for table in self._tables_cache]
         finally:
             cursor.close()
             conn.close()
@@ -110,7 +110,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
                 "columns": columns,
             }
             self._table_schema_cache[table_name] = res
-            return res
+            return copy.deepcopy(self._table_schema_cache[table_name])
         finally:
             cursor.close()
             conn.close()

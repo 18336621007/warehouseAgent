@@ -4,6 +4,7 @@ from agentTest.tests.test_metadata_cache import run_metadata_cache_tests
 from agentTest.tests.test_planner_prompt_schema_rag import run_planner_prompt_schema_rag_tests
 from agentTest.tests.test_planner_validation import run_planner_validation_tests
 from agentTest.tests.test_schema_context import run_schema_context_tests
+from agentTest.tests.test_schema_snapshot_cache import run_schema_snapshot_cache_tests
 from agentTest.tests.test_tool_validation import run_tool_validation_tests
 from agentTest.tests.test_sql_validation import run_sql_validation_tests
 from agentTest.tests.test_hive_metadata_provider import run_hive_metadata_provider_tests
@@ -75,7 +76,11 @@ def main():
     # total_passed += passed
     # total_count += count
 
-    passed, count = run_metadata_cache_tests()
+    # passed, count = run_metadata_cache_tests()
+    # total_passed += passed
+    # total_count += count
+
+    passed, count = run_schema_snapshot_cache_tests()
     total_passed += passed
     total_count += count
 
