@@ -1,7 +1,7 @@
 ﻿import os
 from dotenv import load_dotenv
 from openai import OpenAI
-from agent import Agent
+from agentTest.agent import Agent
 import logging
 from pathlib import Path
 
@@ -45,3 +45,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

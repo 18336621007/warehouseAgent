@@ -11,10 +11,10 @@ from agentTest.conversation import Conversation
 from agentTest.llm import LLM
 from agentTest.state.agent_state import AgentState
 from agentTest.tools.sql_query_tool import SQLQueryTool
-from agentTest.registry.tool_registry import ToolRegistry
-from agentTest.prompt_builder import PromptBuilder
-from agentTest.executor.executor import Executor
-from agentTest.shceduler import Scheduler
+from agentTest.execution.tool_registry import ToolRegistry
+from agentTest.prompt.prompt_builder import PromptBuilder
+from agentTest.execution.executor import Executor
+from agentTest.execution.scheduler import Scheduler
 from agentTest.utils.run_dumper import dump_run
 from agentTest.tools.schema_tool import SchemaTool
 from agentTest.services.schema_grounding_service import SchemaGroundingService
@@ -129,3 +129,4 @@ class Agent:
             answer=answer
         )
         return answer
+

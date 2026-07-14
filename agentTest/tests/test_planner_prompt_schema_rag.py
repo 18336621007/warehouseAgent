@@ -1,7 +1,7 @@
-# 该文件用于测试 planner prompt 是否正确注入 schema RAG 上下文，
+﻿# 该文件用于测试 planner prompt 是否正确注入 schema RAG 上下文，
 # 重点验证 PromptBuilder 生成的提示词中是否包含目标文档的关键信息。
 from agentTest.config.tools import TOOLS
-from agentTest.prompt_builder import PromptBuilder
+from agentTest.prompt.prompt_builder import PromptBuilder
 
 
 planner_prompt_schema_rag_cases = {
