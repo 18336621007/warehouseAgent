@@ -17,6 +17,7 @@ from agentTest.executor.executor import Executor
 from agentTest.shceduler import Scheduler
 from agentTest.utils.run_dumper import dump_run
 from agentTest.tools.schema_tool import SchemaTool
+from agentTest.services.schema_grounding_service import SchemaGroundingService
 from agentTest.services.planning_service import PlanningService
 from agentTest.services.execution_service import ExecutionService
 from agentTest.services.answer_service import AnswerService
@@ -72,22 +73,19 @@ class Agent:
         self.executor = Executor(self.tool_registry)
 
         # 5. 初始化阶段服务：
+        # - SchemaGroundingService：准备 schema_context 和 schema_rag_context
         # - PlanningService：生成 validated plan
         # - ExecutionService：执行 validated plan 并回写 state
         # - AnswerService：基于 trace 生成最终回答
         self.scheduler = Scheduler()
+        self.schema_grounding_service = SchemaGroundingService(
+            self.schema_context_builder,
+            self.schema_snapshot_service,
+            self.schema_document_retriever
+        )
         self.planning_service = PlanningService(self.llm, self.prompt_builder, TOOLS)
         self.execution_service = ExecutionService(self.scheduler, self.executor, self.conversation)
         self.answer_service = AnswerService(self.llm, self.prompt_builder)
-
-    def _build_schema_rag_context(self, query: str):
-        # 输入：
-        # - query：用户问题
-        # 输出：
-        # - retrieved_documents：最相关的 schema documents 列表
-        schema_documents = self.schema_snapshot_service.build_snapshot()
-        retrieved_documents = self.schema_document_retriever.retrieve(query, schema_documents, top_k=3)
-        return retrieved_documents
 
     def chat(self, text):
         # 输入：
@@ -99,31 +97,29 @@ class Agent:
         self.state.reset_run()
         self.state.query = text
 
-        # 1. 生成结构化 schema 上下文，供 planner 精确选择候选表和字段
-        schema_context = self.schema_context_builder.build(text)
+        # 1. 调用 SchemaGroundingService 统一准备 schema grounding 信息
+        schema_context, schema_rag_context = self.schema_grounding_service.prepare(text)
         self.state.schema_context = schema_context
-
-        # 2. 生成 schema RAG 上下文，供 planner 获得文档型 grounding 信息
-        self.state.schema_rag_context = self._build_schema_rag_context(text)
+        self.state.schema_rag_context = schema_rag_context
         print(f"Schema RAG 命中文档数: {len(self.state.schema_rag_context)}")
 
-        # 3. 调用 PlanningService 生成 validated plan
+        # 2. 调用 PlanningService 生成 validated plan
         response, validated_plan = self.planning_service.generate_plan(
             query=text,
             schema_context=schema_context,
-            schema_rag_context=self.state.schema_rag_context
+            schema_rag_context=schema_rag_context
         )
         self.conversation.add_user(text)
         self.conversation.add_assistant(response)
         self.state.current_plan = validated_plan
 
-        # 4. 调用 ExecutionService 按依赖执行计划步骤，并原地更新 state
+        # 3. 调用 ExecutionService 按依赖执行计划步骤，并原地更新 state
         self.execution_service.run(validated_plan, self.state)
 
-        # 5. 调用 AnswerService 基于执行 trace 生成最终回答
+        # 4. 调用 AnswerService 基于执行 trace 生成最终回答
         answer = self.answer_service.answer(self.state)
 
-        # 6. 落盘本轮运行记录，便于后续回放和排查问题
+        # 5. 落盘本轮运行记录，便于后续回放和排查问题
         dump_run(
             query=self.state.query,
             trace=self.state.trace,
