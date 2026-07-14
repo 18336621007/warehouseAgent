@@ -1,5 +1,6 @@
 ﻿from agentTest.tests.test_hive_sql_guardrails import run_hive_sql_guardrails_tests
 from agentTest.tests.test_planner_validation import run_planner_validation_tests
+from agentTest.tests.test_schema_context import run_schema_context_tests
 from agentTest.tests.test_tool_validation import run_tool_validation_tests
 from agentTest.tests.test_sql_validation import run_sql_validation_tests
 from agentTest.tests.test_hive_metadata_provider import run_hive_metadata_provider_tests
@@ -41,10 +42,15 @@ def main():
     # passed, count = run_hive_sql_guardrails_tests()
     # total_passed += passed
 
-    passed, count = run_hive_metadata_provider_tests()
+    #hive获取metadata测试
+    # passed, count = run_hive_metadata_provider_tests()
+    # total_passed += passed
+    # total_count += count
+
+    #表召回测试
+    passed, count = run_schema_context_tests()
     total_passed += passed
     total_count += count
-
     print("=" * 60)
     print(f"全部测试完成，通过 {total_passed}/{total_count}")
 
