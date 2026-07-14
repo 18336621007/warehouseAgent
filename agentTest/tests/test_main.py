@@ -4,6 +4,7 @@ from agentTest.tests.test_schema_context import run_schema_context_tests
 from agentTest.tests.test_tool_validation import run_tool_validation_tests
 from agentTest.tests.test_sql_validation import run_sql_validation_tests
 from agentTest.tests.test_hive_metadata_provider import run_hive_metadata_provider_tests
+from agentTest.tests.test_hive_schema_documents import run_hive_schema_documents_tests
 
 import dotenv
 
@@ -48,11 +49,16 @@ def main():
     # total_count += count
 
     #表召回测试
-    passed, count = run_schema_context_tests()
+    # passed, count = run_schema_context_tests()
+    # total_passed += passed
+    # total_count += count
+    # print("=" * 60)
+    # print(f"全部测试完成，通过 {total_passed}/{total_count}")
+
+    #rag documents 构建测试
+    passed, count = run_hive_schema_documents_tests()
     total_passed += passed
     total_count += count
-    print("=" * 60)
-    print(f"全部测试完成，通过 {total_passed}/{total_count}")
 
 
 if __name__ == "__main__":
