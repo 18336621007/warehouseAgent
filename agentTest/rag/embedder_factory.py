@@ -16,6 +16,8 @@ class EmbedderFactory:
                 model_name=os.getenv("EMBEDDER_MODEL", ""),
                 endpoint=os.getenv("EMBEDDER_ENDPOINT", ""),
                 api_key=os.getenv("EMBEDDER_API_KEY", ""),
+                timeout_seconds=int(os.getenv("EMBEDDER_TIMEOUT_SECONDS", "10")),
+                enable_fallback = os.getenv("EMBEDDER_ENABLE_FALLBACK", "true").lower() == "true"
             )
 
         return SimpleEmbedder()
