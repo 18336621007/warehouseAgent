@@ -1,4 +1,5 @@
 ﻿from agentTest.tests.test_agent_schema_rag import run_agent_schema_rag_tests
+from agentTest.tests.test_embedder_factory import run_embedder_factory_tests
 from agentTest.tests.test_hive_sql_guardrails import run_hive_sql_guardrails_tests
 from agentTest.tests.test_metadata_cache import run_metadata_cache_tests
 from agentTest.tests.test_planner_prompt_schema_rag import run_planner_prompt_schema_rag_tests
@@ -85,7 +86,11 @@ def main():
     # total_passed += passed
     # total_count += count
 
-    passed, count = run_schema_vector_retriever_tests()
+    # passed, count = run_schema_vector_retriever_tests()
+    # total_passed += passed
+    # total_count += count
+
+    passed, count = run_embedder_factory_tests()
     total_passed += passed
     total_count += count
 

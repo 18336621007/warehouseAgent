@@ -1,8 +1,10 @@
 ﻿import math
 import re
 
+from agentTest.rag.base_embedder import BaseEmbedder
 
-class SimpleEmbedder:
+
+class SimpleEmbedder(BaseEmbedder):
     # SimpleEmbedder 负责文本切词、业务词扩展和稀疏向量构建。
     # 当前先使用本地轻量方案跑通链路，后续可替换为真实 embedding 模型。
 

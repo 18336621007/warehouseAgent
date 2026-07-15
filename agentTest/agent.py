@@ -2,6 +2,7 @@
 from agentTest.datasource.mysql_datasource import MySQLDataSource
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.metadata.mysql_metadata_provider import MySQLMetadataProvider
+from agentTest.rag.embedder_factory import EmbedderFactory
 from agentTest.rag.schema_document_builder import SchemaDocumentBuilder
 from agentTest.rag.schema_document_retriever import SchemaDocumentRetriever
 from agentTest.rag.schema_snapshot_service import SchemaSnapshotService
@@ -23,7 +24,6 @@ from agentTest.services.execution_service import ExecutionService
 from agentTest.services.answer_service import AnswerService
 import dotenv
 import os
-from agentTest.rag.simple_embedder import SimpleEmbedder
 from agentTest.rag.schema_vector_index import SchemaVectorIndex
 from agentTest.rag.schema_vector_retriever import SchemaVectorRetriever
 
@@ -68,10 +68,10 @@ class Agent:
         # - SimpleEmbedder: 文本向量器，将文本转化为向量
         # - SchemaVectorIndex: schema 文档索引，将document 转化为向量
         # - SchemaVectorRetriever: 向量召回其，负责基于向量索引召回最相关的 schema documents。
-        self.simple_embedder = SimpleEmbedder()
-        self.schema_vector_index = SchemaVectorIndex(self.simple_embedder)
+        self.embedder = EmbedderFactory.create()
+        self.schema_vector_index = SchemaVectorIndex(self.embedder)
         self.schema_vector_retriever = SchemaVectorRetriever(
-            self.simple_embedder,
+            self.embedder,
             self.schema_vector_index,
         )
 
