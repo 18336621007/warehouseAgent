@@ -23,6 +23,9 @@ from agentTest.services.execution_service import ExecutionService
 from agentTest.services.answer_service import AnswerService
 import dotenv
 import os
+from agentTest.rag.simple_embedder import SimpleEmbedder
+from agentTest.rag.schema_vector_index import SchemaVectorIndex
+from agentTest.rag.schema_vector_retriever import SchemaVectorRetriever
 
 
 dotenv.load_dotenv()
@@ -60,7 +63,18 @@ class Agent:
         self.schema_context_builder = SchemaContextBuilder(self.schema_tool)
         self.schema_document_builder = SchemaDocumentBuilder()
         self.schema_snapshot_service = SchemaSnapshotService(self.schema_tool, self.schema_document_builder)
-        self.schema_document_retriever = SchemaDocumentRetriever()
+        # self.schema_document_retriever = SchemaDocumentRetriever()
+
+        # - SimpleEmbedder: 文本向量器，将文本转化为向量
+        # - SchemaVectorIndex: schema 文档索引，将document 转化为向量
+        # - SchemaVectorRetriever: 向量召回其，负责基于向量索引召回最相关的 schema documents。
+        self.simple_embedder = SimpleEmbedder()
+        self.schema_vector_index = SchemaVectorIndex(self.simple_embedder)
+        self.schema_vector_retriever = SchemaVectorRetriever(
+            self.simple_embedder,
+            self.schema_vector_index,
+        )
+
 
         # 4. 初始化工具执行链路：
         # - SQLQueryTool：执行只读 SQL
@@ -74,15 +88,16 @@ class Agent:
 
         # 5. 初始化阶段服务：
         # - SchemaGroundingService：准备 schema_context 和 schema_rag_context
-        # - PlanningService：生成 validated plan
-        # - ExecutionService：执行 validated plan 并回写 state
-        # - AnswerService：基于 trace 生成最终回答
         self.scheduler = Scheduler()
         self.schema_grounding_service = SchemaGroundingService(
             self.schema_context_builder,
             self.schema_snapshot_service,
-            self.schema_document_retriever
+            self.schema_vector_retriever
         )
+
+        # - PlanningService：生成 validated plan
+        # - ExecutionService：执行 validated plan 并回写 state
+        # - AnswerService：基于 trace 生成最终回答
         self.planning_service = PlanningService(self.llm, self.prompt_builder, TOOLS)
         self.execution_service = ExecutionService(self.scheduler, self.executor, self.conversation)
         self.answer_service = AnswerService(self.llm, self.prompt_builder)

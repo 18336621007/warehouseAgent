@@ -10,6 +10,7 @@ from agentTest.tests.test_sql_validation import run_sql_validation_tests
 from agentTest.tests.test_hive_metadata_provider import run_hive_metadata_provider_tests
 from agentTest.tests.test_hive_schema_documents import run_hive_schema_documents_tests
 from agentTest.tests.test_schema_document_retriever import run_schema_document_retriever_tests
+from agentTest.tests.test_schema_vector_retriever import run_schema_vector_retriever_tests
 
 import dotenv
 
@@ -80,7 +81,11 @@ def main():
     # total_passed += passed
     # total_count += count
 
-    passed, count = run_schema_snapshot_cache_tests()
+    # passed, count = run_schema_snapshot_cache_tests()
+    # total_passed += passed
+    # total_count += count
+
+    passed, count = run_schema_vector_retriever_tests()
     total_passed += passed
     total_count += count
 
