@@ -4,10 +4,27 @@
 class SchemaVectorIndex:
     # SchemaVectorIndex 负责将 schema documents 转为分字段向量索引，并提供缓存。
 
-    def __init__(self, embedder):
+    def __init__(self, embedder, embedding_cache=None):
         self.embedder = embedder
-        self._index_cache = None  # 向量索引缓存
+        self.embedding_cache = embedding_cache # 持久化 embedding 缓存 跨进程/重启可用
+        self._index_cache = None  # 内存级向量索引缓存 存的是本轮已经构建好的整份索引 仅当前进程内复用
         self._build_index_count = 0  # 统计索引是否命中缓存
+
+    def _embed_field(self, document: dict, field_name: str, text: str) -> dict[str, float]:
+        # 优先使用持久化 embedding 缓存，未命中时再调用 embedder。
+        if self.embedding_cache is None:
+            return self.embedder.embed(text)
+
+
+        cached_vector = self.embedding_cache.get_field(document, field_name)
+        if cached_vector is not None:
+            return dict(cached_vector)
+
+        vector = self.embedder.embed(text)
+        self.embedding_cache.set_field(document, field_name, vector)
+        return dict(vector)
+
+
 
     def _build_column_names_text(self, document: dict) -> str:
         # 提取所有列名，供字段级检索使用。
@@ -37,12 +54,12 @@ class SchemaVectorIndex:
                 {
                     "doc_id": document.get("doc_id", ""),
                     "document": dict(document),
-                    "table_name_vector": self.embedder.embed(table_name_text),
-                    "table_comment_vector": self.embedder.embed(table_comment_text),
-                    "summary_vector": self.embedder.embed(summary_text),
-                    "keywords_vector": self.embedder.embed(keywords_text),
-                    "content_vector": self.embedder.embed(content_text),
-                    "column_names_vector": self.embedder.embed(column_names_text),
+                    "table_name_vector": self._embed_field(document, "table_name", table_name_text),
+                    "table_comment_vector": self._embed_field(document, "table_comment", table_comment_text),
+                    "summary_vector": self._embed_field(document, "summary", summary_text),
+                    "keywords_vector": self._embed_field(document, "keywords", keywords_text),
+                    "content_vector": self._embed_field(document, "content", content_text),
+                    "column_names_vector": self._embed_field(document, "column_names", column_names_text),
                 }
             )
 

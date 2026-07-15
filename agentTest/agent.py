@@ -5,6 +5,7 @@ from agentTest.metadata.mysql_metadata_provider import MySQLMetadataProvider
 from agentTest.rag.embedder_factory import EmbedderFactory
 from agentTest.rag.schema_document_builder import SchemaDocumentBuilder
 from agentTest.rag.schema_document_retriever import SchemaDocumentRetriever
+from agentTest.rag.schema_embedding_cache import SchemaEmbeddingCache
 from agentTest.rag.schema_snapshot_service import SchemaSnapshotService
 from agentTest.schema.schema_context_builder import SchemaContextBuilder
 from agentTest.config.tools import TOOLS
@@ -29,7 +30,7 @@ from agentTest.rag.schema_vector_retriever import SchemaVectorRetriever
 
 
 dotenv.load_dotenv()
-
+schema_embedding_cache_file = "D:\\code\\Project\\test\\agentTest\\cache\\schema_embedding_cache.json"
 
 class Agent:
 
@@ -66,14 +67,16 @@ class Agent:
         # self.schema_document_retriever = SchemaDocumentRetriever()
 
         # - SimpleEmbedder: 文本向量器，将文本转化为向量
+        # - SchemaEmbeddingCache chema embedding 持久化缓存
         # - SchemaVectorIndex: schema 文档索引，将document 转化为向量
         # - SchemaVectorRetriever: 向量召回其，负责基于向量索引召回最相关的 schema documents。
         self.embedder = EmbedderFactory.create()
-        self.schema_vector_index = SchemaVectorIndex(self.embedder)
-        self.schema_vector_retriever = SchemaVectorRetriever(
-            self.embedder,
-            self.schema_vector_index,
+        self.schema_embedding_cache = SchemaEmbeddingCache(schema_embedding_cache_file)
+        self.schema_vector_index = SchemaVectorIndex(self.embedder, self.schema_embedding_cache)
+        self.schema_vector_retriever = SchemaVectorRetriever(self.embedder,self.schema_vector_index,
         )
+
+
 
 
         # 4. 初始化工具执行链路：
