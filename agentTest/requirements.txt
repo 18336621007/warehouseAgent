@@ -1,3 +1,9 @@
 openai
 python-dotenv
 pymysql
+
+langchain
+langchain-core
+langchain-community
+faiss-cpu
+langchain-openai

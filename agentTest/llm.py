@@ -1,7 +1,9 @@
-#LLM
+﻿#LLM
 from openai import OpenAI
 import os
+import dotenv
 
+dotenv.load_dotenv()
 
 class LLM:
     def __init__(self):
@@ -22,13 +24,23 @@ class LLM:
         return response.choices[0].message.content
 
 
-    def testchat(self, question: str):
-        # 关键：包裹成数组，带上role标识
-        messages = [
-            {"role": "user", "content": question}
-        ]
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-        )
-        return response.choices[0].message.content
+    # 简要注释：适配 LangChain Prompt 结果并复用现有 chat 调用。
+    def invoke(self, prompt_value):
+        messgaes = []
+
+        # 简要注释：把 LangChain 消息对象转换成 OpenAI chat messages 格式。
+        for message in prompt_value.messages:
+            role = "user"
+            if message.type == "system":
+                role = "system"
+            elif message.type == "human":
+                role = "user"
+            elif message.type == "ai":
+                role = "assistant"
+
+            messgaes.append({
+                "role": role,
+                "content": message.content,
+            })
+
+        return self.chat(messgaes)
