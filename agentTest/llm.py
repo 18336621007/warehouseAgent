@@ -3,15 +3,17 @@ from openai import OpenAI
 import os
 import dotenv
 
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
+
 dotenv.load_dotenv()
 
 class LLM:
     def __init__(self):
         self.client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
+            api_key=get_openai_api_key(),
+            base_url=get_openai_base_url(),
         )
-        self.model = os.getenv("MODEL_NAME")
+        self.model = get_model_name()
 
     def chat(self, messages):
         response = self.client.chat.completions.create(

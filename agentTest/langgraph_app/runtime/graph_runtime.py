@@ -4,6 +4,7 @@ from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddi
 from agentTest.llm import LLM
 
 def build_graph_runtime():
+
     embedding = BailianEmbeddings()
     app_context = build_schema_rag_app(embedding)
     tools = build_langchain_tools()

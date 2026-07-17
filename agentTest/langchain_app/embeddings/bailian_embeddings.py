@@ -4,15 +4,17 @@ import os
 
 from openai import OpenAI
 
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_embedding_model_name
+
 
 class BailianEmbeddings:
     # 简要注释：初始化百炼 embeddings 客户端。
     def __init__(self):
         self.client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
+            api_key=get_openai_api_key(),
+            base_url=get_openai_base_url(),
         )
-        self.model = os.getenv("EMBEDDING_MODEL")
+        self.model = get_embedding_model_name()
 
     # 简要注释：批量文本向量化，供向量库建索引使用。
     def embed_documents(self, texts):

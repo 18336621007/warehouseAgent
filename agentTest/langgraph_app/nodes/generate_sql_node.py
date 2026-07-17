@@ -5,9 +5,11 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.llm import LLM
 
 def build_generate_sql_node(runtime):
+
     llm = runtime["llm"]
     default_prompt = runtime["prompt"]
     def generate_sql_node(state: AgentState) -> dict:
+
         question = state["question"]
         schema_context = state["schema_context"]
 
@@ -22,7 +24,7 @@ def build_generate_sql_node(runtime):
 
         # 第一次生成走标准SQL生成Prompt，修正轮次补充错误原因
         if retry_count > 0:
-            prompt = ChatPromptTemplate([
+            prompt = ChatPromptTemplate.from_messages([
                 (
                     "system",
                     "你是一个面向 Hive 数仓场景的 SQL 助手。请根据用户问题、schema 信息和上一次 SQL 的错误原因，重新生成更符合 Hive 语法和约束的 SQL。返回纯 SQL，不要包含解释，也不要带结尾分号。"

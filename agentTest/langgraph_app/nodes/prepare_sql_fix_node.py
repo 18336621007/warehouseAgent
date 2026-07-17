@@ -4,9 +4,9 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 
 def prepare_sql_fix_node(state: AgentState):
     retry_count = state.get("retry_count", 0)
-    sql_errors = state.get("sql_errors", "SQL校验失败")
+    sql_error = state.get("sql_error", "SQL校验失败")
 
     return {
-        "retry_count": retry_count,
-        "sql_errors": sql_errors
+        "retry_count": retry_count + 1,
+        "sql_fix_reason": sql_error
     }
