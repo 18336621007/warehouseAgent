@@ -1,14 +1,15 @@
-from langchain_core.prompts import ChatPromptTemplate
+﻿from langchain_core.prompts import ChatPromptTemplate
 
-from agentTest.langchain_app.prompts.sql_generation_prompt import build_sql_generation_prompt
-from agentTest.langgraph_app.runtime.graph_logger import log_node_event
+from agentTest.langgraph_app.runtime.graph_logger import log_node_end
+from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.state.agent_state import AgentState
-from agentTest.llm import LLM
+
 
 def build_generate_sql_node(runtime):
 
     llm = runtime["llm"]
     default_prompt = runtime["prompt"]
+
     def generate_sql_node(state: AgentState) -> dict:
 
         question = state["question"]
@@ -17,7 +18,12 @@ def build_generate_sql_node(runtime):
         retry_count = state.get("retry_count", 0)
         sql_fix_reason = state.get("sql_fix_reason", "")
 
-        log_node_event("generate_sql", f"开始生成SQL，retry_count={retry_count}")
+        # 打印节点开始日志
+        log_node_start(
+            "generate_sql",
+            retry_count=retry_count,
+            question=question,
+        )
 
         prompt = default_prompt
         prompt_input = {
@@ -25,7 +31,7 @@ def build_generate_sql_node(runtime):
             "schema_context": schema_context,
         }
 
-        # 第一次生成走标准SQL生成Prompt，修正轮次补充错误原因
+        # 第一轮使用标准 Prompt，修正轮补充 SQL 错误原因。
         if retry_count > 0:
             prompt = ChatPromptTemplate.from_messages([
                 (
@@ -36,15 +42,18 @@ def build_generate_sql_node(runtime):
                     "human",
                     "用户问题：\n{question}\n\n相关 schema 信息：\n{schema_context}\n\n上一次 SQL 的错误原因：\n{sql_fix_reason}"
                 )
-
             ])
             prompt_input["sql_fix_reason"] = sql_fix_reason
-
 
         prompt_value = prompt.invoke(prompt_input)
         generated_sql = llm.invoke(prompt_value)
 
-        log_node_event("generate_sql", f"SQL生成完成，sql={generated_sql}")
+        # 打印节点结束日志
+        log_node_end(
+            "generate_sql",
+            generated_sql=generated_sql,
+            schema_context_length=len(schema_context),
+        )
         return {
             "generated_sql": generated_sql
         }

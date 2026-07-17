@@ -1,8 +1,8 @@
-# Schema 检索节点，负责根据用户问题召回相关 schema 文档。
-from agentTest.langchain_app.app_builder import build_schema_rag_app
-from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
-from agentTest.langgraph_app.runtime.graph_logger import log_node_event
+﻿# Schema 检索节点，负责根据用户问题召回相关 schema 文档。
+from agentTest.langgraph_app.runtime.graph_logger import log_node_end
+from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.state.agent_state import AgentState
+
 
 def build_retrieve_schema_node(runtime):
 
@@ -12,10 +12,13 @@ def build_retrieve_schema_node(runtime):
 
         question = state["question"]
 
-        log_node_event("retrieve_schema", f"开始检索，question={question}")
+        # 打印节点开始日志
+        log_node_start("retrieve_schema", question=question)
 
         schema_documents = retriever.retrieve(question)
-        log_node_event("retrieve_schema", f"检索完成，documents={len(schema_documents)}")
+
+        # 打印节点结束日志
+        log_node_end("retrieve_schema", documents=len(schema_documents))
 
         return {
             "schema_documents": schema_documents

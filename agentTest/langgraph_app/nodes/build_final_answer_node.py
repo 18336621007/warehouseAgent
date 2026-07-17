@@ -1,35 +1,45 @@
-from langchain_core.prompts import ChatPromptTemplate
+﻿from langchain_core.prompts import ChatPromptTemplate
 
-from agentTest.langgraph_app.runtime.graph_logger import log_node_event
+from agentTest.langgraph_app.runtime.graph_logger import log_node_end
+from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.state.agent_state import AgentState
-from agentTest.llm import LLM
+
 
 def build_build_final_answer_node(runtime):
     llm = runtime["llm"]
+
     def build_final_answer_node(state: AgentState):
 
         sql_valid = state.get("sql_valid", False)
-        log_node_event("build_final_answer", f"开始生成最终回答，sql_valid={sql_valid}")
+
+        # 打印节点开始日志
+        log_node_start("build_final_answer", sql_valid=sql_valid)
+
         question = state.get("question", "")
 
-        # sql校验失败返回error
+        # sql 校验失败直接返回 error
         if not sql_valid:
             sql_error = state.get("sql_error", "SQL校验失败")
+
+            # 打印校验失败分支日志
+            log_node_end("build_final_answer", branch="sql_invalid", sql_error=sql_error)
 
             return {
                 "final_answer": f"本次未执行 SQL 查询，因为生成的 SQL 未通过校验。原因：{sql_error}"
             }
 
-        # sql校验成功
+        # sql 校验成功
         sql_result = state.get("sql_result", {})
         row_count = sql_result.get("row_count", 0) if isinstance(sql_result, dict) else 0
 
         if row_count == 0:
 
+            # 打印空结果分支日志
+            log_node_end("build_final_answer", branch="empty_result", row_count=row_count)
+
             return {
                 "final_answer": "SQL 已成功执行，但没有查询到符合条件的数据。"
             }
-
 
         prompt = ChatPromptTemplate.from_messages([
             (
@@ -49,12 +59,10 @@ def build_build_final_answer_node(runtime):
 
         final_answer = llm.invoke(prompt_value)
 
-        log_node_event("build_final_answer", f"最终回答生成完成.final_answer={final_answer}")
+        # 打印成功分支日志
+        log_node_end("build_final_answer", branch="success", final_answer=final_answer)
         return {
             "final_answer": final_answer,
         }
 
-
     return build_final_answer_node
-
-
