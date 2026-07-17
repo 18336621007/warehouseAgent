@@ -1,0 +1,22 @@
+# 简要注释：LangGraph 最小工作流演示入口，用于本地验证 graph 链路。
+
+from agentTest.langgraph_app.graphs.sql_agent_graph import build_sql_agent_graph
+
+
+# 简要注释：运行最小 SQL Agent Graph。
+def run_demo(question: str):
+    app = build_sql_agent_graph()
+
+    initial_state = {
+        "question": question,
+    }
+
+    result = app.invoke(initial_state)
+    return result
+
+
+# 简要注释：本地示例入口。
+if __name__ == "__main__":
+    question = "查询最近7天订单量最高的商品"
+    result = run_demo(question)
+    print(result)

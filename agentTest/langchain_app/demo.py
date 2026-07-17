@@ -24,3 +24,18 @@ if __name__ == "__main__":
 
     demo_result = run_demo(embeddings, question)
     print(demo_result)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
