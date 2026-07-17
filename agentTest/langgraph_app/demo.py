@@ -19,6 +19,6 @@ def run_demo(question: str):
 
 # 简要注释：本地示例入口。
 if __name__ == "__main__":
-    question = "查询订单量最高的商品"
+    question = "查询订单"
     result = run_demo(question)
     print(result["final_answer"])

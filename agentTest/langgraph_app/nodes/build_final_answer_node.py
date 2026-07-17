@@ -1,5 +1,6 @@
 from langchain_core.prompts import ChatPromptTemplate
 
+from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.llm import LLM
 
@@ -8,6 +9,7 @@ def build_build_final_answer_node(runtime):
     def build_final_answer_node(state: AgentState):
 
         sql_valid = state.get("sql_valid", False)
+        log_node_event("build_final_answer", f"开始生成最终回答，sql_valid={sql_valid}")
         question = state.get("question", "")
 
         # sql校验失败返回error
@@ -47,6 +49,7 @@ def build_build_final_answer_node(runtime):
 
         final_answer = llm.invoke(prompt_value)
 
+        log_node_event("build_final_answer", f"最终回答生成完成.final_answer={final_answer}")
         return {
             "final_answer": final_answer,
         }

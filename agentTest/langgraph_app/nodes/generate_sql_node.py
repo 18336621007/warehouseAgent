@@ -1,6 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate
 
 from agentTest.langchain_app.prompts.sql_generation_prompt import build_sql_generation_prompt
+from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.llm import LLM
 
@@ -15,6 +16,8 @@ def build_generate_sql_node(runtime):
 
         retry_count = state.get("retry_count", 0)
         sql_fix_reason = state.get("sql_fix_reason", "")
+
+        log_node_event("generate_sql", f"开始生成SQL，retry_count={retry_count}")
 
         prompt = default_prompt
         prompt_input = {
@@ -41,7 +44,7 @@ def build_generate_sql_node(runtime):
         prompt_value = prompt.invoke(prompt_input)
         generated_sql = llm.invoke(prompt_value)
 
-
+        log_node_event("generate_sql", f"SQL生成完成，sql={generated_sql}")
         return {
             "generated_sql": generated_sql
         }
