@@ -26,3 +26,9 @@ class AgentState(TypedDict, total=False):
     # 最终回答结果
     final_answer: str
 
+    # 当前sql修正重试次数
+    retry_count: int
+
+    # 当前sql需要修正的原因
+    sql_fix_reason: str
+

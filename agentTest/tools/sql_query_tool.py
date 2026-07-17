@@ -1,4 +1,5 @@
-﻿from agentTest.validate.sql_validate import is_read_only_sql, validate_hive_sql
+﻿from agentTest.langchain_app.utils.sql_cleaner import clear_sql
+from agentTest.validate.sql_validate import is_read_only_sql, validate_hive_sql
 from agentTest.datasource.hive_datasource import HiveDataSource
 
 
@@ -23,6 +24,7 @@ class SQLQueryTool:
             raise ValueError("missing sql")
 
         # 统一清洗 SQL，去掉结尾分号，避免 Hive 解析报错。
+        sql = clear_sql(sql)
         sql = sql.strip().rstrip(";").strip()
 
         # 先做基础只读校验，拦截写入、DDL 等危险语句
