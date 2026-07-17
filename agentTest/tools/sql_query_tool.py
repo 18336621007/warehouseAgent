@@ -22,6 +22,9 @@ class SQLQueryTool:
         if not sql:
             raise ValueError("missing sql")
 
+        # 统一清洗 SQL，去掉结尾分号，避免 Hive 解析报错。
+        sql = sql.strip().rstrip(";").strip()
+
         # 先做基础只读校验，拦截写入、DDL 等危险语句
         is_valid, message = is_read_only_sql(sql)
         if not is_valid:

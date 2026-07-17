@@ -15,8 +15,14 @@ class AgentState(TypedDict, total=False):
     # 模型生成的 SQL。
     generated_sql: str
 
+    # 表示sql是否通过校验
+    sql_valid: bool
+
+    # 记录sql校验失败原因
+    sql_error: str
     # SQL 执行结果。
     sql_result: Any
 
-    # 最终回答结果。
+    # 最终回答结果
     final_answer: str
+

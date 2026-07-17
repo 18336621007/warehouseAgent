@@ -1,11 +1,13 @@
 # 简要注释：LangGraph 最小工作流演示入口，用于本地验证 graph 链路。
 
 from agentTest.langgraph_app.graphs.sql_agent_graph import build_sql_agent_graph
+from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 
 
 # 简要注释：运行最小 SQL Agent Graph。
 def run_demo(question: str):
-    app = build_sql_agent_graph()
+    runtime = build_graph_runtime()
+    app = build_sql_agent_graph(runtime)
 
     initial_state = {
         "question": question,
