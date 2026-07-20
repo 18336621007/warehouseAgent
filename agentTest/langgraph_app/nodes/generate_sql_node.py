@@ -1,5 +1,6 @@
 ﻿from langchain_core.prompts import ChatPromptTemplate
 
+from agentTest.langchain_app.utils.sql_cleaner import clear_sql
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
@@ -54,6 +55,8 @@ def build_generate_sql_node(runtime):
 
             prompt_value = prompt.invoke(prompt_input)
             generated_sql = llm.invoke(prompt_value)
+            #先清晰sql再记录日志，确保日志展示的是实际执行的sql
+            generated_sql = clear_sql(generated_sql)
 
             # 记录节点结束日志
             log_node_end(
