@@ -2,6 +2,8 @@
 
 from typing import List, Any
 
+from agentTest.semantic.semantic_rules import match_semantic_entries, format_semantic_context
+
 
 class SchemaRagChain:
     # 简要注释：初始化 RAG 链。
@@ -25,9 +27,15 @@ class SchemaRagChain:
     # 简要注释：执行检索增强生成。
     def invoke(self, question: str):
         documents = self.retriever.retrieve(question) # 先检索相关的schema文档
-        schema_context = self.format_schema_context(documents) # 把检索到的document 整理成可以拼接给prompt的context文本
+        schema_context = self.format_schema_context(documents) # 把检索到的 document 整理成可以拼接给prompt的context文本
+
+        # 匹配语义条目，生成语义指引
+        matched_entries = match_semantic_entries(question)
+        semantic_context = format_semantic_context(matched_entries)
         prompt_value = self.prompt.invoke({
             "question": question,
             "schema_context": schema_context,
+            "semantic_context": semantic_context
         })
         return self.llm.invoke(prompt_value)
+

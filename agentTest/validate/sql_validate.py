@@ -1,8 +1,8 @@
 ﻿import re
 
 from agentTest.db.hive_guardrails import (
-    ALLOWED_HIVE_DATABASES,
-    ALLOWED_HIVE_TABLES,
+    ALLOWED_DATABASES,
+    ALLOWED_TABLES,
     REQUIRE_LIMIT,
     ALLOW_JOIN,
     ALLOW_WITH,
@@ -106,11 +106,11 @@ def validate_hive_sql(sql: str) -> tuple[bool, str]:
         db_name_lower = db_name.lower()
         table_name_lower = table_name.lower()
 
-        if db_name_lower not in ALLOWED_HIVE_DATABASES:
+        if db_name_lower not in ALLOWED_DATABASES:
             return False, f"Hive 查询访问了非白名单库: {db_name_lower}"
 
         # 如果配置了白名单表，则要求只能访问这些表
-        if ALLOWED_HIVE_TABLES and table_name_lower not in ALLOWED_HIVE_TABLES:
+        if ALLOWED_TABLES and table_name_lower not in ALLOWED_TABLES:
             return False, f"Hive 查询访问了非白名单表: {table_name_lower}"
 
     return True, "Hive SQL 校验通过"

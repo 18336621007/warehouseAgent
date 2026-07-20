@@ -7,7 +7,7 @@ LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 LOG_FILE = LOG_DIR / "langgraph_app.log"
 
 
-def _short_text(value, max_length=120):
+def _short_text(value, max_length=1000):
     # 将长文本截断，避免日志内容过长
     if value is None:
         return ""

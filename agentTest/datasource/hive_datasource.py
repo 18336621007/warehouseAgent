@@ -16,10 +16,10 @@ class HiveDataSource(BaseDataSource):
             password=self.config["password"],
             database=self.config["database"],
             auth=self.config["auth"],
-            timeout=timeout_seconds,
-            configuration={
-                "hive.query.timeout.seconds": str(timeout_seconds)
-            } if timeout_seconds else None,
+            # timeout=timeout_seconds,
+            # configuration={
+            #     "hive.query.timeout.seconds": str(timeout_seconds)
+            # } if timeout_seconds else None,
         )
 
     def query(self, sql: str, timeout_seconds=None, max_rows=None):

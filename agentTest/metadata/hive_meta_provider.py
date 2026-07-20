@@ -1,7 +1,7 @@
 ﻿import copy
 
 from agentTest.db.hive_config import get_hive_config
-from agentTest.db.hive_guardrails import ALLOWED_HIVE_TABLES
+from agentTest.db.hive_guardrails import ALLOWED_TABLES
 from agentTest.metadata.base_metadata_provider import BaseMetadataProvider
 from pyhive import hive
 
@@ -30,9 +30,9 @@ class HiveMetadataProvider(BaseMetadataProvider):
 
     def _is_allowed_table(self, table_name: str):
         # 当配置了表白名单时，只允许访问白名单内的表
-        if not ALLOWED_HIVE_TABLES:
+        if not ALLOWED_TABLES:
             return True
-        return table_name in ALLOWED_HIVE_TABLES
+        return table_name in ALLOWED_TABLES
 
     def list_tables(self):
         if self._tables_cache is not None:

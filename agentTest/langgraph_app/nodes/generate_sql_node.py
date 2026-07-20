@@ -38,6 +38,7 @@ def build_generate_sql_node(runtime):
 
             # 第一轮使用标准 Prompt，修正轮补充 SQL 错误原因。
             if retry_count > 0:
+                previous_sql = state.get("generated_sql", "")
                 prompt = ChatPromptTemplate.from_messages([
                     (
                         "system",
@@ -45,9 +46,10 @@ def build_generate_sql_node(runtime):
                     ),
                     (
                         "human",
-                        "用户问题：\n{question}\n\n相关 schema 信息：\n{schema_context}\n\n上一次 SQL 的错误原因：\n{sql_fix_reason}"
+                        "用户问题：\n{question}\n\n相关 schema 信息：\n{schema_context}\n\n上一次生成的 SQL：\n{previous_sql}\n\n所有已指出的错误原因：\n{sql_fix_reason}"
                     )
                 ])
+                prompt_input["previous_sql"] = previous_sql
                 prompt_input["sql_fix_reason"] = sql_fix_reason
 
             prompt_value = prompt.invoke(prompt_input)

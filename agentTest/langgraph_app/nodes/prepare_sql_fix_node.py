@@ -9,6 +9,17 @@ def prepare_sql_fix_node(state: AgentState):
     sql_error = state.get("sql_error", "SQL校验失败")
     next_retry_count = retry_count + 1
 
+    # 积累历史错误原因，避免修一个丢一个
+    previous_fix_reason = state.get("sql_fix_reason", "")
+    if previous_fix_reason:
+        accumulates_reason = previous_fix_reason + ";" + sql_error
+    else:
+        accumulates_reason = sql_error
+
+    #上一次生成的sql，帮助模型知道上一轮写了什么
+    previous_sql = state.get("generated_sql", "")
+
+
     # 打印节点开始日志
     log_node_start(
         "prepare_sql_fix",
@@ -25,5 +36,5 @@ def prepare_sql_fix_node(state: AgentState):
 
     return {
         "retry_count": next_retry_count,
-        "sql_fix_reason": sql_error
+        "sql_fix_reason": accumulates_reason,
     }
