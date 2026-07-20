@@ -15,6 +15,7 @@ def build_sql_generation_prompt():
     6. 生成的 SQL 必须尽量符合 Hive 语法
     7. 如果需要限制结果集，请显式使用 LIMIT
     8. 无论信息是否充分，都不要返回说明文字，只返回一条尽量合理、尽量保守的 Hive SQL
+    9. 查询必须显式带 LIMIT，禁止 select *
     """
 
     human_prompt = """

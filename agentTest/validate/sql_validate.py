@@ -50,10 +50,10 @@ def is_read_only_sql(sql: str) -> tuple[bool, str]:
     first_token = tokens[0]
 
     # 检测是否包含高危写操作关键字
-    for token in tokens:
-        normalized_token = token.strip("(),")
-        if normalized_token in WRITE_KEYWORDS:
-            return False, f"SQL 包含高危写操作关键字 [{normalized_token}]，禁止执行"
+    # for token in tokens:
+    #     normalized_token = token.strip("(),")
+    #     if normalized_token in WRITE_KEYWORDS:
+    #         return False, f"SQL 包含高危写操作关键字 [{normalized_token}]，禁止执行"
 
 
 

@@ -1,11 +1,11 @@
 # 允许访问的 Hive 数据库白名单
 ALLOWED_DATABASES = [
-    "test","dwd_trip","dwm_trip","ads_trip"
+    "dwd_trip","dwm_trip","ads_trip"
 ]
 
 # 允许访问的 Hive 表白名单
 ALLOWED_TABLES = [
-    "agent_order_demo",
+
     "dwd_exchange_order_rent_detail_hour",
     "dwm_exchange_order_addition_detail_hour",
     "ads_exchange_platform_operations_report_day"

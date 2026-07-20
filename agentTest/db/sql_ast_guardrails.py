@@ -1,6 +1,47 @@
 # 基于 SQL AST 的 Guardrails 规则模块
 from sqlglot import exp
 from sqlglot import parse_one
+from sqlglot import exp
+from sqlglot import parse_one
+from sqlglot import parse          # 新增：解析多条语句
+
+# AST 中代表写操作/DDL 的节点类型
+WRITE_EXP_TYPES = {
+    exp.Insert,
+    exp.Delete,
+    exp.Update,
+    exp.Drop,
+    exp.Create,
+    exp.Merge,
+}
+
+
+def is_read_only_ast(sql: str):
+    # 基于 AST 判断 SQL 是否只读，拦截非 SELECT/WITH 语句、写操作和多语句
+    if not sql or not sql.strip():
+        return False, "SQL 语句不能为空"
+
+    # 解析多条语句，检测分号拼接攻击
+    statements = list(parse(sql, read="hive"))
+    if len(statements) > 1:
+        return False, "禁止执行多条 SQL 语句"
+
+    # 解析为单条 AST
+    try:
+        expression = parse_one(sql, read="hive")
+    except Exception as error:
+        return False, f"SQL 解析失败: {error}"
+
+    # 只允许 SELECT 开头（WITH 在 sqlglot 中也解析为 Select）
+    if not isinstance(expression, exp.Select):
+        return False, "仅支持 SELECT / WITH 查询"
+
+    # 递归检查 AST 中是否包含写操作节点
+    for write_type in WRITE_EXP_TYPES:
+        if expression.find(write_type):
+            return False, f"SQL 包含高危写操作，禁止执行"
+
+    return True, "SQL 为合法只读查询"
 
 
 def parse_sql_ast(sql: str):
@@ -68,7 +109,12 @@ def validate_sql_ast_guardrails(
     allowed_tables: list[str],
     partition_fields: list[str],
 ):
-    # 统一执行 AST 级 Guardrails 校验
+    # 1. 先做只读校验（AST 版）
+    is_valid, message = is_read_only_ast(sql)
+    if not is_valid:
+        return False, message
+
+    # # 2. 解析 AST
     try:
         expression = parse_sql_ast(sql)
     except Exception as error:

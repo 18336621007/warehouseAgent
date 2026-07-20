@@ -19,6 +19,6 @@ def run_demo(question: str):
 
 # 简要注释：本地示例入口。
 if __name__ == "__main__":
-    question = "昨天补贴了多少金额"
+    question = "昨天补贴金额的订单，给我一个"
     result = run_demo(question)
     print(result["final_answer"])

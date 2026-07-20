@@ -1,7 +1,7 @@
 ﻿import copy
 
 from agentTest.db.hive_config import get_hive_config
-from agentTest.db.hive_guardrails import ALLOWED_TABLES
+from agentTest.db.hive_guardrails import ALLOWED_TABLES, ALLOWED_DATABASES
 from agentTest.metadata.base_metadata_provider import BaseMetadataProvider
 from pyhive import hive
 
@@ -44,22 +44,25 @@ class HiveMetadataProvider(BaseMetadataProvider):
 
         try:
             self._list_tables_query_cnt  += 1
-            sql = f"show tables in {self.config['database']}"
-            cursor.execute(sql)
-            rows = cursor.fetchall()
+            all_tables = []
 
-            tables = [
-                {
-                    "database_name": self.config["database"],
-                    "table_name": row[0],
-                    "table_comment": "",
-                    "table_type": ""
-                }
-                for row in rows
-            ]
+            # 遍历所有白名单库，查询每个库下的表
+            for database_name in ALLOWED_DATABASES:
+                sql = f"show tables in {database_name}"
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+
+                for row in rows:
+                    all_tables.append({
+                        "database_name": database_name,
+                        "table_name": row[0],
+                        "table_comment": "",
+                        "table_type": ""
+                    })
+
 
             # 在 metadata 层执行白名单过滤，避免上层拿到非白名单表
-            result = [table for table in tables if self._is_allowed_table(table["table_name"])]
+            result = [table for table in all_tables if self._is_allowed_table(table["table_name"])]
             self._tables_cache = result #缓存
             return  [dict(table) for table in self._tables_cache]
         finally:
@@ -74,13 +77,36 @@ class HiveMetadataProvider(BaseMetadataProvider):
         if table_name in self._table_schema_cache:
             return copy.deepcopy(self._table_schema_cache[table_name])
 
+        # 先从 tables_cache 中找到表所属的库名，没有则遍历白名单库
+        database_name = self.config["database"]  # 兜底
+        if self._tables_cache:
+            for table in self._tables_cache:
+                if table["table_name"] == table_name:
+                    database_name = table["database_name"]
+                    break
+        if not database_name:
+            database_name = self.config["database"]
+
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
             self._describe_table_query_cnt += 1
-            sql = f"describe {self.config['database']}.{table_name}"
-            cursor.execute(sql)
+            # 用找到的库名尝试，失败则遍历所有白名单库重试
+            last_error = None
+            databases_to_try = [database_name] + [db for db in ALLOWED_DATABASES if db != database_name]
+            for db_name in databases_to_try:
+                try:
+                    sql = f"describe {db_name}.{table_name}"
+                    cursor.execute(sql)
+                    database_name = db_name  # 找到后更新真实库名
+                    break
+                except Exception as error:
+                    last_error = error
+                    continue
+            else:
+                raise last_error
+
             rows = cursor.fetchall()
 
             columns = []
@@ -103,7 +129,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
                     "partition_key": False,
                 })
             res = {
-                "database_name": self.config["database"],
+                "database_name": database_name,
                 "table_name": table_name,
                 "table_comment": "",
                 "table_type": "",

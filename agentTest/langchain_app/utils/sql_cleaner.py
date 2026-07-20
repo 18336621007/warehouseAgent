@@ -2,6 +2,30 @@
 
 import re
 
+# 分区字段格式映射：字段名 -> 日期格式
+PARTITION_FIELD_FORMATS = {
+    "pt_dt": "yyyyMMdd"
+}
+
+def fix_partition_date_format(sql: str) -> str:
+    # 只对 yyyyMMdd 格式的字段做清洗，yyyy-MM-dd 格式的字段不需要转换
+    for field, fmt in PARTITION_FIELD_FORMATS.items():
+        if fmt != "yyyyMMdd":
+            continue
+        # pt_dt = date_sub(current_date, N) -> pt_dt = regexp_replace(date_sub(...), '-', '')
+        sql = re.sub(
+            rf"{field}\s*(=|>=|<=)\s*date_sub\s*\(\s*current_date\s*,\s*(\d+)\s*\)",
+            rf"{field} \1 regexp_replace(date_sub(current_date, \2), '-', '')",
+            sql, flags=re.IGNORECASE,
+        )
+        # pt_dt = date_format(date_sub(...), ...) -> 同上
+        sql = re.sub(
+            rf"{field}\s*(=|>=|<=)\s*date_format\s*\(\s*date_sub\s*\(\s*current_date\s*,\s*(\d+)\s*\)\s*,\s*'[^']*'\s*\)",
+            rf"{field} \1 regexp_replace(date_sub(current_date, \2), '-', '')",
+            sql, flags=re.IGNORECASE,
+        )
+    return sql
+
 def clear_sql(sql: str) -> str:
     if not sql:
         return ""
@@ -20,4 +44,7 @@ def clear_sql(sql: str) -> str:
     # 简要注释：去掉结尾分号，避免当前 Hive 环境解析问题。
     cleaned_sql = cleaned_sql.rstrip().rstrip(";").strip()
 
-    return cleaned_sql
+    #分区格式
+    fixed_sql = fix_partition_date_format(cleaned_sql)
+
+    return fixed_sql

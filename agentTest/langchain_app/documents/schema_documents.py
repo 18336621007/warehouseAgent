@@ -2,7 +2,7 @@
 from typing import List, Dict, Any
 
 from langchain_core.documents import Document
-
+from agentTest.db.hive_guardrails import ALLOWED_TABLES
 """
 Document
 它本质上就是一个“文档对象”，一般至少有两个核心字段：
