@@ -39,6 +39,8 @@ def clear_sql(sql: str) -> str:
 
     # 简要注释：去掉结尾分号，避免当前 Hive 环境解析问题。
     cleaned_sql = cleaned_sql.rstrip().rstrip(";").strip()
+    # 去掉 ${xxx} 变量占位符，兜底替换为 current_date
+    cleaned_sql = re.sub(r"\$\{[^}]+\}", "current_date", cleaned_sql)
 
     #分区格式
     fixed_sql = fix_partition_date_format(cleaned_sql)

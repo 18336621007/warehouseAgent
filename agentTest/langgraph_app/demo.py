@@ -19,6 +19,6 @@ def run_demo(question: str):
 
 # 简要注释：本地示例入口。
 if __name__ == "__main__":
-    question = "最近7天有多少个订单"
+    question = "昨天各平台的订单数量分布"
     result = run_demo(question)
     print(result["final_answer"])

@@ -16,6 +16,7 @@ def build_sql_generation_prompt():
     7. 如果需要限制结果集，请显式使用 LIMIT
     8. 无论信息是否充分，都不要返回说明文字，只返回一条尽量合理、尽量保守的 Hive SQL
     9. 查询必须显式带 LIMIT，禁止 select *
+    10. 禁止使用 bizdate、dt 等 ETL 变量占位符。时间条件请使用 date_sub(current_date, N) 或 current_date()
     """
 
     human_prompt = """
