@@ -1,4 +1,4 @@
-# Schema 上下文增强节点，负责结合 schema tool 补充精确表结构信息。
+﻿# Schema 上下文增强节点，负责结合 schema tool 补充精确表结构信息。
 from agentTest.langchain_app.chains.schema_rag_chain import SchemaRagChain
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.semantic.semantic_rules import match_semantic_entries, format_semantic_context
@@ -24,6 +24,9 @@ def build_enrich_schema_context_node(runtime):
             table_name = getattr(first_doc, "metadata", {}).get("table_name", "")
 
             if table_name:
+                # 剥离库名前缀，兼容增强版 Document 的 "库名.表名" 格式
+                if "." in table_name:
+                    table_name = table_name.split(".")[-1]
                 table_schema = describe_table_tool.invoke({
                     "table_name": table_name,
                 })
