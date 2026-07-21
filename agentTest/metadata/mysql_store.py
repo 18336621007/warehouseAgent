@@ -1,4 +1,4 @@
-"""MySQL 元数据存储层，负责 enriched_metadata 的读写和断点续跑"""
+﻿"""MySQL 元数据存储层，负责 enriched_metadata 的读写和断点续跑"""
 import json
 import pymysql
 
@@ -197,5 +197,47 @@ def save_database(database_name: str, data: dict):
                 data.get("description", ""),
             ))
         conn.commit()
+    finally:
+        conn.close()
+# ── 从 MySQL 加载增强元数据（供向量库重建使用） ────────────────────────
+def load_enriched_tables():
+    """从 MySQL 加载所有增强元数据，返回 {full_name: {domain, core_function, ..., columns: [...]}} 结构"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 加载表级数据
+            cursor.execute("SELECT full_name, domain, core_function, key_entities, potential_use_cases, original_comment FROM enriched_tables")
+            table_rows = cursor.fetchall()
+
+            # 加载字段级数据
+            cursor.execute("SELECT full_key, database_name, table_name, column_name, domain, fields_type, relations, field_aliases, sample_values, original_comment FROM enriched_columns")
+            column_rows = cursor.fetchall()
+
+        result = {}
+        for row in table_rows:
+            full_name = row[0]
+            result[full_name] = {
+                "domain": row[1] or "",
+                "core_function": row[2] or "",
+                "key_entities": json.loads(row[3]) if row[3] else [],
+                "potential_use_cases": json.loads(row[4]) if row[4] else [],
+                "original_comment": row[5] or "",
+                "columns": [],
+            }
+
+        for row in column_rows:
+            table_name = f"{row[1]}.{row[2]}"  # full_table_name
+            if table_name in result:
+                result[table_name]["columns"].append({
+                    "column_name": row[3],
+                    "domain": row[4] or "",
+                    "fields_type": row[5] or "dimension",
+                    "relations": json.loads(row[6]) if row[6] else [],
+                    "field_aliases": json.loads(row[7]) if row[7] else [],
+                    "sample_values": json.loads(row[8]) if row[8] else [],
+                    "original_comment": row[9] or "",
+                })
+
+        return result
     finally:
         conn.close()
