@@ -1,5 +1,9 @@
 # 最小语义层：业务问题到数据表与字段的结构化映射
 # 每一条语义条目描述了某类业务问题应该优先查哪张表、用哪些字段、注意什么规则。
+# 分区字段格式定义（唯一真实来源）
+PARTITION_FIELD_FORMATS = {
+    "pt_dt": "yyyyMMdd",   # 如 20260719
+}
 
 SEMANTIC_ENTRIES = [
     {
@@ -53,12 +57,15 @@ def format_semantic_context(matched_entries):
         fields = ", ".join(entry.get("key_fields", []))
         time_field = entry.get("default_time_field", "")
         notes = entry.get("notes", "")
+        # 追加分区字段格式提示
+        time_format = PARTITION_FIELD_FORMATS.get(time_field, "")
+        format_hint = f"（格式: {time_format}）" if time_format else ""
 
         text = (
             f"语义指引 {idx + 1}:\n"
             f"- 推荐表: {table}\n"
             f"- 关键字段: {fields}\n"
-            f"- 默认时间字段: {time_field}\n"
+            f"- 默认时间字段: {time_field}{format_hint}\n"
             f"- 注意事项: {notes}\n"
         )
         lines.append(text)
