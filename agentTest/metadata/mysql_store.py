@@ -1,4 +1,4 @@
-﻿"""MySQL 元数据存储层，负责 enriched_metadata 的读写和断点续跑"""
+﻿"""MySQL 元数据存储层，负责 enriched_metadata 的读写和断点续跑，每次调用都会对比mysql中已有的表集合，增量更新"""
 import json
 import pymysql
 
@@ -16,7 +16,31 @@ def _get_connection():
         database=cfg["database"],
         charset=cfg["charset"],
     )
+def list_enriched_table_names():
+    """返回 MySQL 中已有的表名集合，用于增量比对"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT full_name FROM enriched_tables")
+            return {row[0] for row in cursor.fetchall()}
+    finally:
+        conn.close()
 
+
+def delete_table_data(full_name: str):
+    """删除某张表的增强数据（表级+字段级），用于表结构变更后重采"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM enriched_tables WHERE full_name = %s", (full_name,))
+            # 字段级按 database.table 前缀匹配删除
+            cursor.execute(
+                "DELETE FROM enriched_columns WHERE CONCAT(database_name, '.', table_name) = %s",
+                (full_name,)
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 def init_metadata_tables():
     """建库建表，幂等执行（表不存在才建）"""
