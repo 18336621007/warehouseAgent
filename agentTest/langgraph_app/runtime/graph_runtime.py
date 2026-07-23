@@ -1,12 +1,12 @@
 ﻿# Graph 运行时依赖构建模块，负责统一初始化共享对象。
-from agentTest.langchain_app.app_builder import build_schema_rag_app, build_langchain_tools
+from agentTest.langchain_app.app_builder import build_schema_rag_app
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
 from agentTest.langgraph_app.runtime.graph_logger import clear_log_file
 from agentTest.langgraph_app.runtime.graph_logger import get_log_file_path
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.llm import LLM
 from agentTest.langchain_app.app_builder import build_enriched_schema_rag_app, build_langchain_tools
-from agentTest.langchain_app.prompts.sql_generation_prompt import build_sql_generation_prompt  # 新增
+from agentTest.langgraph_app.prompts.sql_generation_prompt import build_sql_generation_prompt  # 新增
 
 
 def build_graph_runtime():
@@ -26,10 +26,9 @@ def build_graph_runtime():
     return {
         "embedding": embedding,
         "llm": llm,
-        # "prompt": app_context["prompt"], # 之前的
-        # "retriever": app_context["retriever"], # 之前的
         "prompt": build_sql_generation_prompt(),  # prompt 直接构建，不依赖 Hive
         "retriever": enriched_context["retriever"],  # 增强版检索器
+        "vector_store": enriched_context["vector_store"],  # FAISS 对象，供 Planner 拿余弦距离
         "tools": tools
     }
 """

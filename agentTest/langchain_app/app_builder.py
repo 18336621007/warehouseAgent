@@ -1,6 +1,6 @@
 ﻿from agentTest.langchain_app.chains.schema_rag_chain import SchemaRagChain
 from agentTest.langchain_app.documents.schema_documents import SchemaDocumentsBuilder
-from agentTest.langchain_app.prompts.sql_generation_prompt import build_sql_generation_prompt
+from agentTest.langgraph_app.prompts.sql_generation_prompt import build_sql_generation_prompt
 from agentTest.langchain_app.retrievers.schema_retriever import SchemaRetriever
 from agentTest.langchain_app.tools.tool_factory import build_tools
 from agentTest.langchain_app.vectorstores.schema_vector_store import SchemaVectorStore

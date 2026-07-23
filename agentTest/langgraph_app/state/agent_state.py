@@ -32,3 +32,12 @@ class AgentState(TypedDict, total=False):
     # 当前sql需要修正的原因
     sql_fix_reason: str
 
+    # Planner 路由结果："seeker" 或 "advisor"
+    route: str
+
+    # Planner 判定原因
+    planner_reason: str
+
+    # Planner LLM 识别的实体：{"tables": [...], "fields": [...], "completeness": "full/partial/none"}
+    planner_entities: dict
+
