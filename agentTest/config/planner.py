@@ -12,6 +12,6 @@ MAX_HIGH_SIMILARITY_COUNT = 3
 # 判定为"高相似度"的分数门槛
 HIGH_SIMILARITY_THRESHOLD = 0.6
 
-# 各层检索 k 值
+# Planner 各层检索 k 值
 TABLE_SEARCH_K = 5
 COLUMN_SEARCH_K = 10

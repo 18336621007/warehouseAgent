@@ -48,6 +48,16 @@ def build_planner_node(runtime):
     ])
 
     def planner_node(state):
+        # 如果 Advisor 已确认映射，跳过分析，直接路由 seeker
+        if state.get("advisor_confirmed"):
+            log_node_end("planner", route="seeker", completeness="full",
+                         planner_reason="Advisor 已确认映射关系",
+                         tables=state.get("planner_entities", {}).get("tables", []),
+                         fields=state.get("planner_entities", {}).get("fields", []),
+                         high_similarity_count=0, table_top_scores="", column_top_scores="",
+                         duration_ms=0)
+            return {"route": "seeker", "advisor_confirmed": False}  # 重置标记
+
         question = state["question"]
         timer = start_timer()
 

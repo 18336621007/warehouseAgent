@@ -1,6 +1,8 @@
 # Supervisor 父图：调度 Planner → Seeker/Advisor 的多 Agent 架构入口
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 
+from agentTest.langgraph_app.graphs.advisor_graph import build_advisor_subgraph
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.nodes.planner_node import build_planner_node
 from agentTest.langgraph_app.graphs.seeker_graph import build_seeker_subgraph
@@ -23,8 +25,8 @@ def build_supervisor_graph(runtime):
     # LangGraph 自动对接子图的 START/END，同名 state 字段自动传递
     supervisor.add_node("seeker", build_seeker_subgraph(runtime))
 
-    # 注册 advisor 占位（下节课替换为完整子图）
-    supervisor.add_node("advisor", advisor_stub_node)
+    # 先编译，再注册（避免 LangGraph 重复调用工厂函数）
+    supervisor.add_node("advisor", build_advisor_subgraph(runtime))
 
     # 设置边：START → planner → 路由 → seeker/advisor → END
     supervisor.add_edge(START, "planner")
@@ -37,6 +39,10 @@ def build_supervisor_graph(runtime):
         }
     )
     supervisor.add_edge("seeker", END)
-    supervisor.add_edge("advisor", END)
+    # 回环到planner再做判断
+    supervisor.add_edge("advisor", "planner")
 
-    return supervisor.compile()
+    # 添加 checkpointer 支持 interrupt 暂停/恢复
+    checkpointer = MemorySaver()
+
+    return supervisor.compile(checkpointer=checkpointer)

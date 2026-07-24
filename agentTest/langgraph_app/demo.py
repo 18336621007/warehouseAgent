@@ -1,24 +1,57 @@
-# 简要注释：LangGraph 最小工作流演示入口，用于本地验证 graph 链路。
+# 简要注释：LangGraph 多轮交互演示入口 —— 支持 Advisor interrupt 暂停/恢复
+from langgraph.types import Command
 
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 
 
-# 简要注释：运行最小 SQL Agent Graph。
-def run_demo(question: str):
+def run_demo():
     runtime = build_graph_runtime()
     app = build_supervisor_graph(runtime)
+    # thread_id 保持多轮对话状态，同一 session 内共享 checkpointer
+    config = {"configurable": {"thread_id": "demo-session-1"}}
 
-    initial_state = {
-        "question": question,
-    }
+    print("=" * 60)
+    print("  欢迎使用智能数仓助手")
+    print("  输入 exit 或 quit 退出对话")
+    print("  有什么我可以帮到你的吗？")
+    print("=" * 60)
+    print()
 
-    result = app.invoke(initial_state)
-    return result
+    current_question = input("你: ").strip()
+    if not current_question or current_question.lower() in ("exit", "quit"):
+        print("结束对话。")
+        return
+
+    while True:
+        # 发起图执行 —— Planner → Seeker 或 Planner → Advisor
+        result = app.invoke({"question": current_question}, config)
+
+        # LangGraph interrupt 可能不抛异常而是写入返回值
+        interrupt_info = result.get("__interrupt__")
+        if interrupt_info:
+            # Advisor 需要用户澄清
+            advisor_msg = interrupt_info[0].value if interrupt_info else "请进一步说明您的需求"
+            print(f"\nAI: {advisor_msg}")
+
+            user_answer = input("\n你: ").strip()
+            if not user_answer or user_answer.lower() in ("exit", "quit"):
+                print("结束对话。")
+                break
+
+            # 注入用户回答，恢复图执行（继续循环）
+            app.invoke(Command(resume=user_answer), config)
+            continue
+
+        # 正常结束（seeker 链路走完）
+        final_answer = result.get("final_answer", "")
+        print(f"\nAI: {final_answer}")
+
+        current_question = input("\n你: ").strip()
+        if not current_question or current_question.lower() in ("exit", "quit"):
+            print("结束对话。")
+            break
 
 
-# 简要注释：本地示例入口。
 if __name__ == "__main__":
-    question = "统计昨天各平台的订单数量分布"
-    result = run_demo(question)
-    print(result["final_answer"])
+    run_demo()
