@@ -5,6 +5,7 @@ from typing import List,Any,TypedDict
 class AgentState(TypedDict, total=False):
     # 用户原始问题。
     question: str
+    original_question: str  # 当前话题原始问题，新话题时更新
 
 
     # 检索到的 schema 文档列表。
@@ -39,4 +40,6 @@ class AgentState(TypedDict, total=False):
 
     advisor_question: str  # Advisor 向用户提出的澄清问题
     advisor_confirmed: bool  # Advisor 是否已确认映射关系
+    advisor_round: int       # Advisor 澄清轮次计数器
+    advisor_messages: list[dict]  # Advisor 子图内的多轮对话历史
 

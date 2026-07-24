@@ -48,19 +48,15 @@ def build_planner_node(runtime):
     ])
 
     def planner_node(state):
-        # 如果 Advisor 已确认映射，跳过分析，直接路由 seeker
-        if state.get("advisor_confirmed"):
-            log_node_end("planner", route="seeker", completeness="full",
-                         planner_reason="Advisor 已确认映射关系",
-                         tables=state.get("planner_entities", {}).get("tables", []),
-                         fields=state.get("planner_entities", {}).get("fields", []),
-                         high_similarity_count=0, table_top_scores="", column_top_scores="",
-                         duration_ms=0)
-            return {"route": "seeker", "advisor_confirmed": False}  # 重置标记
-
         question = state["question"]
-        timer = start_timer()
 
+        # 保存当前话题的原始问题（新话题时更新）
+        original_question = state.get("original_question")
+        is_new_topic = state.get("advisor_round", 0) == 0  # 无 Advisor 介入 = 新话题
+        if is_new_topic or not original_question:
+            original_question = question
+
+        timer = start_timer()
         log_node_start("planner", question=question)
 
         try:
@@ -175,6 +171,9 @@ def build_planner_node(runtime):
             return {
                 "route": route,
                 "planner_reason": planner_reason,
+                "original_question": original_question,
+                "advisor_round": 0,  # 清空 Advisor 计数器，进入新一轮判定
+                "advisor_messages": [], # 清空这一轮对话历史
                 "planner_entities": {
                     "tables": planner_output.tables,
                     "fields": planner_output.fields,

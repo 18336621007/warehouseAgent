@@ -3,18 +3,15 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph
 
+from agentTest.config.advisor import MAX_ADVISOR_ROUNDS
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
-from agentTest.langgraph_app.routers.advisor_router import route_after_advisor
+from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_timer, log_node_start, elapsed_ms
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
 from agentTest.langgraph_app.prompts.advisor_prompt import ADVISOR_SYSTEM_PROMPT
 from agentTest.langgraph_app.state.agent_state import AgentState
 from langgraph.types import interrupt, Command
 from langgraph.graph import StateGraph, START, END
 
-def _is_confirmed(final_answer: str) -> bool:
-    """判断 Advisor 回复是否为「确认映射」而非「追问」"""
-    # 确认特征：包含 (内部映射: ...) 格式
-    return "(内部映射:" in final_answer
 
 def build_advisor_subgraph(runtime):
     """构建 Advisor ReAct Agent 子图"""
@@ -38,13 +35,29 @@ def build_advisor_subgraph(runtime):
 
     def run_advisor(state):
         question = state["question"]
-        messages = [{"role": "user", "content": question}]
-        result = agent.invoke({"messages": messages})
+        advisor_round = state.get("advisor_round", 0) + 1
+        timer = start_timer()
+        log_node_start("advisor_agent", question=question[:80])
+
+        # 累积对话历史，让 Agent 理解用户的 "1" 等简略回复
+        history = state.get("advisor_messages") or []
+        history.append({"role": "user", "content": question})
+
+        result = agent.invoke({"messages": history})
         last_msg = result["messages"][-1]
-        advisor_confirmed = _is_confirmed(last_msg.content)
+        history.append({"role": "assistant", "content": last_msg.content})
+
+
+        log_node_end("advisor_agent",
+                     round=advisor_round,
+                     answer_preview=last_msg.content[:120],
+                     duration_ms=elapsed_ms(timer))
+
         return {
             "final_answer": last_msg.content,
-            "advisor_confirmed": advisor_confirmed,
+            "advisor_round": advisor_round,
+            "advisor_messages": history,  # 持久化对话历史
+            "question": question # 显式传递，确保父图 state 同步
         }
 
     def wait_user_clarification(state):
@@ -55,6 +68,14 @@ def build_advisor_subgraph(runtime):
         # 用户回答后恢复，更新 question 为用户的澄清内容
         return {"question": user_response}
 
+    # 路由：轮次超限 → 回父图让 Planner 重新判定
+    def route_after_advisor_round(state):
+        if state.get("advisor_round", 0) >= MAX_ADVISOR_ROUNDS:
+            return "end"
+
+        return "clarify"
+
+
     graph.add_node("advisor_agent", run_advisor)
     graph.add_node("wait_user", wait_user_clarification)
 
@@ -63,9 +84,9 @@ def build_advisor_subgraph(runtime):
     # 条件路由：确认 → END（回父图）；追问 → wait_user（暂停）
     graph.add_conditional_edges(
         "advisor_agent",
-        route_after_advisor,
+        route_after_advisor_round,
         {
-            "confirm": END,  # 已确认映射 → 返回父图
+            "end": END,  # 已确认映射 → 返回父图
             "clarify": "wait_user",  # 需要澄清 → 暂停等用户
         }
     )
