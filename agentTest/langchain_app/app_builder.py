@@ -11,6 +11,12 @@ from agentTest.llm import LLM
 _CACHE_SCHEMA_DIR = "cache/schema_faiss_index"
 _CACHE_ENRICHED_DIR = "cache/enriched_faiss_index"
 
+# 库级 FAISS 落盘路径
+_CACHE_DB_DIR = "cache/db_faiss_index"
+# 表级 FAISS 落盘路径
+_CACHE_TABLE_DIR = "cache/table_faiss_index"
+# 字段级 FAISS 落盘路径
+_CACHE_COLUMN_DIR = "cache/column_faiss_index"
 
 # 简要注释：创建 Schema RAG 链并统一返回相关对象（原始版）。
 def build_schema_rag_app(embedding):
@@ -67,3 +73,42 @@ def build_enriched_schema_rag_app(embedding):
         "vector_store": vector_store,
         "retriever": retriever,
     }
+
+
+# 简要注释：构建库级向量库，每库一个 Document
+def build_db_rag(embedding):
+    from agentTest.langchain_app.documents.enriched_db_documents import EnrichedDatabaseDocumentsBuilder
+
+    document_builder = EnrichedDatabaseDocumentsBuilder()
+    documents = document_builder.build_documents()
+
+    vector_store_manager = SchemaVectorStore(embedding)
+    vector_store = vector_store_manager.load_or_build(_CACHE_DB_DIR, documents)
+
+    return {"vector_store": vector_store, "documents": documents}
+
+
+# 简要注释：构建表级向量库，每表一个 Document
+def build_table_rag(embedding):
+    from agentTest.langchain_app.documents.enriched_table_documents import EnrichedTableDocumentsBuilder
+
+    document_builder = EnrichedTableDocumentsBuilder()
+    documents = document_builder.build_documents()
+
+    vector_store_manager = SchemaVectorStore(embedding)
+    vector_store = vector_store_manager.load_or_build(_CACHE_TABLE_DIR, documents)
+
+    return {"vector_store": vector_store, "documents": documents}
+
+
+# 简要注释：构建字段级向量库，每字段一个 Document
+def build_column_rag(embedding):
+    from agentTest.langchain_app.documents.enriched_column_documents import EnrichedColumnDocumentsBuilder
+
+    document_builder = EnrichedColumnDocumentsBuilder()
+    documents = document_builder.build_documents()
+
+    vector_store_manager = SchemaVectorStore(embedding)
+    vector_store = vector_store_manager.load_or_build(_CACHE_COLUMN_DIR, documents)
+
+    return {"vector_store": vector_store, "documents": documents}

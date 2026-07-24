@@ -39,8 +39,21 @@ class EnrichedSchemaDocumentsBuilder:
         )
 
     def build_documents(self) -> List[Document]:
-        enriched = load_enriched_tables()
+        from agentTest.metadata.mysql_store import load_enriched_tables, load_enriched_columns
+
+        tables = load_enriched_tables()
+        columns = load_enriched_columns()
+
+        # 把字段按表名分组
+        columns_by_table = {}
+        for col in columns:
+            table_key = f"{col['database_name']}.{col['table_name']}"
+            if table_key not in columns_by_table:
+                columns_by_table[table_key] = []
+            columns_by_table[table_key].append(col)
+
         documents = []
-        for table_name, table_data in enriched.items():
+        for table_name, table_data in tables.items():
+            table_data["columns"] = columns_by_table.get(table_name, [])
             documents.append(self.build_document(table_name, table_data))
         return documents

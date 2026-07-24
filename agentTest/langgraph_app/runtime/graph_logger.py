@@ -28,7 +28,7 @@ def _format_kv_pairs(data):
     for key, value in data.items():
         parts.append(f"{key}={_short_text(value)}")
 
-    return ", ".join(parts)
+    return "\n".join(parts)
 
 
 def _write_log(line):

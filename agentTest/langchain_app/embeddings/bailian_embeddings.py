@@ -18,12 +18,18 @@ class BailianEmbeddings:
 
     # 简要注释：批量文本向量化，供向量库建索引使用。
     def embed_documents(self, texts):
-        response = self.client.embeddings.create(
-            model=self.model,
-            input=texts,
-            encoding_format="float",
-        )
-        return [item.embedding for item in response.data]
+        # 百炼 embedding API 单次最多 10 条，需要分批
+        batch_size = 10
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i: i + batch_size]
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=batch,
+                encoding_format="float",
+            )
+            all_embeddings.extend([item.embedding for item in response.data])
+        return all_embeddings
 
     # 简要注释：单条查询文本向量化，供检索阶段使用。
     def embed_query(self, text):

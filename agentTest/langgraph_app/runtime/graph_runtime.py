@@ -1,5 +1,5 @@
 ﻿# Graph 运行时依赖构建模块，负责统一初始化共享对象。
-from agentTest.langchain_app.app_builder import build_schema_rag_app
+from agentTest.langchain_app.app_builder import build_schema_rag_app, build_db_rag, build_table_rag, build_column_rag
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
 from agentTest.langgraph_app.runtime.graph_logger import clear_log_file
 from agentTest.langgraph_app.runtime.graph_logger import get_log_file_path
@@ -15,8 +15,15 @@ def build_graph_runtime():
     clear_log_file()
 
     embedding = BailianEmbeddings()
-    app_context = build_schema_rag_app(embedding)  #最早的映射schema
+
+    # 新增：三层 FAISS 向量库（Advisor 用）
+    db_rag = build_db_rag(embedding)
+    table_rag = build_table_rag(embedding)
+    column_rag = build_column_rag(embedding)
+
+    # 保留：旧的单层版本（Seeker 暂时还用）
     enriched_context = build_enriched_schema_rag_app(embedding) # 论文增强后的schema
+
     tools = build_langchain_tools()
     llm = LLM()
 
@@ -28,7 +35,10 @@ def build_graph_runtime():
         "llm": llm,
         "prompt": build_sql_generation_prompt(),  # prompt 直接构建，不依赖 Hive
         "retriever": enriched_context["retriever"],  # 增强版检索器
-        "vector_store": enriched_context["vector_store"],  # FAISS 对象，供 Planner 拿余弦距离
+        # 新增：三层向量库（Advisor 用）
+        "db_vector_store": db_rag["vector_store"],
+        "table_vector_store": table_rag["vector_store"],
+        "column_vector_store": column_rag["vector_store"],
         "tools": tools
     }
 """

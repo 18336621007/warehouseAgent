@@ -11,7 +11,7 @@ from langgraph.graph import StateGraph, START, END
 from agentTest.langgraph_app.nodes.prepare_sql_fix_node import prepare_sql_fix_node
 
 
-# 构建 Seeker 子图：明确需求走此通道，复用现有 7 节点 SQL 生成链路
+# 构建 Seeker 子图：处理明确需求
 # 作为 Supervisor 父图的子图使用，不再自闭环（START/END 由父图对接）
 def build_seeker_subgraph(runtime):
     graph = StateGraph(AgentState)

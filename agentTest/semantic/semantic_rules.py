@@ -10,9 +10,9 @@ SEMANTIC_ENTRIES = [
         # 订单量 / 订单状态类问题
         "keywords": ["订单量", "订单分布", "订单数", "租赁中", "租赁订单", "订单状态", "已完成", "已取消", "待支付", "待审核"],
         "default_table": "dwd_trip.dwd_exchange_order_rent_detail_hour",
-        "key_fields": ["rent_status", "pt_dt", "pt_platform", "rent_days", "rent_rmb"],
+        "key_fields": ["rent_detail_status", "pt_dt", "pt_platform", "rent_days", "rent_rmb"],
         "default_time_field": "pt_dt",
-        "notes": "需要按 rent_status 过滤状态。订单粒度：一条记录代表一个订单。",
+        "notes": "需要按 rent_detail_status 过滤状态。订单粒度：一条记录代表一个订单。",
     },
     {
         # 优惠 / 补贴 / 支付类问题
