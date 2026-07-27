@@ -1,5 +1,5 @@
-from agentTest.langgraph_app.state.agent_state import AgentState
+﻿from agentTest.langgraph_app.state.agent_state import AgentState
 
 
 def route_after_planner(state: AgentState):
-    return state.get("route", "advidsor")
+    return state.get("route", "advisor")

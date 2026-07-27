@@ -1,4 +1,4 @@
-# LangGraph 工作流状态定义，保存各节点共享的数据。
+﻿# LangGraph 工作流状态定义，保存各节点共享的数据。
 from typing import List,Any,TypedDict
 
 
@@ -30,16 +30,11 @@ class AgentState(TypedDict, total=False):
     sql_fix_reason: str
 
 
-    # Planner 路由结果："seeker" 或 "advisor"
+    # Planner 路由结果：\"seeker\" 或 \"advisor\"
     route: str
     # Planner 判定原因
     planner_reason: str
-    # Planner LLM 识别的实体：{"tables": [...], "fields": [...], "completeness": "full/partial/none"}
+    # Planner LLM 识别的实体：{\"tables\": [...], \"fields\": [...], \"completeness\": \"full/partial/none\"}
     planner_entities: dict
 
-
-    advisor_question: str  # Advisor 向用户提出的澄清问题
-    advisor_confirmed: bool  # Advisor 是否已确认映射关系
-    advisor_round: int       # Advisor 澄清轮次计数器
     advisor_messages: list[dict]  # Advisor 子图内的多轮对话历史
-
