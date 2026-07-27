@@ -22,27 +22,20 @@ def run_demo():
         print("结束对话。")
         return
 
-    original_question = current_question  # 当前话题的原始问题
-    advisor_turns = 0  # 同一话题内 Advisor 已追问轮数
-    round_num = 1  # 全局轮次计数
-    advisor_last_answer = ""  # 上轮 Advisor 的回复，传给 Planner 帮助理解用户的选择
+    original_question = current_question
+    advisor_turns = 0
+    round_num = 1
+    advisor_last_answer = ""
 
     while True:
-        # 用户简略回复（"1""A""好的"等）→ Planner 用原始问题保证语义完整
-        # 但 Advisor 用 user_response 看到用户的真实选择
-        is_short = len(current_question.strip()) <= 5
-        question_for_planner = original_question if is_short else current_question
-
-        # 轮次分隔线
         log_round_separator(round_num)
-        # 记录本轮用户输入
         log_user_input(current_question)
 
         result = app.invoke({
-                    "question": question_for_planner,
+                    "question": original_question,      # 始终用原始问题，保持话题一致性
                     "original_question": original_question,
-                    "user_response": current_question,
-                    "advisor_last_answer": advisor_last_answer,  # 上轮 Advisor 回复，Planner 用此理解 "1""A" 的含义
+                    "user_response": current_question,   # 用户本轮真实输入，Planner/Advisor 据此理解意图
+                    "advisor_last_answer": advisor_last_answer,
                 },
                 config)
 
@@ -50,13 +43,10 @@ def run_demo():
         round_num += 1
 
         if route == "advisor":
-            # Advisor 给出了追问/建议，展示给用户
             print(f"\nAI: {result.get('final_answer', '')}")
-            # 保存 Advisor 本轮的回复，供下一轮 Planner 理解用户的简短选择
             advisor_last_answer = result.get("final_answer", "")
             advisor_turns += 1
 
-            # 硬止损：追问超过上限，提示用户重新描述
             if advisor_turns >= MAX_DEMO_ADVISOR_TURNS:
                 print("\nAI: 抱歉，经过多轮沟通我仍无法确定您的需求，请尝试重新描述。")
                 advisor_turns = 0
@@ -68,17 +58,16 @@ def run_demo():
                 original_question = current_question
                 continue
 
-            # 等待用户下一轮输入
             current_question = input("\n你: ").strip()
             if not current_question or current_question.lower() in ("exit", "quit"):
                 print("结束对话。")
                 break
             continue
 
-        # route == "seeker"：Seeker 已生成最终答案
+        # seeker：已生成最终答案
         print(f"\nAI: {result.get('final_answer', '')}")
-        advisor_turns = 0  # 新话题，重置计数
-        advisor_last_answer = ""  # 新话题，清空
+        advisor_turns = 0
+        advisor_last_answer = ""
 
         current_question = input("\n你: ").strip()
         if not current_question or current_question.lower() in ("exit", "quit"):

@@ -11,6 +11,10 @@ class AgentState(TypedDict, total=False):
     # Advisor 最近一次给用户的回复文本，Planner 用此理解用户的简短选择（如 "1" 对应哪个选项）
     advisor_last_answer: str
 
+    # Advisor 确认后的最终方案：{tables: [...], fields: [...], confirmed_at: str}
+    # 由 Advisor 在 confirm_selection 触发后写入，Planner/Seeker 只读不改
+    confirmed_plan: dict
+
     # 检索到的 schema 文档列表。
     schema_documents: List[Any]
     # 整理后的 schema 上下文文本。

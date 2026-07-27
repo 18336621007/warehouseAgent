@@ -6,8 +6,6 @@
 #   ② LLM 解析：将召回元数据 + 用户问题 + 用户实际输入 + 已确认方案 + Advisor 上轮回复传给 LLM
 #   ③ 阈值判定：LLM full → seeker（FAISS 只做极端否决）；
 #      LLM partial/none → advisor
-#
-# 不再使用快速通道跳过 LLM——即使有 confirmed 标记，也交由 LLM 综合判断。
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -68,13 +66,13 @@ def build_planner_node(runtime):
         # 每轮 Planner 都独立判定：original_question 由 demo 层维护
         original_question = state.get("original_question", question)
 
-        # ── 构建已确认方案的上下文，传给 LLM 辅助判断（不再跳过评估）──
-        planner_entities = state.get("planner_entities") or {}
+        # ── 读取独立的 confirmed_plan（Advisor 写入，Planner 只读不改）──
+        confirmed_plan = state.get("confirmed_plan") or {}
+        has_confirmed = bool(confirmed_plan.get("tables"))
         confirmed_context = ""
-        has_confirmed = planner_entities.get("confirmed", False)
         if has_confirmed:
-            tables = planner_entities.get("tables", [])
-            fields = planner_entities.get("fields", [])
+            tables = confirmed_plan.get("tables", [])
+            fields = confirmed_plan.get("fields", [])
             confirmed_context = (
                 "【上一轮已确认的分析方案】\n"
                 f"表: {', '.join(tables)}\n"
@@ -125,14 +123,11 @@ def build_planner_node(runtime):
             planner_output = structured_llm.invoke(prompt_value)
 
             # ── 信任 LLM 的 completeness 判定，不做覆盖 ──
-            # 之前的后校验会根据 tables/fields 是否为空覆盖 completeness，
-            # 但 LLM 填 fields 帮助 Advisor 定位 ≠ full，覆盖会导致误判
             tables = planner_output.tables
             fields = planner_output.fields
             completeness = planner_output.completeness
 
             # 后校验：修改场景强制路由 ──
-            # 上一轮有已确认方案 + 用户输入是修改意图 → 强制 partial，走 Advisor 重新确认
             is_modifying = has_confirmed and _is_modification(user_response)
             if is_modifying:
                 completeness = "partial"
@@ -148,13 +143,12 @@ def build_planner_node(runtime):
                 else:
                     completeness = "full"
 
-            # ── 用户确认时，复用 confirmed_context 的精确字段，而不是 LLM 重新推测的 ──
-            # LLM 可能在 full 时自己填了不同字段，但 confirmed_context 是 Advisor + 用户确认过的
+            # ── 用户确认时，复用 confirmed_plan 的精确字段 ──
             if completeness == "full" and has_confirmed:
-                tables = planner_entities.get("tables", tables)
-                fields = planner_entities.get("fields", fields)
+                tables = confirmed_plan.get("tables", tables)
+                fields = confirmed_plan.get("fields", fields)
 
-            # ── 收集 top-k 分数（每条截断到 40 字符），用于辅助日志 ──
+            # ── 收集 top-k 分数，用于辅助日志 ──
             table_scores = []
             for doc, score in table_docs_with_scores:
                 similarity = round(1 - score / 2, 3)
@@ -170,9 +164,7 @@ def build_planner_node(runtime):
                 column_scores.append(f"{name}({similarity})")
             column_scores_str = " | ".join(column_scores)
 
-            # ── 步骤③：阈值判定（LLM 为主，FAISS 仅做 full 时极端兜底）──
-
-            # 统计字段层高相似候选数（仅用于 full 时的极端兜底）
+            # ── 步骤③：阈值判定 ──
             high_similarity_count = 0
             for doc, score in column_docs_with_scores:
                 similarity = 1 - score / 2
@@ -191,16 +183,14 @@ def build_planner_node(runtime):
                 route = "seeker"
                 planner_reason = "LLM判定映射完整: " + planner_output.reason
 
-            # ── 构建 planner_entities 返回值，保留 Advisor 设置的 confirmed 标记 ──
-            # confirmed 是 Advisor 通过 confirm_selection 工具设置的，Planner 不应覆盖
+            # ── planner_entities 只写 Planner 自己的分析结果，不写 confirmed 标记 ──
+            # confirmed 由 confirmed_plan 独立管理
             new_entities = {
                 "tables": tables,
                 "fields": fields,
                 "completeness": completeness,
-                "confirmed": has_confirmed and completeness == "full",  # 用户确认 full → 保留 confirmed
             }
 
-            # ── 日志：主行只放关键决策信息 ──
             log_node_end(
                 "planner",
                 route=route,
@@ -211,7 +201,6 @@ def build_planner_node(runtime):
                 reason=planner_reason,
                 ms=elapsed_ms(timer),
             )
-            # 辅助行：表/字段检索分数
             log_sub_info(f"表: {table_scores_str}")
             log_sub_info(f"字段: {column_scores_str}")
 

@@ -1,7 +1,7 @@
 ﻿# Advisor 子图：ReAct Agent，内部用工具查元数据，对外说业务语言
 # 一问一答模式，不保留内部状态机。Planner 是唯一的调度中心。
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, ToolMessage  # 用标准消息对象维护对话历史
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 
@@ -10,6 +10,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_tim
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
 from agentTest.langgraph_app.prompts.advisor_prompt import ADVISOR_SYSTEM_PROMPT
 from agentTest.langgraph_app.state.agent_state import AgentState
+from datetime import datetime
 
 
 def build_advisor_subgraph(runtime):
@@ -35,7 +36,6 @@ def build_advisor_subgraph(runtime):
         """处理用户问题：基于完整对话历史生成回复。
         用 user_response（用户原话）理解选择，如"1"/"月租订单"/"好的"；
         Planner 用 question 保证语义完整，两者互不干扰。"""
-        # 优先用 user_response，兜底用 question
         question = state.get("user_response", state["question"])
         timer = start_timer()
         log_node_start("advisor_agent", question=question[:60])
@@ -57,17 +57,16 @@ def build_advisor_subgraph(runtime):
                 all_tool_names.append(tc.get("name", "?"))
         log_node_event("advisor_agent", f"本轮工具调用: {all_tool_names if all_tool_names else '[无]'}")
 
-        # ── 检测 confirm_selection 工具调用（遍历全部消息，不只是最后一条）──
-        # create_agent 把 tool_calls 放在中间 AIMessage 上，last_msg 是纯文本总结，没有 tool_calls
-        confirmed_entities = None
+        # ── 检测 confirm_selection 工具调用，写入独立的 confirmed_plan 字段 ──
+        # confirmed_plan 是独立字段，不会被 Planner 覆盖，职责单一
+        confirmed_plan = None
         for msg in new_history:
             for tc in (getattr(msg, "tool_calls", None) or []):
                 if tc.get("name") == "confirm_selection":
-                    confirmed_entities = {
+                    confirmed_plan = {
                         "tables": [tc["args"]["table"]],
                         "fields": tc["args"]["fields"],
-                        "completeness": "full",
-                        "confirmed": True,  # Planner 用此标记跳过 FAISS+LLM 评估
+                        "confirmed_at": datetime.now().isoformat(),
                     }
                     # Agent 调用了工具 → 追加 ToolMessage，否则下一轮 Agent 认为工具调用未完成
                     new_history.append(ToolMessage(
@@ -75,21 +74,22 @@ def build_advisor_subgraph(runtime):
                         tool_call_id=tc["id"],
                     ))
                     break
-            if confirmed_entities:
+            if confirmed_plan:
                 break
 
         log_node_end("advisor_agent",
                      answer_summary=str(last_msg.content),
-                     confirmed=confirmed_entities is not None,
+                     confirmed=confirmed_plan is not None,
                      ms=elapsed_ms(timer))
 
         return_value = {
             "final_answer": last_msg.content,
-            "advisor_messages": new_history,  # 存 Message 对象列表，下次调用时复用
+            "advisor_messages": new_history,
         }
 
-        if confirmed_entities:
-            return_value["planner_entities"] = confirmed_entities
+        # 确认后写入独立字段 confirmed_plan（不再碰 planner_entities）
+        if confirmed_plan:
+            return_value["confirmed_plan"] = confirmed_plan
 
         return return_value
 
