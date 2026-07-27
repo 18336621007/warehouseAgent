@@ -28,7 +28,7 @@ def build_graph_runtime():
     llm = LLM()
 
     # 记录 runtime 初始化完成日志
-    log_node_event("graph_runtime", f"runtime initialized, log_file={get_log_file_path()}")
+    log_node_event("runtime", f"初始化完成, 日志: {get_log_file_path()}")
 
     return {
         "embedding": embedding,

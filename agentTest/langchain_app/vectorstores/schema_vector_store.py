@@ -23,12 +23,16 @@ class SchemaVectorStore():
     def load_or_build(self, path: str, documents):
         if os.path.exists(path) and os.listdir(path):
             try:
-                print(f"  -> 从磁盘加载向量库: {path}")
+                # 延迟导入，避免循环依赖
+                from agentTest.langgraph_app.runtime.graph_logger import log_node_event
+                log_node_event("vector_store", f"从磁盘加载: {path}")
                 return FAISS.load_local(path, self.embeddings, allow_dangerous_deserialization=True)
             except Exception:
-                # 旧 L2 缓存加载失败，重建
-                print(f"  -> 加载失败（可能是旧 L2 缓存），将重建: {path}")
-        print(f"  -> 构建向量库并落盘: {path}")
+                from agentTest.langgraph_app.runtime.graph_logger import log_node_event
+                log_node_event("vector_store", f"加载失败（旧缓存），重建: {path}")
+
+        from agentTest.langgraph_app.runtime.graph_logger import log_node_event
+        log_node_event("vector_store", f"构建并落盘: {path}")
         vector_store = self.build(documents)
         self.save(vector_store, path)
         return vector_store

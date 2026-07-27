@@ -1,12 +1,11 @@
 ﻿# Planner 调度节点：FAISS 检索增强元数据 → LLM 结构化解析 → 模糊度判定
 #
-# Planner 是唯一的调度中心：LLM 语义判断 + FAISS 向量校验，双向验证。
-# 判定优先级：LLM 为主，FAISS 为辅。
+# Planner 是唯一的调度中心：LLM 语义判断为主，FAISS 仅做 full 时的极端兜底。
 # 三步流程（对齐论文 SQL-MARS 的 Planner 设计）：
 #   ① FAISS 检索：用余弦相似度召回 top-k 增强元数据
 #   ② LLM 解析：将召回元数据 + 用户问题传给 LLM，输出结构化结果
-#   ③ 阈值判定：LLM full + FAISS 不过度异常 → seeker；
-#      LLM none → advisor；LLM partial → FAISS 兜底
+#   ③ 阈值判定：LLM full → seeker（FAISS 只做极端否决）；
+#      LLM partial/none → advisor
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -16,9 +15,9 @@ from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
+from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.config.planner import (
-    MIN_TABLE_SIMILARITY,
     MAX_HIGH_SIMILARITY_COUNT,
     HIGH_SIMILARITY_THRESHOLD,
     TABLE_SEARCH_K,
@@ -90,12 +89,13 @@ def build_planner_node(runtime):
             else:
                 planner_output.completeness = "full"
 
-            # ── 收集 top-k 分数，用于日志分析 ──
+            # ── 收集 top-k 分数（每条截断到 40 字符），用于辅助日志 ──
             table_scores = []
             for doc, score in table_docs_with_scores:
                 similarity = round(1 - score / 2, 3)
                 name = doc.metadata.get("table", "?")
-                table_scores.append(f"{name}({similarity})")
+                short_name = name if len(name) <= 40 else "..." + name[-37:]
+                table_scores.append(f"{short_name}({similarity})")
             table_scores_str = " | ".join(table_scores)
 
             column_scores = []
@@ -105,63 +105,46 @@ def build_planner_node(runtime):
                 column_scores.append(f"{name}({similarity})")
             column_scores_str = " | ".join(column_scores)
 
-            # ── 步骤③：阈值判定（LLM + FAISS 双向验证，对齐论文 §3.2.1）──
+            # ── 步骤③：阈值判定（LLM 为主，FAISS 仅做 full 时极端兜底）──
             #
-            # 判定优先级：LLM 为主，FAISS 为辅。
-            # - LLM full：FAISS 做极端兜底（候选数 > 3 倍阈值才否决）
-            # - LLM none：直接 advisor
-            # - LLM partial：FAISS 常规兜底（字段匹配、候选数）
+            # none / partial → advisor（字段不确定，必须澄清）
+            # full → seeker（LLM 唯一确定了字段，信任它）
+            #   full 的例外：字段候选爆炸（> 3 倍阈值）→ advisor（FAISS 极端兜底）
 
-            # FAISS 指标
-            top_column_similarity = max(
-                (1 - score / 2 for doc, score in column_docs_with_scores),
-                default=0
-            )
-            # 仅统计字段层的高相似候选数（表级候选不构成"字段语义歧义"）
+            # 统计字段层高相似候选数（仅用于 full 时的极端兜底）
             high_similarity_count = 0
             for doc, score in column_docs_with_scores:
                 similarity = 1 - score / 2
-                if similarity > HIGH_SIMILARITY_THRESHOLD:  # 0.65
+                if similarity > HIGH_SIMILARITY_THRESHOLD:
                     high_similarity_count += 1
 
-            if planner_output.completeness == "none":
-                # LLM 认为完全无法映射 → advisor
+            if planner_output.completeness in ("none", "partial"):
+                # none：无法定位任何表；partial：有表但字段不确定 → advisor
                 route = "advisor"
-                planner_reason = "LLM 判定无法映射: " + planner_output.reason
-            elif planner_output.completeness == "full":
-                # LLM 认为映射完整 → 以 LLM 为准，FAISS 仅做极端兜底
-                if high_similarity_count > MAX_HIGH_SIMILARITY_COUNT * 3:
-                    # 极端情况：字段候选爆炸（如 15+），FAISS 否决 LLM
-                    route = "advisor"
-                    planner_reason = f"LLM判定full但字段候选过多({high_similarity_count} > {MAX_HIGH_SIMILARITY_COUNT * 3})，存在不确定性: {planner_output.reason}"
-                else:
-                    route = "seeker"
-                    planner_reason = "LLM 判定映射完整: " + planner_output.reason
-            elif top_column_similarity < MIN_TABLE_SIMILARITY:
-                # partial：LLM 不确定字段 → FAISS 字段匹配兜底
+                planner_reason = f"LLM判定{planner_output.completeness}: " + planner_output.reason
+            elif high_similarity_count > MAX_HIGH_SIMILARITY_COUNT * 3:
+                # full 但字段候选爆炸 → FAISS 否决 LLM（极端兜底）
                 route = "advisor"
-                planner_reason = f"partial且字段级匹配过低({top_column_similarity:.2f} < {MIN_TABLE_SIMILARITY}): {planner_output.reason}"
-            elif high_similarity_count > MAX_HIGH_SIMILARITY_COUNT:
-                # partial：字段候选过多 → advisor
-                route = "advisor"
-                planner_reason = f"partial且字段候选过多({high_similarity_count} > {MAX_HIGH_SIMILARITY_COUNT}): {planner_output.reason}"
+                planner_reason = f"LLM判定full但字段候选过多({high_similarity_count} > {MAX_HIGH_SIMILARITY_COUNT * 3}): {planner_output.reason}"
             else:
-                # partial 但 FAISS 校验通过 → seeker
+                # full 且候选正常 → trust LLM
                 route = "seeker"
-                planner_reason = "partial但FAISS校验通过: " + planner_output.reason
+                planner_reason = "LLM判定映射完整: " + planner_output.reason
 
+            # ── 日志：主行只放关键决策信息 ──
             log_node_end(
                 "planner",
                 route=route,
                 completeness=planner_output.completeness,
-                planner_reason=planner_reason,
-                tables=planner_output.tables,
-                fields=planner_output.fields,
-                high_similarity_count=high_similarity_count,
-                table_top_scores=table_scores_str,
-                column_top_scores=column_scores_str,
-                duration_ms=elapsed_ms(timer),
+                tables=str(tables),
+                fields=str(fields),
+                high_sim=high_similarity_count,
+                reason=planner_reason,
+                ms=elapsed_ms(timer),
             )
+            # 辅助行：表/字段检索分数
+            log_sub_info(f"表: {table_scores_str}")
+            log_sub_info(f"字段: {column_scores_str}")
 
             return {
                 "route": route,
@@ -175,7 +158,7 @@ def build_planner_node(runtime):
             }
 
         except Exception as error:
-            log_node_error("planner", error=error, duration_ms=elapsed_ms(timer))
+            log_node_error("planner", error=str(error), ms=elapsed_ms(timer))
             raise
 
     return planner_node

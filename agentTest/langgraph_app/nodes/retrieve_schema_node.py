@@ -25,8 +25,8 @@ def build_retrieve_schema_node(runtime):
             # 记录节点结束日志
             log_node_end(
                 "retrieve_schema",
-                documents=len(schema_documents),
-                duration_ms=elapsed_ms(timer),
+                docs=len(schema_documents),
+                ms=elapsed_ms(timer),
             )
 
             return {
@@ -36,8 +36,8 @@ def build_retrieve_schema_node(runtime):
             # 记录节点异常日志
             log_node_error(
                 "retrieve_schema",
-                error=error,
-                duration_ms=elapsed_ms(timer),
+                error=str(error),
+                ms=elapsed_ms(timer),
             )
             raise
 

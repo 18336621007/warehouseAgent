@@ -34,7 +34,7 @@ def build_advisor_subgraph(runtime):
         """处理用户问题：基于完整对话历史（advisor_messages）生成回复"""
         question = state["question"]
         timer = start_timer()
-        log_node_start("advisor_agent", question=question[:80])
+        log_node_start("advisor_agent", question=question[:60])
 
         # 累积对话历史，让 Agent 理解用户的 "1"\"a\" 等简略回复
         history = state.get("advisor_messages") or []
@@ -44,9 +44,10 @@ def build_advisor_subgraph(runtime):
         last_msg = result["messages"][-1]
         history.append({"role": "assistant", "content": last_msg.content})
 
+        # 日志只记录前 100 字符摘要，避免 final_answer 撑爆日志
         log_node_end("advisor_agent",
-                     final_answer=last_msg.content,
-                     duration_ms=elapsed_ms(timer))
+                     answer_summary=str(last_msg.content)[:100] + ("..." if len(str(last_msg.content)) > 100 else ""),
+                     ms=elapsed_ms(timer))
 
         return {
             "final_answer": last_msg.content,

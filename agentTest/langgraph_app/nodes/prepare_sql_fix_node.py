@@ -23,15 +23,15 @@ def prepare_sql_fix_node(state: AgentState):
     # 打印节点开始日志
     log_node_start(
         "prepare_sql_fix",
-        retry_count=retry_count,
-        sql_error=sql_error,
+        retry=retry_count,
+        error=sql_error,
     )
 
     # 打印节点结束日志
     log_node_end(
         "prepare_sql_fix",
-        next_retry_count=next_retry_count,
-        sql_fix_reason=sql_error,
+        next_retry=next_retry_count,
+        reason=sql_error,
     )
 
     return {

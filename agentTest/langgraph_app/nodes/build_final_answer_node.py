@@ -30,7 +30,7 @@ def build_build_final_answer_node(runtime):
                     "build_final_answer",
                     branch="sql_invalid",
                     sql_error=sql_error,
-                    duration_ms=elapsed_ms(timer),
+                    ms=elapsed_ms(timer),
                 )
 
                 return {
@@ -47,8 +47,8 @@ def build_build_final_answer_node(runtime):
                 log_node_end(
                     "build_final_answer",
                     branch="empty_result",
-                    row_count=row_count,
-                    duration_ms=elapsed_ms(timer),
+                    rows=row_count,
+                    ms=elapsed_ms(timer),
                 )
 
                 return {
@@ -73,12 +73,14 @@ def build_build_final_answer_node(runtime):
 
             final_answer = llm.invoke(prompt_value)
 
-            # 记录成功分支日志
+            # 记录成功分支日志 —— 截断 answer 避免日志过长
+            answer_text = str(final_answer)
+            answer_preview = answer_text[:100] + ("..." if len(answer_text) > 100 else "")
             log_node_end(
                 "build_final_answer",
                 branch="success",
-                final_answer=final_answer,
-                duration_ms=elapsed_ms(timer),
+                answer_preview=answer_preview,
+                ms=elapsed_ms(timer),
             )
             return {
                 "final_answer": final_answer,
@@ -88,8 +90,8 @@ def build_build_final_answer_node(runtime):
             log_node_error(
                 "build_final_answer",
                 question=question,
-                error=error,
-                duration_ms=elapsed_ms(timer),
+                error=str(error),
+                ms=elapsed_ms(timer),
             )
             raise
 

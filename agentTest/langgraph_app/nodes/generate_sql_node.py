@@ -26,7 +26,7 @@ def build_generate_sql_node(runtime):
         # 记录节点开始日志
         log_node_start(
             "generate_sql",
-            retry_count=retry_count,
+            retry=retry_count,
             question=question,
         )
 
@@ -58,12 +58,13 @@ def build_generate_sql_node(runtime):
             #先清晰sql再记录日志，确保日志展示的是实际执行的sql
             generated_sql = clear_sql(generated_sql)
 
-            # 记录节点结束日志
+            # 记录节点结束日志 —— SQL 保留 150 字符预览
+            sql_preview = str(generated_sql)[:150] + ("..." if len(str(generated_sql)) > 150 else "")
             log_node_end(
                 "generate_sql",
-                generated_sql=generated_sql,
-                schema_context_length=len(schema_context),
-                duration_ms=elapsed_ms(timer),
+                sql=sql_preview,
+                ctx_len=len(schema_context),
+                ms=elapsed_ms(timer),
             )
             return {
                 "generated_sql": generated_sql
@@ -72,9 +73,9 @@ def build_generate_sql_node(runtime):
             # 记录节点异常日志
             log_node_error(
                 "generate_sql",
-                retry_count=retry_count,
-                error=error,
-                duration_ms=elapsed_ms(timer),
+                retry=retry_count,
+                error=str(error),
+                ms=elapsed_ms(timer),
             )
             raise
 

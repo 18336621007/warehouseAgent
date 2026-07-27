@@ -13,8 +13,9 @@ from agentTest.validate.sql_validate import validate_hive_sql
 def validate_sql_node(state: AgentState):
     generated_sql = state.get("generated_sql", "")
 
-    # 打印节点开始日志
-    log_node_start("validate_sql", generated_sql=generated_sql)
+    # 打印节点开始日志 —— SQL 保留 120 字符预览
+    sql_preview = str(generated_sql)[:120] + ("..." if len(str(generated_sql)) > 120 else "")
+    log_node_start("validate_sql", sql=sql_preview)
 
     # 基础合法性校验
     is_valid, message = validate_hive_sql(generated_sql)
@@ -32,7 +33,7 @@ def validate_sql_node(state: AgentState):
         }
 
     # 打印节点结束日志
-    log_node_end("validate_sql", sql_valid=is_valid, sql_error=message)
+    log_node_end("validate_sql", valid=is_valid, error=message)
 
     return {
         "sql_valid": True,

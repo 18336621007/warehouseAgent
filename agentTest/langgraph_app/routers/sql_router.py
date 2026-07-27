@@ -13,9 +13,9 @@ def route_after_sql_validation(state: AgentState):
     if sql_valid:
         # 打印执行分支日志
         log_route_decision(
-            "route_after_sql_validation",
-            sql_valid=sql_valid,
-            retry_count=retry_count,
+            "sql_router",
+            valid=sql_valid,
+            retry=retry_count,
             decision="execute",
         )
         return "execute"
@@ -23,18 +23,18 @@ def route_after_sql_validation(state: AgentState):
     if retry_count >= MAX_SQL_RETRY_COUNT:
         # 打印结束分支日志
         log_route_decision(
-            "route_after_sql_validation",
-            sql_valid=sql_valid,
-            retry_count=retry_count,
+            "sql_router",
+            valid=sql_valid,
+            retry=retry_count,
             decision="end",
         )
         return "end"
 
     # 打印修正分支日志
     log_route_decision(
-        "route_after_sql_validation",
-        sql_valid=sql_valid,
-        retry_count=retry_count,
+        "sql_router",
+        valid=sql_valid,
+        retry=retry_count,
         decision="fix",
     )
     return "fix"
