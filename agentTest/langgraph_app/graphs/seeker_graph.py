@@ -9,12 +9,12 @@ from agentTest.langgraph_app.routers.sql_router import route_after_sql_validatio
 from agentTest.langgraph_app.state.agent_state import AgentState
 from langgraph.graph import StateGraph, START, END
 from agentTest.langgraph_app.nodes.prepare_sql_fix_node import prepare_sql_fix_node
-
+from agentTest.langgraph_app.state.seeker_state import SeekerState
 
 # 构建 Seeker 子图：处理明确需求
 # 作为 Supervisor 父图的子图使用，不再自闭环（START/END 由父图对接）
 def build_seeker_subgraph(runtime):
-    graph = StateGraph(AgentState)
+    graph = StateGraph(SeekerState)
 
     graph.add_node("retrieve_schema", build_retrieve_schema_node(runtime))
     graph.add_node("build_schema_context", build_schema_context_node)

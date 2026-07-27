@@ -1,0 +1,23 @@
+# ── state/seeker.py ──
+# Seeker 子图字段 + Evaluator 字段（同属一条执行链路）
+from typing import List, Any, TypedDict
+from agentTest.langgraph_app.state.base_state import BaseState
+
+class SeekerState(BaseState, total=False):
+    # Seeker SQL 生成链路
+    schema_documents: List[Any]
+    schema_context: str
+    generated_sql: str
+    sql_valid: bool
+    sql_error: str
+    sql_result: Any
+    final_answer: str
+    retry_count: int
+    sql_fix_reason: str
+    confirmed_plan: dict         # 只读，SQL 一致性校验用
+
+    # Evaluator 评估字段
+    advisor_turns: int           # 本次话题 Advisor 追问轮次（demo 层传入）
+    total_topic_time_ms: float   # 本次话题总耗时（demo 层传入）
+    evaluator_score: float       # 综合评分（Evaluator 写入）
+    evaluator_self_score: float  # LLM 自评分数（Evaluator 写入）

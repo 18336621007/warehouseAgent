@@ -1,47 +1,9 @@
-﻿# LangGraph 工作流状态定义，保存各节点共享的数据。
-from typing import List,Any,TypedDict
+﻿# ── state/agent_state.py ──
+# 父图 AgentState：继承所有子图 State，Supervisor 使用
+from typing import TypedDict
+from agentTest.langgraph_app.state.planner_state import PlannerState
+from agentTest.langgraph_app.state.advisor_state import AdvisorState
+from agentTest.langgraph_app.state.seeker_state import SeekerState
 
-
-class AgentState(TypedDict, total=False):
-    # 用户原始问题。
-    question: str
-    original_question: str  # 当前话题原始问题，新话题时更新
-    user_response: str       # 用户本轮实际输入（不替换），Advisor 用此理解用户选择
-
-    # Advisor 最近一次给用户的回复文本，Planner 用此理解用户的简短选择（如 "1" 对应哪个选项）
-    advisor_last_answer: str
-
-    # Advisor 确认后的最终方案：{tables: [...], fields: [...], confirmed_at: str}
-    # 由 Advisor 在 confirm_selection 触发后写入，Planner/Seeker 只读不改
-    confirmed_plan: dict
-
-    # 检索到的 schema 文档列表。
-    schema_documents: List[Any]
-    # 整理后的 schema 上下文文本。
-    schema_context: str
-
-
-    # 模型生成的 SQL。
-    generated_sql: str
-    # 表示sql是否通过校验
-    sql_valid: bool
-    # 记录sql校验失败原因
-    sql_error: str
-    # SQL 执行结果。
-    sql_result: Any
-    # 最终回答结果
-    final_answer: str
-    # 当前sql修正重试次数
-    retry_count: int
-    # 当前sql需要修正的原因
-    sql_fix_reason: str
-
-
-    # Planner 路由结果：\"seeker\" 或 \"advisor\"
-    route: str
-    # Planner 判定原因
-    planner_reason: str
-    # Planner LLM 识别的实体：{\"tables\": [...], \"fields\": [...], \"completeness\": \"full/partial/none\"}
-    planner_entities: dict
-
-    advisor_messages: list  # Advisor 子图多轮对话历史（LangChain Message 对象列表）
+class AgentState(PlannerState, AdvisorState, SeekerState, total=False):
+    pass

@@ -4,7 +4,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
-
+from agentTest.langgraph_app.state.advisor_state import AdvisorState
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_timer, log_node_start, elapsed_ms, log_node_event
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
@@ -30,7 +30,7 @@ def build_advisor_subgraph(runtime):
 
     agent = create_agent(llm, tools, system_prompt=ADVISOR_SYSTEM_PROMPT)
 
-    graph = StateGraph(AgentState)
+    graph = StateGraph(AdvisorState)
 
     def run_advisor(state):
         """处理用户问题：基于完整对话历史生成回复。
