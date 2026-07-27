@@ -1,4 +1,4 @@
-﻿# Planner 调度节点：FAISS 检索增强元数据 → LLM 结构化解析 → 模糊度判定
+# Planner 调度节点：FAISS 检索增强元数据 → LLM 结构化解析 → 模糊度判定
 #
 # Planner 是唯一的调度中心：LLM 语义判断为主，FAISS 仅做 full 时的极端兜底。
 # 三步流程（对齐论文 SQL-MARS 的 Planner 设计）：
@@ -8,6 +8,7 @@
 #      LLM partial/none → advisor
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from datetime import datetime
 
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
 from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
@@ -204,12 +205,23 @@ def build_planner_node(runtime):
             log_sub_info(f"表: {table_scores_str}")
             log_sub_info(f"字段: {column_scores_str}")
 
-            return {
+            return_value = {
                 "route": route,
                 "planner_reason": planner_reason,
                 "original_question": original_question,
                 "planner_entities": new_entities,
             }
+
+            # Planner 路由 seeker 时，若 Advisor 未写入 confirmed_plan，自动提升 planner_entities 为兜底方案
+            # 确保 generate_sql 的一致性校验能检测到方案偏差（如误用不在方案中的字段）
+            if route == "seeker" and not has_confirmed and tables:
+                return_value["confirmed_plan"] = {
+                    "tables": tables,
+                    "fields": fields,
+                    "confirmed_at": datetime.now().isoformat(),
+                }
+
+            return return_value
 
         except Exception as error:
             log_node_error("planner", error=str(error), ms=elapsed_ms(timer))
