@@ -11,13 +11,13 @@ LOG_FILE = LOG_DIR / "langgraph_app.log"
 _NODE_WIDTH = 12
 
 
-def _short_text(value, max_length=200):
+def _short_text(value, max_length=None):
     # 将长文本截断，避免日志内容过长（默认 120 字符，SQL 类可传更大值）
     if value is None:
         return ""
 
     text = str(value).replace("\n", " ").strip()
-    if len(text) <= max_length:
+    if max_length is None or len(text) <= max_length:
         return text
 
     return text[:max_length] + "..."
@@ -69,8 +69,8 @@ def elapsed_ms(start_time):
 
 
 def log_round_separator(round_num):
-    # 轮次分隔线：══════ 第N轮 ══════
-    _write_log("", "═", f"═════ 第{round_num}轮 {'═' * 50}")
+    # 轮次分隔线：====== 第N轮 ======
+    _write_log("", "=", f"===== 第{round_num}轮 {'=' * 50}")
 
 
 def log_sub_info(message):
@@ -82,30 +82,30 @@ def log_sub_info(message):
 
 
 def log_node_start(node_name, **kwargs):
-    # 节点开始：HH:MM:SS node_name  ▶ message
-    _write_log(node_name, "▶", _format_inline(kwargs))
+    # 节点开始：HH:MM:SS node_name  >> message
+    _write_log(node_name, ">>", _format_inline(kwargs))
 
 
 def log_node_end(node_name, **kwargs):
-    # 节点结束：HH:MM:SS node_name  ◀ message
-    _write_log(node_name, "◀", _format_inline(kwargs))
+    # 节点结束：HH:MM:SS node_name  << message
+    _write_log(node_name, "<<", _format_inline(kwargs))
 
 
 def log_node_error(node_name, **kwargs):
-    # 节点异常：HH:MM:SS node_name  ✖ message
-    _write_log(node_name, "✖", _format_inline(kwargs))
+    # 节点异常：HH:MM:SS node_name  !! message
+    _write_log(node_name, "!!", _format_inline(kwargs))
 
 
 def log_node_event(node_name, message):
     # 兼容旧写法的事件日志
-    _write_log(node_name, "●", _short_text(message))
+    _write_log(node_name, "--", _short_text(message))
 
 
 def log_route_decision(route_name, **kwargs):
-    # 路由决策：HH:MM:SS route_name → message
-    _write_log(route_name, "→", _format_inline(kwargs))
+    # 路由决策：HH:MM:SS route_name -> message
+    _write_log(route_name, "->", _format_inline(kwargs))
 
 
 def log_user_input(message):
-    # 用户输入：HH:MM:SS user       ▶ message
-    _write_log("user", "▶", _short_text(message, max_length=200))
+    # 用户输入：HH:MM:SS user       >> message
+    _write_log("user", ">>", _short_text(message))

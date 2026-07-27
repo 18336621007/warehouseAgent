@@ -6,7 +6,7 @@ class AgentState(TypedDict, total=False):
     # 用户原始问题。
     question: str
     original_question: str  # 当前话题原始问题，新话题时更新
-
+    user_response: str       # 用户本轮实际输入（不替换），Advisor 用此理解用户选择
 
     # 检索到的 schema 文档列表。
     schema_documents: List[Any]
@@ -37,4 +37,4 @@ class AgentState(TypedDict, total=False):
     # Planner LLM 识别的实体：{\"tables\": [...], \"fields\": [...], \"completeness\": \"full/partial/none\"}
     planner_entities: dict
 
-    advisor_messages: list[dict]  # Advisor 子图内的多轮对话历史
+    advisor_messages: list  # Advisor 子图多轮对话历史（LangChain Message 对象列表）

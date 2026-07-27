@@ -58,11 +58,10 @@ def build_generate_sql_node(runtime):
             #先清晰sql再记录日志，确保日志展示的是实际执行的sql
             generated_sql = clear_sql(generated_sql)
 
-            # 记录节点结束日志 —— SQL 保留 150 字符预览
-            sql_preview = str(generated_sql)[:150] + ("..." if len(str(generated_sql)) > 150 else "")
+            # 记录节点结束日志
             log_node_end(
                 "generate_sql",
-                sql=sql_preview,
+                sql=str(generated_sql),
                 ctx_len=len(schema_context),
                 ms=elapsed_ms(timer),
             )

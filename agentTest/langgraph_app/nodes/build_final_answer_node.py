@@ -74,8 +74,7 @@ def build_build_final_answer_node(runtime):
             final_answer = llm.invoke(prompt_value)
 
             # 记录成功分支日志 —— 截断 answer 避免日志过长
-            answer_text = str(final_answer)
-            answer_preview = answer_text[:100] + ("..." if len(answer_text) > 100 else "")
+            answer_preview = str(final_answer)
             log_node_end(
                 "build_final_answer",
                 branch="success",

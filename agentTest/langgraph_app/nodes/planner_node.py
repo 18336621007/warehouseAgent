@@ -6,6 +6,9 @@
 #   ② LLM 解析：将召回元数据 + 用户问题传给 LLM，输出结构化结果
 #   ③ 阈值判定：LLM full → seeker（FAISS 只做极端否决）；
 #      LLM partial/none → advisor
+#
+# 快速通道：如果 Advisor 已通过 confirm_selection 工具确认了实体
+#   → planner_entities.confirmed == True → 跳过 ①②③，直接路由 seeker
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -52,6 +55,29 @@ def build_planner_node(runtime):
         # 每轮 Planner 都独立判定：original_question 由 demo 层维护
         original_question = state.get("original_question", question)
 
+        # ── 快速通道：Advisor 已通过 confirm_selection 工具确认了实体 ──
+        # 此时不再需要 FAISS + LLM 评估，直接路由 seeker
+        planner_entities = state.get("planner_entities") or {}
+        if planner_entities.get("confirmed"):
+            timer = start_timer()
+            log_node_start("planner", question=question)
+            log_node_end(
+                "planner",
+                route="seeker",
+                completeness="full",
+                tables=str(planner_entities.get("tables", [])),
+                fields=str(planner_entities.get("fields", [])),
+                reason="Advisor confirmed entities, skip evaluation",
+                ms=elapsed_ms(timer),
+            )
+            return {
+                "route": "seeker",
+                "planner_reason": "Advisor已通过confirm_selection确认实体，跳过评估",
+                "original_question": original_question,
+                "planner_entities": planner_entities,
+            }
+
+        # ── 以下为原有的 FAISS + LLM 评估流程 ──
         timer = start_timer()
         log_node_start("planner", question=question)
 

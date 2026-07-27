@@ -1,6 +1,7 @@
-# Advisor 的三个检索工具，k 值从 config/advisor.py 读取
+﻿# Advisor 的三个检索工具，k 值从 config/advisor.py 读取
 from langchain.tools import tool
 from agentTest.config.advisor import SEARCH_DB_K, SEARCH_TABLE_K, SEARCH_COLUMN_K
+from agentTest.langgraph_app.tools.confirm_selection import confirm_selection  # 确认工具
 
 # 全局变量，由 build_advisor_tools() 注入 FAISS 实例
 _db_vector_store = None
@@ -45,9 +46,9 @@ def search_columns(question: str, table: str = "") -> str:
 
 
 def build_advisor_tools(db_vector_store, table_vector_store, column_vector_store):
-    """注入三层 FAISS 实例，返回工具列表"""
+    """注入三层 FAISS 实例，返回工具列表（含 confirm_selection 确认工具）"""
     global _db_vector_store, _table_vector_store, _column_vector_store
     _db_vector_store = db_vector_store
     _table_vector_store = table_vector_store
     _column_vector_store = column_vector_store
-    return [search_databases, search_tables, search_columns]
+    return [search_databases, search_tables, search_columns, confirm_selection]

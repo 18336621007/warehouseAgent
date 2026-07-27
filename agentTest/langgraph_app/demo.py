@@ -27,7 +27,8 @@ def run_demo():
     round_num = 1  # 全局轮次计数
 
     while True:
-        # 用户简略回复（"1"\"a"\"好的"等）→ 用原始问题保证 Planner 语义完整
+        # 用户简略回复（"1"\"a"\"好的"等）→ Planner 用原始问题保证语义完整
+        # 但 Advisor 用 user_response 看到用户的真实选择
         question_for_planner = current_question
         if len(current_question.strip()) <= 5:
             question_for_planner = original_question
@@ -38,9 +39,11 @@ def run_demo():
         log_user_input(current_question)
 
         # 每轮一次完整图执行：Planner → Advisor 或 Seeker → END
+        # user_response 传递用户原话，Advisor 据此理解"1"/"A"/"月租"等选择
         result = app.invoke({
                     "question": question_for_planner,
                     "original_question": original_question,
+                    "user_response": current_question,  # 新增：用户实际输入
                 },
                 config)
 

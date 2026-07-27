@@ -17,9 +17,8 @@ def build_execute_sql_node(runtime):
         generated_sql = state.get("generated_sql", "")
         timer = start_timer()
 
-        # 记录节点开始日志 —— SQL 保留 150 字符预览
-        sql_preview = str(generated_sql)[:150] + ("..." if len(str(generated_sql)) > 150 else "")
-        log_node_start("execute_sql", sql=sql_preview)
+        # 记录节点开始日志
+        log_node_start("execute_sql", sql=str(generated_sql))
 
         try:
             sql_result = sql_query_tool.invoke({
