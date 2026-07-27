@@ -297,3 +297,95 @@ def load_enriched_columns():
         return result
     finally:
         conn.close()
+# ── Evaluator 高质量对话存储 ────────────────────────────────────────
+
+def init_evaluator_table():
+    """建表（幂等），存储 Evaluator 评估后的高质量对话"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS evaluated_dialogues (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    question TEXT,
+                    resolved_question TEXT,
+                    final_sql TEXT,
+                    final_answer TEXT,
+                    tables_used VARCHAR(500) DEFAULT '',
+                    fields_used VARCHAR(500) DEFAULT '',
+                    domain_tag VARCHAR(100) DEFAULT '',
+                    advisor_turns INT DEFAULT 0,
+                    total_time_ms FLOAT DEFAULT 0,
+                    time_score FLOAT DEFAULT 0,
+                    turn_score FLOAT DEFAULT 0,
+                    llm_self_score FLOAT DEFAULT 0,
+                    comprehensive_score FLOAT DEFAULT 0,
+                    is_high_quality TINYINT(1) DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # 兼容旧表：如果 resolved_question 列不存在则补充
+            cursor.execute("""
+                SELECT COUNT(*) FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'evaluated_dialogues'
+                  AND COLUMN_NAME = 'resolved_question'
+            """)
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("""
+                    ALTER TABLE evaluated_dialogues
+                    ADD COLUMN resolved_question TEXT AFTER question
+                """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_evaluated_dialogue(
+    question: str,
+    resolved_question: str,
+    sql: str,
+    answer: str,
+    tables_used: list,
+    fields_used: list,
+    advisor_turns: int,
+    total_time_ms: float,
+    time_score: float,
+    turn_score: float,
+    llm_self_score: float,
+    comprehensive_score: float,
+    domain_tag: str = "",
+):
+    """保存一条评估后的对话记录，仅 ≥ 80 分的入库"""
+    is_high_quality = 1 if comprehensive_score >= 80 else 0
+    if not is_high_quality:
+        return
+
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO evaluated_dialogues
+                    (question, resolved_question, final_sql, final_answer, tables_used, fields_used,
+                     domain_tag, advisor_turns, total_time_ms, time_score, turn_score,
+                     llm_self_score, comprehensive_score, is_high_quality)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                question,
+                resolved_question,
+                sql,
+                answer,
+                ",".join(tables_used) if tables_used else "",
+                ",".join(fields_used) if fields_used else "",
+                domain_tag,
+                advisor_turns,
+                total_time_ms,
+                time_score,
+                turn_score,
+                llm_self_score,
+                comprehensive_score,
+                is_high_quality,
+            ))
+        conn.commit()
+    finally:
+        conn.close()

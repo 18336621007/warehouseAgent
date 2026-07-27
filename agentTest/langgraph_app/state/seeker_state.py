@@ -1,4 +1,4 @@
-# ── state/seeker.py ──
+﻿# ── state/seeker.py ──
 # Seeker 子图字段 + Evaluator 字段（同属一条执行链路）
 from typing import List, Any, TypedDict
 from agentTest.langgraph_app.state.base_state import BaseState
@@ -15,6 +15,9 @@ class SeekerState(BaseState, total=False):
     retry_count: int
     sql_fix_reason: str
     confirmed_plan: dict         # 只读，SQL 一致性校验用
+
+    # Advisor 澄清历史（Evaluator 需要，从父图传递）
+    advisor_messages: list
 
     # Evaluator 评估字段
     advisor_turns: int           # 本次话题 Advisor 追问轮次（demo 层传入）

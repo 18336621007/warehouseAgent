@@ -1,12 +1,14 @@
-# Graph 运行时依赖构建模块，负责统一初始化共享对象。
+﻿# Graph 运行时依赖构建模块，负责统一初始化共享对象。
 from agentTest.langchain_app.app_builder import build_schema_rag_app, build_db_rag, build_table_rag, build_column_rag
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
+from agentTest.langchain_app.vectorstores.example_vector_store import ExampleVectorStore
 from agentTest.langgraph_app.runtime.graph_logger import clear_log_file
 from agentTest.langgraph_app.runtime.graph_logger import get_log_file_path
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.llm import LLM
 from agentTest.langchain_app.app_builder import build_enriched_schema_rag_app, build_langchain_tools
 from agentTest.metadata.mysql_store import load_enriched_columns  # 加载字段类型映射
+from agentTest.metadata.mysql_store import init_evaluator_table  # 初始化 Evaluator 评估表
 from agentTest.langgraph_app.prompts.sql_generation_prompt import build_sql_generation_prompt  # 新增
 
 
@@ -24,6 +26,11 @@ def build_graph_runtime():
 
     # 保留：旧的单层版本（Seeker 暂时还用）
     enriched_context = build_enriched_schema_rag_app(embedding) # 论文增强后的schema
+
+    # Evaluator 示例向量库（高质量对话存储，供 Planner/Advisor/Seeker 检索）
+    example_vector_store = ExampleVectorStore(embedding)
+    # 初始化 Evaluator MySQL 表（幂等）
+    init_evaluator_table()
 
     tools = build_langchain_tools()
     llm = LLM()
@@ -51,6 +58,7 @@ def build_graph_runtime():
         "db_vector_store": db_rag["vector_store"],
         "table_vector_store": table_rag["vector_store"],
         "column_vector_store": column_rag["vector_store"],
+        "example_vector_store": example_vector_store,  # Evaluator 示例向量库
         "tools": tools,
         "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}
         "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}
