@@ -1,4 +1,4 @@
-﻿# Graph 运行时依赖构建模块，负责统一初始化共享对象。
+# Graph 运行时依赖构建模块，负责统一初始化共享对象。
 from agentTest.langchain_app.app_builder import build_schema_rag_app, build_db_rag, build_table_rag, build_column_rag
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
 from agentTest.langgraph_app.runtime.graph_logger import clear_log_file
@@ -6,6 +6,7 @@ from agentTest.langgraph_app.runtime.graph_logger import get_log_file_path
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.llm import LLM
 from agentTest.langchain_app.app_builder import build_enriched_schema_rag_app, build_langchain_tools
+from agentTest.metadata.mysql_store import load_enriched_columns  # 加载字段类型映射
 from agentTest.langgraph_app.prompts.sql_generation_prompt import build_sql_generation_prompt  # 新增
 
 
@@ -27,6 +28,17 @@ def build_graph_runtime():
     tools = build_langchain_tools()
     llm = LLM()
 
+    # 从 MySQL 加载字段类型映射（度量/维度），供 generate_sql 生成聚合 SQL
+    columns = load_enriched_columns()
+    field_type_map = {}
+    for col in columns:
+        key = f"{col['database_name']}.{col['table_name']}.{col['column_name']}"
+        field_type_map[key] = col.get("fields_type", "dimension")
+    # 同时建一个仅用 column_name 的兜底映射
+    field_type_map_simple = {}
+    for col in columns:
+        field_type_map_simple[col["column_name"]] = col.get("fields_type", "dimension")
+
     # 记录 runtime 初始化完成日志
     log_node_event("runtime", f"初始化完成, 日志: {get_log_file_path()}")
 
@@ -39,7 +51,9 @@ def build_graph_runtime():
         "db_vector_store": db_rag["vector_store"],
         "table_vector_store": table_rag["vector_store"],
         "column_vector_store": column_rag["vector_store"],
-        "tools": tools
+        "tools": tools,
+        "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}
+        "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}
     }
 """
 为什么 prompt 可以直接构建？

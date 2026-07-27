@@ -13,6 +13,11 @@ from agentTest.validate.sql_validate import validate_hive_sql
 def validate_sql_node(state: AgentState):
     generated_sql = state.get("generated_sql", "")
 
+    # 方案B：非聚合查询缺 LIMIT → 自动追加（安全兜底，不影响 LLM 生成聚合 SQL）
+    upper_sql = generated_sql.upper().rstrip(";").strip()
+    if "LIMIT" not in upper_sql and "GROUP BY" not in upper_sql:
+        generated_sql = upper_sql + " LIMIT 100"
+
     # 打印节点开始日志
     log_node_start("validate_sql", sql=str(generated_sql))
 
@@ -37,4 +42,5 @@ def validate_sql_node(state: AgentState):
     return {
         "sql_valid": True,
         "sql_error": "",
+        "generated_sql": generated_sql,
     }

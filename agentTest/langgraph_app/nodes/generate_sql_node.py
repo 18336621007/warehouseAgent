@@ -15,6 +15,17 @@ def build_generate_sql_node(runtime):
     default_prompt = runtime["prompt"]
 
     def generate_sql_node(state: AgentState) -> dict:
+        # ── 读取 Planner/Advisor 确认的分析方案，格式化为 prompt 独立 section ──
+        planner_entities = state.get("planner_entities") or {}
+        confirmed_section = ""
+        if planner_entities.get("confirmed"):
+            tables = planner_entities.get("tables", [])
+            fields = planner_entities.get("fields", [])
+            confirmed_section = (
+                "【已确认的分析方案 — 必须使用以下表和字段】\n"
+                f"- 数据表: {', '.join(tables)}\n"
+                f"- 字段: {', '.join(fields)}"
+            )
 
         question = state["question"]
         schema_context = state["schema_context"]
@@ -35,10 +46,16 @@ def build_generate_sql_node(runtime):
             prompt_input = {
                 "question": question,
                 "schema_context": schema_context,
+                "confirmed_section": confirmed_section
             }
 
             # 第一轮使用标准 Prompt，修正轮补充 SQL 错误原因。
             if retry_count > 0:
+                # 修正轮：把确认信息直接拼到 schema_context 前面
+                if confirmed_section:
+                    prompt_input["schema_context"] = confirmed_section + "\n\n" + schema_context
+
+                #上一轮生成的sql
                 previous_sql = state.get("generated_sql", "")
                 prompt = ChatPromptTemplate.from_messages([
                     (
