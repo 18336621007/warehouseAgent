@@ -8,6 +8,9 @@ class AgentState(TypedDict, total=False):
     original_question: str  # 当前话题原始问题，新话题时更新
     user_response: str       # 用户本轮实际输入（不替换），Advisor 用此理解用户选择
 
+    # Advisor 最近一次给用户的回复文本，Planner 用此理解用户的简短选择（如 "1" 对应哪个选项）
+    advisor_last_answer: str
+
     # 检索到的 schema 文档列表。
     schema_documents: List[Any]
     # 整理后的 schema 上下文文本。

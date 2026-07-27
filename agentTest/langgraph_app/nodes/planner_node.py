@@ -3,12 +3,11 @@
 # Planner 是唯一的调度中心：LLM 语义判断为主，FAISS 仅做 full 时的极端兜底。
 # 三步流程（对齐论文 SQL-MARS 的 Planner 设计）：
 #   ① FAISS 检索：用余弦相似度召回 top-k 增强元数据
-#   ② LLM 解析：将召回元数据 + 用户问题传给 LLM，输出结构化结果
+#   ② LLM 解析：将召回元数据 + 用户问题 + 用户实际输入 + 已确认方案 + Advisor 上轮回复传给 LLM
 #   ③ 阈值判定：LLM full → seeker（FAISS 只做极端否决）；
 #      LLM partial/none → advisor
 #
-# 快速通道：如果 Advisor 已通过 confirm_selection 工具确认了实体
-#   → planner_entities.confirmed == True → 跳过 ①②③，直接路由 seeker
+# 不再使用快速通道跳过 LLM——即使有 confirmed 标记，也交由 LLM 综合判断。
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -26,6 +25,20 @@ from agentTest.config.planner import (
     TABLE_SEARCH_K,
     COLUMN_SEARCH_K,
 )
+
+# 修改触发词：用户说这些词表示在修改方案，应强制路由到 Advisor 重新确认
+MODIFICATION_KEYWORDS = ["不对", "不是", "换成", "修改", "调整", "改", "换", "错了"]
+
+
+def _is_modification(user_response: str) -> bool:
+    """判断用户输入是否为修改意图（简单关键词匹配）"""
+    if not user_response:
+        return False
+    text = user_response.strip()
+    for keyword in MODIFICATION_KEYWORDS:
+        if keyword in text:
+            return True
+    return False
 
 
 def build_planner_node(runtime):
@@ -55,29 +68,32 @@ def build_planner_node(runtime):
         # 每轮 Planner 都独立判定：original_question 由 demo 层维护
         original_question = state.get("original_question", question)
 
-        # ── 快速通道：Advisor 已通过 confirm_selection 工具确认了实体 ──
-        # 此时不再需要 FAISS + LLM 评估，直接路由 seeker
+        # ── 构建已确认方案的上下文，传给 LLM 辅助判断（不再跳过评估）──
         planner_entities = state.get("planner_entities") or {}
-        if planner_entities.get("confirmed"):
-            timer = start_timer()
-            log_node_start("planner", question=question)
-            log_node_end(
-                "planner",
-                route="seeker",
-                completeness="full",
-                tables=str(planner_entities.get("tables", [])),
-                fields=str(planner_entities.get("fields", [])),
-                reason="Advisor confirmed entities, skip evaluation",
-                ms=elapsed_ms(timer),
+        confirmed_context = ""
+        has_confirmed = planner_entities.get("confirmed", False)
+        if has_confirmed:
+            tables = planner_entities.get("tables", [])
+            fields = planner_entities.get("fields", [])
+            confirmed_context = (
+                "【上一轮已确认的分析方案】\n"
+                f"表: {', '.join(tables)}\n"
+                f"字段: {', '.join(fields)}\n"
+                "请根据用户本轮实际输入判断：用户是确认方案（→ full）、修改方案（→ partial）、还是换话题（→ none）"
             )
-            return {
-                "route": "seeker",
-                "planner_reason": "Advisor已通过confirm_selection确认实体，跳过评估",
-                "original_question": original_question,
-                "planner_entities": planner_entities,
-            }
 
-        # ── 以下为原有的 FAISS + LLM 评估流程 ──
+        # ── 获取 Advisor 上轮回复，帮助 LLM 理解用户的简短选择 ──
+        advisor_last_answer = state.get("advisor_last_answer", "")
+        if advisor_last_answer:
+            advisor_last_answer = (
+                "【上一轮 Advisor 的回复】\n"
+                f"{advisor_last_answer[:800]}\n"
+                "如果用户输入是数字或简短选择，请从此回复中推断对应的是哪个选项。"
+            )
+        else:
+            advisor_last_answer = ""
+
+        # ── FAISS + LLM 评估流程 ──
         timer = start_timer()
         log_node_start("planner", question=question)
 
@@ -97,23 +113,46 @@ def build_planner_node(runtime):
                 metadata_lines.append(f"[字段]\n{content}")
             metadata_context = "\n\n".join(metadata_lines)
 
-            # ── 步骤②：LLM 结构化解析 ──
+            # ── 步骤②：LLM 结构化解析（含 user_response、confirmed_context、advisor_last_answer）──
+            user_response = state.get("user_response", question)
             prompt_value = prompt.invoke({
                 "question": question,
+                "user_response": user_response,
                 "metadata_context": metadata_context,
+                "confirmed_context": confirmed_context,
+                "advisor_last_answer": advisor_last_answer,
             })
             planner_output = structured_llm.invoke(prompt_value)
 
-            # 后校验：不以 LLM 的 completeness 为准，按实际输出重算
+            # ── 信任 LLM 的 completeness 判定，不做覆盖 ──
+            # 之前的后校验会根据 tables/fields 是否为空覆盖 completeness，
+            # 但 LLM 填 fields 帮助 Advisor 定位 ≠ full，覆盖会导致误判
             tables = planner_output.tables
             fields = planner_output.fields
+            completeness = planner_output.completeness
 
-            if not tables:
-                planner_output.completeness = "none"
-            elif not fields:
-                planner_output.completeness = "partial"
-            else:
-                planner_output.completeness = "full"
+            # 后校验：修改场景强制路由 ──
+            # 上一轮有已确认方案 + 用户输入是修改意图 → 强制 partial，走 Advisor 重新确认
+            is_modifying = has_confirmed and _is_modification(user_response)
+            if is_modifying:
+                completeness = "partial"
+                if not planner_output.reason:
+                    planner_output.reason = "用户在已确认方案的基础上提出修改，需 Advisor 重新确认"
+
+            # 兜底：LLM 未填 completeness 或填了无效值
+            if completeness not in ("full", "partial", "none"):
+                if not tables:
+                    completeness = "none"
+                elif not fields:
+                    completeness = "partial"
+                else:
+                    completeness = "full"
+
+            # ── 用户确认时，复用 confirmed_context 的精确字段，而不是 LLM 重新推测的 ──
+            # LLM 可能在 full 时自己填了不同字段，但 confirmed_context 是 Advisor + 用户确认过的
+            if completeness == "full" and has_confirmed:
+                tables = planner_entities.get("tables", tables)
+                fields = planner_entities.get("fields", fields)
 
             # ── 收集 top-k 分数（每条截断到 40 字符），用于辅助日志 ──
             table_scores = []
@@ -132,10 +171,6 @@ def build_planner_node(runtime):
             column_scores_str = " | ".join(column_scores)
 
             # ── 步骤③：阈值判定（LLM 为主，FAISS 仅做 full 时极端兜底）──
-            #
-            # none / partial → advisor（字段不确定，必须澄清）
-            # full → seeker（LLM 唯一确定了字段，信任它）
-            #   full 的例外：字段候选爆炸（> 3 倍阈值）→ advisor（FAISS 极端兜底）
 
             # 统计字段层高相似候选数（仅用于 full 时的极端兜底）
             high_similarity_count = 0
@@ -144,24 +179,32 @@ def build_planner_node(runtime):
                 if similarity > HIGH_SIMILARITY_THRESHOLD:
                     high_similarity_count += 1
 
-            if planner_output.completeness in ("none", "partial"):
-                # none：无法定位任何表；partial：有表但字段不确定 → advisor
+            if completeness in ("none", "partial"):
                 route = "advisor"
-                planner_reason = f"LLM判定{planner_output.completeness}: " + planner_output.reason
+                planner_reason = f"LLM判定{completeness}: " + planner_output.reason
+                if is_modifying:
+                    planner_reason = f"LLM判定{completeness}(修改场景强制): " + planner_output.reason
             elif high_similarity_count > MAX_HIGH_SIMILARITY_COUNT * 3:
-                # full 但字段候选爆炸 → FAISS 否决 LLM（极端兜底）
                 route = "advisor"
                 planner_reason = f"LLM判定full但字段候选过多({high_similarity_count} > {MAX_HIGH_SIMILARITY_COUNT * 3}): {planner_output.reason}"
             else:
-                # full 且候选正常 → trust LLM
                 route = "seeker"
                 planner_reason = "LLM判定映射完整: " + planner_output.reason
+
+            # ── 构建 planner_entities 返回值，保留 Advisor 设置的 confirmed 标记 ──
+            # confirmed 是 Advisor 通过 confirm_selection 工具设置的，Planner 不应覆盖
+            new_entities = {
+                "tables": tables,
+                "fields": fields,
+                "completeness": completeness,
+                "confirmed": has_confirmed and completeness == "full",  # 用户确认 full → 保留 confirmed
+            }
 
             # ── 日志：主行只放关键决策信息 ──
             log_node_end(
                 "planner",
                 route=route,
-                completeness=planner_output.completeness,
+                completeness=completeness,
                 tables=str(tables),
                 fields=str(fields),
                 high_sim=high_similarity_count,
@@ -176,11 +219,7 @@ def build_planner_node(runtime):
                 "route": route,
                 "planner_reason": planner_reason,
                 "original_question": original_question,
-                "planner_entities": {
-                    "tables": planner_output.tables,
-                    "fields": planner_output.fields,
-                    "completeness": planner_output.completeness,
-                },
+                "planner_entities": new_entities,
             }
 
         except Exception as error:

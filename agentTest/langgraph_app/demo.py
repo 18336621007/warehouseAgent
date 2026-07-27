@@ -9,7 +9,7 @@ from agentTest.config.advisor import MAX_DEMO_ADVISOR_TURNS
 def run_demo():
     runtime = build_graph_runtime()
     app = build_supervisor_graph(runtime)
-    config = {"configurable": {"thread_id": "demo-session-1"}} # tread_id用于区分不同会话，这里先写死
+    config = {"configurable": {"thread_id": "demo-session-1"}}
     print("=" * 60)
     print("  欢迎使用智能数仓助手")
     print("  输入 exit 或 quit 退出对话")
@@ -25,25 +25,24 @@ def run_demo():
     original_question = current_question  # 当前话题的原始问题
     advisor_turns = 0  # 同一话题内 Advisor 已追问轮数
     round_num = 1  # 全局轮次计数
+    advisor_last_answer = ""  # 上轮 Advisor 的回复，传给 Planner 帮助理解用户的选择
 
     while True:
-        # 用户简略回复（"1"\"a"\"好的"等）→ Planner 用原始问题保证语义完整
+        # 用户简略回复（"1""A""好的"等）→ Planner 用原始问题保证语义完整
         # 但 Advisor 用 user_response 看到用户的真实选择
-        question_for_planner = current_question
-        if len(current_question.strip()) <= 5:
-            question_for_planner = original_question
+        is_short = len(current_question.strip()) <= 5
+        question_for_planner = original_question if is_short else current_question
 
         # 轮次分隔线
         log_round_separator(round_num)
         # 记录本轮用户输入
         log_user_input(current_question)
 
-        # 每轮一次完整图执行：Planner → Advisor 或 Seeker → END
-        # user_response 传递用户原话，Advisor 据此理解"1"/"A"/"月租"等选择
         result = app.invoke({
                     "question": question_for_planner,
                     "original_question": original_question,
-                    "user_response": current_question,  # 新增：用户实际输入
+                    "user_response": current_question,
+                    "advisor_last_answer": advisor_last_answer,  # 上轮 Advisor 回复，Planner 用此理解 "1""A" 的含义
                 },
                 config)
 
@@ -53,12 +52,15 @@ def run_demo():
         if route == "advisor":
             # Advisor 给出了追问/建议，展示给用户
             print(f"\nAI: {result.get('final_answer', '')}")
+            # 保存 Advisor 本轮的回复，供下一轮 Planner 理解用户的简短选择
+            advisor_last_answer = result.get("final_answer", "")
             advisor_turns += 1
 
             # 硬止损：追问超过上限，提示用户重新描述
             if advisor_turns >= MAX_DEMO_ADVISOR_TURNS:
                 print("\nAI: 抱歉，经过多轮沟通我仍无法确定您的需求，请尝试重新描述。")
                 advisor_turns = 0
+                advisor_last_answer = ""
                 current_question = input("\n你: ").strip()
                 if not current_question or current_question.lower() in ("exit", "quit"):
                     print("结束对话。")
@@ -76,6 +78,7 @@ def run_demo():
         # route == "seeker"：Seeker 已生成最终答案
         print(f"\nAI: {result.get('final_answer', '')}")
         advisor_turns = 0  # 新话题，重置计数
+        advisor_last_answer = ""  # 新话题，清空
 
         current_question = input("\n你: ").strip()
         if not current_question or current_question.lower() in ("exit", "quit"):
