@@ -5,7 +5,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_community.vectorstores.utils import DistanceStrategy
 
-_CACHE_EXAMPLE_DIR = "cache/example_faiss_index"
+# 3级向上到agentTest目录，与其他FAISS缓存同路径
+_CACHE_EXAMPLE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "langgraph_app", "cache", "example_faiss_index")
 
 
 class ExampleVectorStore:

@@ -8,15 +8,17 @@ from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.llm import LLM
 
 # 向量库磁盘缓存路径
-_CACHE_SCHEMA_DIR = "cache/schema_faiss_index"
-_CACHE_ENRICHED_DIR = "cache/enriched_faiss_index"
+import os
+_CACHE_BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "langgraph_app", "cache")
+_CACHE_SCHEMA_DIR = os.path.join(_CACHE_BASE, "schema_faiss_index")
+_CACHE_ENRICHED_DIR = os.path.join(_CACHE_BASE, "enriched_faiss_index")
 
 # 库级 FAISS 落盘路径
-_CACHE_DB_DIR = "cache/db_faiss_index"
+_CACHE_DB_DIR = os.path.join(_CACHE_BASE, "db_faiss_index")
 # 表级 FAISS 落盘路径
-_CACHE_TABLE_DIR = "cache/table_faiss_index"
+_CACHE_TABLE_DIR = os.path.join(_CACHE_BASE, "table_faiss_index")
 # 字段级 FAISS 落盘路径
-_CACHE_COLUMN_DIR = "cache/column_faiss_index"
+_CACHE_COLUMN_DIR = os.path.join(_CACHE_BASE, "column_faiss_index")
 
 # 简要注释：创建 Schema RAG 链并统一返回相关对象（原始版）。
 def build_schema_rag_app(embedding):
