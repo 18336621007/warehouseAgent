@@ -4,8 +4,7 @@
 # 第一个值表示是否通过
 # 第二个值表示提示信息
 from agentTest.db.hive_guardrails import validate_sql_with_guardrails
-from agentTest.langgraph_app.runtime.graph_logger import log_node_end
-from agentTest.langgraph_app.runtime.graph_logger import log_node_start
+from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_event, log_node_start
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.validate.sql_validate import validate_hive_sql
 
@@ -13,10 +12,11 @@ from agentTest.validate.sql_validate import validate_hive_sql
 def validate_sql_node(state: AgentState):
     generated_sql = state.get("generated_sql", "")
 
-    # 方案B：非聚合查询缺 LIMIT → 自动追加（安全兜底，不影响 LLM 生成聚合 SQL）
-    upper_sql = generated_sql.upper().rstrip(";").strip()
-    if "LIMIT" not in upper_sql and "GROUP BY" not in upper_sql:
-        generated_sql = upper_sql + " LIMIT 100"
+    # 缺少 LIMIT → 程序自动追加，无需 LLM 重生成（所有 Hive 查询都必须带 LIMIT）
+    sql_clean = generated_sql.rstrip(";").strip()
+    if "LIMIT" not in sql_clean.upper():
+        generated_sql = sql_clean + " LIMIT 1000"
+        log_node_event("validate_sql", "自动追加 LIMIT 1000")
 
     # 打印节点开始日志
     log_node_start("validate_sql", sql=str(generated_sql))

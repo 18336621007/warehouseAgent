@@ -13,7 +13,7 @@ from datetime import datetime
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
 from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
-from agentTest.langgraph_app.runtime.graph_logger import log_node_end
+from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
@@ -187,8 +187,13 @@ def build_planner_node(runtime):
             # ── planner_entities 只写 Planner 自己的分析结果，不写 confirmed 标记 ──
             # confirmed 由 confirmed_plan 独立管理
             new_entities = {
+                "table": tables[0] if tables else "",
                 "tables": tables,
                 "fields": fields,
+                "measures": [],       # Planner不区分度量/维度，留空
+                "dimensions": [],
+                "time_field": "pt_dt",
+                "filters": "",
                 "completeness": completeness,
             }
 
@@ -214,12 +219,13 @@ def build_planner_node(runtime):
 
             # Planner 路由 seeker 时，若 Advisor 未写入 confirmed_plan，自动提升 planner_entities 为兜底方案
             # 确保 generate_sql 的一致性校验能检测到方案偏差（如误用不在方案中的字段）
-            if route == "seeker" and not has_confirmed and tables:
-                return_value["confirmed_plan"] = {
-                    "tables": tables,
-                    "fields": fields,
-                    "confirmed_at": datetime.now().isoformat(),
-                }
+            if route == "seeker" and not has_confirmed:
+                # 企业级规则：没有confirmed_plan就不能进Seeker，强制路由Advisor
+                route = "advisor"
+                planner_reason = "无已确认方案（Advisor未调用confirm_selection），需Advisor澄清后重新判定"
+                log_node_event("planner", "强制路由advisor: 缺少confirmed_plan")
+                return_value["route"] = route
+                return_value["planner_reason"] = planner_reason
 
             return return_value
 

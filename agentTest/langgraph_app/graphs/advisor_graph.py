@@ -48,6 +48,28 @@ def _get_tool_call_args(messages, tool_name):
     return results
 
 
+def _build_confirmation_message(plan: dict) -> str:
+    """用confirmed_plan构造标准化确认消息，杜绝LLM编造查询结果"""
+    table = plan.get("table", "")
+    measures = plan.get("measures", [])
+    dimensions = plan.get("dimensions", [])
+    time_field = plan.get("time_field", "pt_dt")
+    time_range = plan.get("time_range", "") or "昨天"
+    filters = plan.get("filters", "")
+
+    lines = ["已锁定分析方案：", f"- 数据表：{table}"]
+    if measures:
+        lines.append(f"- 度量：{', '.join(measures)}")
+    if dimensions:
+        lines.append(f"- 维度：{', '.join(dimensions)}")
+    lines.append(f"- 时间：{time_field} = {time_range}")
+    if filters:
+        lines.append(f"- 过滤：{filters}")
+    lines.append("")
+    lines.append('以上信息确认无误？回复"好"开始查询。')
+    return "\n".join(lines)
+
+
 def build_advisor_subgraph(runtime):
     """构建 Advisor ReAct Agent 子图 —— 一问一答，含 confirm_selection 合规校验"""
     llm = ChatOpenAI(
@@ -86,7 +108,13 @@ def build_advisor_subgraph(runtime):
         log_node_start("advisor_agent", question=question[:60])
 
         history = list(state.get("advisor_messages") or [])
-        history.append(HumanMessage(content=question))
+                # Planner候选表注入，Advisor在此基础上做字段检索
+        planner_tables = (state.get("planner_entities") or {}).get("tables", [])
+        if planner_tables and not history:
+            table_ctx = "\n(Planner已筛选候选表: " + ", ".join(planner_tables) + "，请在此基础上选择）"
+            history.append(HumanMessage(content=question + table_ctx))
+        else:
+            history.append(HumanMessage(content=question))
 
         new_history = None
         retries = 0
@@ -136,6 +164,7 @@ def build_advisor_subgraph(runtime):
             measures = args.get("measures", [])
             dimensions = args.get("dimensions", [])
             time_field = args.get("time_field", "pt_dt")
+            time_range = args.get("time_range", "")
             filters = args.get("filters", "")
 
             # 图级兜底校验：从 search_columns 返回中提取字段名，自动补齐遗漏维度
@@ -179,6 +208,7 @@ def build_advisor_subgraph(runtime):
                 "measures": list(measures),
                 "dimensions": list(dimensions),
                 "time_field": time_field,
+                "time_range": time_range,
                 "filters": filters,
                 "fields": all_fields_dedup,
                 "confirmed_at": datetime.now().isoformat(),
@@ -192,7 +222,7 @@ def build_advisor_subgraph(runtime):
 
             log_node_event("advisor_agent",
                 f"confirmed_plan: table={table}, measures={measures}, "
-                f"dimensions={dimensions}, time={time_field}, "
+                f"dimensions={dimensions}, time={time_field}({time_range or '未指定'}), "
                 f"filters={filters or '无'}, missing_dims={missing_dims if missing_dims else '无'}")
 
         log_node_end("advisor_agent",
@@ -202,12 +232,16 @@ def build_advisor_subgraph(runtime):
                      ms=elapsed_ms(timer))
 
         return_value = {
-            "final_answer": last_msg.content if last_msg.content else "",
             "advisor_messages": new_history,
         }
 
         if confirmed_plan:
+            # 确认阶段：用标准化消息代替LLM原文，杜绝编造假结果
             return_value["confirmed_plan"] = confirmed_plan
+            return_value["final_answer"] = _build_confirmation_message(confirmed_plan)
+        else:
+            # 澄清阶段：保留LLM原文
+            return_value["final_answer"] = last_msg.content if last_msg.content else ""
 
         return return_value
 

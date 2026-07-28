@@ -332,8 +332,7 @@ def init_evaluator_table():
                 ("resolved_question", "TEXT AFTER question"),
                 ("user_score", "FLOAT DEFAULT 75 AFTER llm_self_score"),
                 ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
-                ("example_hash", "VARCHAR(32) DEFAULT  AFTER is_high_quality"),
-                ("example_hash", "VARCHAR(32) DEFAULT ''' AFTER is_high_quality"),
+                ("example_hash", "VARCHAR(32) DEFAULT '' AFTER is_high_quality"),
             ]:
                 cursor.execute("""
                     SELECT COUNT(*) FROM information_schema.COLUMNS

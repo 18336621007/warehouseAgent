@@ -24,7 +24,7 @@ DATE_FORMAT_HIVE_EXPR = {
 
 
 def _build_fallback_sql(confirmed_plan: dict) -> str:
-    table = confirmed_plan.get("table", "")
+    table = confirmed_plan.get("table", "") or (confirmed_plan.get("tables", [None])[0] if confirmed_plan.get("tables") else "")
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
@@ -56,13 +56,14 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
 def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     issues = []
     sql_upper = sql.upper()
-    table = confirmed_plan.get("table", "")
+    table = confirmed_plan.get("table", "") or (confirmed_plan.get("tables", [None])[0] if confirmed_plan.get("tables") else "")
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
+    time_range = confirmed_plan.get("time_range", "") or "昨天"  # 未指定默认昨天（企业惯例：当天分区常为空）
     filters = confirmed_plan.get("filters", "")
 
-    if not table or not measures:
+    if not table:
         return issues
 
     # 1. 表名校验
@@ -101,7 +102,15 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
         if time_field.lower() not in where_part.lower():
             issues.append(f"时间分区字段 {time_field} 不在 WHERE 条件中")
 
-    # 5. filters 校验
+    # 5. 日期值校验：time_range说"昨天"但SQL没用date_sub → 报错
+    if time_range:
+        sql_lower = sql.lower()
+        if "昨天" in time_range and "date_sub" not in sql_lower:
+            issues.append(f"时间条件应为昨天(date_sub(current_date(),1))，但SQL中未找到date_sub，疑似使用了当天日期")
+        elif "今天" in time_range and "current_date" not in sql_lower:
+            issues.append(f"时间条件应为今天(current_date())，但SQL中未找到current_date")
+
+    # 6. filters 校验
     if filters and filters.strip():
         filter_normalized = filters.strip().lower().replace(" ", "")
         sql_normalized = sql.lower().replace(" ", "")
@@ -114,7 +123,7 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
 def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer: str, llm) -> str:
     tables = confirmed_plan.get("tables", [])
     fields = confirmed_plan.get("fields", [])
-    measures = confirmed_plan.get("measures", [])
+    measures = confirmed_plan.get("measures", []) or confirmed_plan.get("fields", [])
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
     filters = confirmed_plan.get("filters", "")
@@ -155,7 +164,7 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
 
     prompt_value = check_prompt.invoke({
         "table": ", ".join(tables),
-        "measures": ", ".join(measures) if measures else ", ".join(fields),
+        "measures": ", ".join(measures) if measures else "无（仅查询维度信息）",
         "dimensions": ", ".join(dimensions) if dimensions else "无",
         "time_field": time_field,
         "filters": filters or "无",
@@ -176,9 +185,13 @@ def build_generate_sql_node(runtime):
 
     def generate_sql_node(state: AgentState) -> dict:
         confirmed_plan = state.get("confirmed_plan") or {}
+        # 企业级规则：走到 generate_sql 的请求必须有 confirmed_plan
+        if not confirmed_plan.get("table") and not confirmed_plan.get("tables"):
+            log_node_error("generate_sql", error="缺少confirmed_plan，无法生成SQL（应在此之前由Planner兜底路由Advisor）")
+            return {"generated_sql": "", "sql_error": "缺少已确认的分析方案"}
         confirmed_section = ""
-        if confirmed_plan.get("table"):
-            table = confirmed_plan.get("table", "")
+        if confirmed_plan.get("table") or confirmed_plan.get("tables"):
+            table = confirmed_plan.get("table", "") or (confirmed_plan.get("tables", [None])[0] if confirmed_plan.get("tables") else "")
             measures = confirmed_plan.get("measures", [])
             dimensions = confirmed_plan.get("dimensions", [])
             time_field = confirmed_plan.get("time_field", "pt_dt")
@@ -189,7 +202,8 @@ def build_generate_sql_node(runtime):
                 parts.append(f"- 度量字段（必须用聚合函数 SUM/COUNT/AVG）: {', '.join(measures)}")
             if dimensions:
                 parts.append(f"- 维度字段（必须在 SELECT 和 GROUP BY 中）: {', '.join(dimensions)}")
-            parts.append(f"- 时间分区（必须在 WHERE 中）: {time_field}")
+            time_range_cs = confirmed_plan.get("time_range", "") or "昨天"
+            parts.append(f"- 时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
             if filters:
                 parts.append(f"- 额外过滤条件（必须在 WHERE 中）: {filters}")
 
@@ -231,7 +245,7 @@ def build_generate_sql_node(runtime):
 
             # ── 方案一致性校验 ──
             consistency_retry = 0
-            if confirmed_plan.get("table"):
+            if confirmed_plan.get("table") or confirmed_plan.get("tables"):
                 while consistency_retry < MAX_CONSISTENCY_RETRIES:
                     inconsistency = _check_plan_consistency(
                         generated_sql, confirmed_plan, advisor_last_answer, llm
