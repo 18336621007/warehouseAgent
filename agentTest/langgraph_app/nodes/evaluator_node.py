@@ -1,5 +1,6 @@
-﻿# Evaluator 评估节点：收集指标 → LLM 自评 → 计算综合分 → 入库
+# Evaluator 评估节点：收集指标 → LLM 自评 → 计算综合分 → 入库
 # 放在 Seeker 子图 build_final_answer 之后，只在 Seeker 通道触发
+# 始终入库 MySQL（返回 dialogue_id 供用户后续打分），FAISS 仅高分入库
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -18,7 +19,7 @@ from agentTest.metadata.mysql_store import save_evaluated_dialogue, load_enriche
 
 
 def build_evaluator_node(runtime):
-    """构建 Evaluator 节点：LLM 自评打分 + 高分对话入库（MySQL + FAISS）"""
+    """构建 Evaluator 节点：LLM 自评打分 + 入库（MySQL 始终 / FAISS 仅高分）"""
     example_vector_store = runtime.get("example_vector_store")
     llm = ChatOpenAI(
         api_key=get_openai_api_key(),
@@ -73,84 +74,82 @@ def build_evaluator_node(runtime):
             })
             self_score: EvaluatorSelfScore = structured_llm.invoke(prompt_value)
 
-            # ── 步骤3：计算综合分 ──
+            # ── 步骤3：计算综合分（初始用户分 = 默认 75）──
             llm_self_avg = (self_score.coherence_score + self_score.satisfaction_score) / 2
+            user_score = DEFAULT_USER_SCORE
             comprehensive = round(
                 WEIGHT_TIME * time_score
                 + WEIGHT_TURNS * turn_score
                 + WEIGHT_LLM_SELF * llm_self_avg
-                + WEIGHT_USER * DEFAULT_USER_SCORE,
+                + WEIGHT_USER * user_score,
                 1,
             )
             is_high_quality = comprehensive >= HIGH_QUALITY_THRESHOLD
 
-            # ── 步骤4：高分对话入库（MySQL + FAISS 双写）──
-            if is_high_quality:
-                confirmed_plan = state.get("confirmed_plan") or {}
-                tables_used = confirmed_plan.get("tables", [])
-                fields_used = confirmed_plan.get("fields", [])
+            # ── 步骤4：构建 resolved_question 和 domain_tag（入库共用）──
+            confirmed_plan = state.get("confirmed_plan") or {}
+            tables_used = confirmed_plan.get("tables", [])
+            fields_used = confirmed_plan.get("fields", [])
 
-                # 构建解析后问题：原始问题 + 确认方案摘要
-                # 防止模糊问题被误匹配（如"回流订单数"被错误关联到"月租订单"口径）
-                resolved_question = str(question)
-                if confirmed_plan.get("tables"):
-                    tables_str = ", ".join(tables_used)
-                    fields_str = ", ".join(fields_used)
-                    resolved_question = (
-                        f"{question}"
-                        f"（确认方案: 表={tables_str}, 字段={fields_str}）"
-                    )
+            resolved_question = str(question)
+            if confirmed_plan.get("tables"):
+                tables_str = ", ".join(tables_used)
+                fields_str = ", ".join(fields_used)
+                resolved_question = f"{question}（确认方案: 表={tables_str}, 字段={fields_str}）"
 
-                # 从增强元数据获取 domain_tag
-                enriched = load_enriched_tables()
-                domain_tag = ""
-                for tbl in tables_used:
-                    if tbl in enriched:
-                        domain_tag = enriched[tbl].get("domain", "")
-                        break
+            enriched = load_enriched_tables()
+            domain_tag = ""
+            for tbl in tables_used:
+                if tbl in enriched:
+                    domain_tag = enriched[tbl].get("domain", "")
+                    break
 
-                # MySQL 写入
+            # ── 步骤5：MySQL 始终入库，返回 ID 供用户后续打分 ──
+            dialogue_id = None
+            try:
+                dialogue_id = save_evaluated_dialogue(
+                    question=str(question),
+                    resolved_question=resolved_question,
+                    sql=str(generated_sql),
+                    answer=str(final_answer),
+                    tables_used=tables_used,
+                    fields_used=fields_used,
+                    advisor_turns=advisor_turns,
+                    total_time_ms=total_time_ms,
+                    time_score=time_score,
+                    turn_score=turn_score,
+                    llm_self_score=llm_self_avg,
+                    comprehensive_score=comprehensive,
+                    domain_tag=domain_tag,
+                    user_score=user_score,
+                )
+            except Exception as db_error:
+                log_node_error("evaluator", error=f"MySQL入库失败: {db_error}")
+
+            # ── 步骤6：FAISS 仅高分入库 ──
+            if is_high_quality and example_vector_store is not None:
                 try:
-                    save_evaluated_dialogue(
-                        question=str(question),
-                        resolved_question=resolved_question,
+                    example_vector_store.add_example(
+                        question=resolved_question,
                         sql=str(generated_sql),
                         answer=str(final_answer),
-                        tables_used=tables_used,
-                        fields_used=fields_used,
-                        advisor_turns=advisor_turns,
-                        total_time_ms=total_time_ms,
-                        time_score=time_score,
-                        turn_score=turn_score,
-                        llm_self_score=llm_self_avg,
-                        comprehensive_score=comprehensive,
+                        tables=tables_used,
+                        fields=fields_used,
                         domain_tag=domain_tag,
+                        score=comprehensive,
                     )
-                except Exception as db_error:
-                    log_node_error("evaluator", error=f"MySQL入库失败: {db_error}")
-
-                # FAISS 写入：page_content 用 resolved_question，语义检索更精准
-                if example_vector_store is not None:
-                    try:
-                        example_vector_store.add_example(
-                            question=resolved_question,  # 用解析后问题，而非原始模糊问题
-                            sql=str(generated_sql),
-                            answer=str(final_answer),
-                            tables=tables_used,
-                            fields=fields_used,
-                            domain_tag=domain_tag,
-                            score=comprehensive,
-                        )
-                    except Exception as faiss_error:
-                        log_node_error("evaluator", error=f"FAISS入库失败: {faiss_error}")
+                except Exception as faiss_error:
+                    log_node_error("evaluator", error=f"FAISS入库失败: {faiss_error}")
 
             log_node_end(
                 "evaluator",
                 comprehensive=comprehensive,
+                user=round(user_score, 1),
                 time=round(time_score, 1),
                 turns=round(turn_score, 1),
                 self=round(llm_self_avg, 1),
                 high_quality=is_high_quality,
+                dialogue_id=dialogue_id,
                 comment=self_score.brief_comment,
                 ms=elapsed_ms(timer),
             )
@@ -158,6 +157,7 @@ def build_evaluator_node(runtime):
             return {
                 "evaluator_score": comprehensive,
                 "evaluator_self_score": round(llm_self_avg, 1),
+                "evaluator_dialogue_id": dialogue_id or 0,
             }
 
         except Exception as error:

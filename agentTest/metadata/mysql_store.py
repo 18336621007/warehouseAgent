@@ -1,4 +1,4 @@
-﻿"""MySQL 元数据存储层，负责 enriched_metadata 的读写和断点续跑，每次调用都会对比mysql中已有的表集合，增量更新"""
+"""MySQL 元数据存储层，负责 enriched_metadata 的读写和断点续跑，每次调用都会对比mysql中已有的表集合，增量更新"""
 import json
 import pymysql
 
@@ -297,10 +297,11 @@ def load_enriched_columns():
         return result
     finally:
         conn.close()
+
 # ── Evaluator 高质量对话存储 ────────────────────────────────────────
 
 def init_evaluator_table():
-    """建表（幂等），存储 Evaluator 评估后的高质量对话"""
+    """建表（幂等），存储 Evaluator 评估后的对话，user_score 支持用户后续打分"""
     conn = _get_connection()
     try:
         with conn.cursor() as cursor:
@@ -319,23 +320,27 @@ def init_evaluator_table():
                     time_score FLOAT DEFAULT 0,
                     turn_score FLOAT DEFAULT 0,
                     llm_self_score FLOAT DEFAULT 0,
+                    user_score FLOAT DEFAULT 75,
                     comprehensive_score FLOAT DEFAULT 0,
                     is_high_quality TINYINT(1) DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
-            # 兼容旧表：如果 resolved_question 列不存在则补充
-            cursor.execute("""
-                SELECT COUNT(*) FROM information_schema.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE()
-                  AND TABLE_NAME = 'evaluated_dialogues'
-                  AND COLUMN_NAME = 'resolved_question'
-            """)
-            if cursor.fetchone()[0] == 0:
+            # 兼容旧表：补充缺失字段
+            for col, col_def in [
+                ("resolved_question", "TEXT AFTER question"),
+                ("user_score", "FLOAT DEFAULT 75 AFTER llm_self_score"),
+                ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+            ]:
                 cursor.execute("""
-                    ALTER TABLE evaluated_dialogues
-                    ADD COLUMN resolved_question TEXT AFTER question
-                """)
+                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'evaluated_dialogues'
+                      AND COLUMN_NAME = %s
+                """, (col,))
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute(f"ALTER TABLE evaluated_dialogues ADD COLUMN {col} {col_def}")
         conn.commit()
     finally:
         conn.close()
@@ -355,12 +360,10 @@ def save_evaluated_dialogue(
     llm_self_score: float,
     comprehensive_score: float,
     domain_tag: str = "",
+    user_score: float = 75,
 ):
-    """保存一条评估后的对话记录，仅 ≥ 80 分的入库"""
+    """保存一条评估后的对话记录，始终入库并返回 ID"""
     is_high_quality = 1 if comprehensive_score >= 80 else 0
-    if not is_high_quality:
-        return
-
     conn = _get_connection()
     try:
         with conn.cursor() as cursor:
@@ -368,24 +371,53 @@ def save_evaluated_dialogue(
                 INSERT INTO evaluated_dialogues
                     (question, resolved_question, final_sql, final_answer, tables_used, fields_used,
                      domain_tag, advisor_turns, total_time_ms, time_score, turn_score,
-                     llm_self_score, comprehensive_score, is_high_quality)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     llm_self_score, user_score, comprehensive_score, is_high_quality)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                question,
-                resolved_question,
-                sql,
-                answer,
+                question, resolved_question, sql, answer,
                 ",".join(tables_used) if tables_used else "",
                 ",".join(fields_used) if fields_used else "",
-                domain_tag,
-                advisor_turns,
-                total_time_ms,
-                time_score,
-                turn_score,
-                llm_self_score,
-                comprehensive_score,
-                is_high_quality,
+                domain_tag, advisor_turns, total_time_ms, time_score, turn_score,
+                llm_self_score, user_score, comprehensive_score, is_high_quality,
             ))
+            dialogue_id = cursor.lastrowid
+        conn.commit()
+        return dialogue_id
+    finally:
+        conn.close()
+
+
+def update_user_score(dialogue_id: int, user_score: float):
+    """用户打分后更新 MySQL，重算综合分并刷新 is_high_quality"""
+    from agentTest.config.evaluator import (
+        WEIGHT_TIME, WEIGHT_TURNS, WEIGHT_LLM_SELF, WEIGHT_USER,
+        HIGH_QUALITY_THRESHOLD,
+    )
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 读取现有分数
+            cursor.execute(
+                "SELECT time_score, turn_score, llm_self_score FROM evaluated_dialogues WHERE id = %s",
+                (dialogue_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return
+            time_score, turn_score, llm_self = row
+            # 用真实用户分重算综合分
+            comprehensive = round(
+                WEIGHT_TIME * (time_score or 0)
+                + WEIGHT_TURNS * (turn_score or 0)
+                + WEIGHT_LLM_SELF * (llm_self or 0)
+                + WEIGHT_USER * user_score,
+                1,
+            )
+            is_high = 1 if comprehensive >= HIGH_QUALITY_THRESHOLD else 0
+            cursor.execute(
+                "UPDATE evaluated_dialogues SET user_score = %s, comprehensive_score = %s, is_high_quality = %s WHERE id = %s",
+                (user_score, comprehensive, is_high, dialogue_id),
+            )
         conn.commit()
     finally:
         conn.close()
