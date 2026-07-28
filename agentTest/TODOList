@@ -8,3 +8,7 @@
 第二层：监测调用“方案确认”前是否调过“列查询”，没有就注入提示词冲泡
 第三层：监控拦截次数到日志
 
+执行sql和方案不一致：
+重构confirm_selection参数，包括表，指标，维度，时间，额外过滤字段
+confirmed_plan与confirm_selection后对比，保证状态一致
+生成sql校验是否覆盖confirmed_plan所有字段，若不一致重试
