@@ -332,6 +332,8 @@ def init_evaluator_table():
                 ("resolved_question", "TEXT AFTER question"),
                 ("user_score", "FLOAT DEFAULT 75 AFTER llm_self_score"),
                 ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+                ("example_hash", "VARCHAR(32) DEFAULT  AFTER is_high_quality"),
+                ("example_hash", "VARCHAR(32) DEFAULT ''' AFTER is_high_quality"),
             ]:
                 cursor.execute("""
                     SELECT COUNT(*) FROM information_schema.COLUMNS
@@ -361,6 +363,7 @@ def save_evaluated_dialogue(
     comprehensive_score: float,
     domain_tag: str = "",
     user_score: float = 75,
+    example_hash: str = "",
 ):
     """保存一条评估后的对话记录，始终入库并返回 ID"""
     is_high_quality = 1 if comprehensive_score >= 80 else 0
@@ -371,14 +374,15 @@ def save_evaluated_dialogue(
                 INSERT INTO evaluated_dialogues
                     (question, resolved_question, final_sql, final_answer, tables_used, fields_used,
                      domain_tag, advisor_turns, total_time_ms, time_score, turn_score,
-                     llm_self_score, user_score, comprehensive_score, is_high_quality)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     llm_self_score, user_score, comprehensive_score, is_high_quality, example_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 question, resolved_question, sql, answer,
                 ",".join(tables_used) if tables_used else "",
                 ",".join(fields_used) if fields_used else "",
                 domain_tag, advisor_turns, total_time_ms, time_score, turn_score,
                 llm_self_score, user_score, comprehensive_score, is_high_quality,
+                example_hash,
             ))
             dialogue_id = cursor.lastrowid
         conn.commit()
@@ -388,7 +392,9 @@ def save_evaluated_dialogue(
 
 
 def update_user_score(dialogue_id: int, user_score: float):
-    """用户打分后更新 MySQL，重算综合分并刷新 is_high_quality"""
+    """用户打分后更新 MySQL，重算综合分并刷新 is_high_quality
+    返回 dict：{ was_high, is_high, hash_id, question, sql, answer, tables, fields, domain, score }
+    供 FAISS 同步：原先高分变低分则删，原先低分变高分则加"""
     from agentTest.config.evaluator import (
         WEIGHT_TIME, WEIGHT_TURNS, WEIGHT_LLM_SELF, WEIGHT_USER,
         HIGH_QUALITY_THRESHOLD,
@@ -396,28 +402,54 @@ def update_user_score(dialogue_id: int, user_score: float):
     conn = _get_connection()
     try:
         with conn.cursor() as cursor:
-            # 读取现有分数
+            # 读取现有分数及 FAISS 同步所需字段
             cursor.execute(
-                "SELECT time_score, turn_score, llm_self_score FROM evaluated_dialogues WHERE id = %s",
+                """SELECT time_score, turn_score, llm_self_score, is_high_quality,
+                          example_hash, resolved_question, final_sql, final_answer,
+                          tables_used, fields_used, domain_tag, comprehensive_score
+                   FROM evaluated_dialogues WHERE id = %s""",
                 (dialogue_id,)
             )
             row = cursor.fetchone()
             if not row:
-                return
-            time_score, turn_score, llm_self = row
+                return {}
+            time_s, turn_s, llm_s, old_high = row[0], row[1], row[2], row[3]
+            old_hash = row[4] or ''
+            old_q = row[5] or ''
+            old_sql = row[6] or ''
+            old_answer = row[7] or ''
+            old_tables = row[8] or ''
+            old_fields = row[9] or ''
+            old_domain = row[10] or ''
+
             # 用真实用户分重算综合分
             comprehensive = round(
-                WEIGHT_TIME * (time_score or 0)
-                + WEIGHT_TURNS * (turn_score or 0)
-                + WEIGHT_LLM_SELF * (llm_self or 0)
+                WEIGHT_TIME * (time_s or 0)
+                + WEIGHT_TURNS * (turn_s or 0)
+                + WEIGHT_LLM_SELF * (llm_s or 0)
                 + WEIGHT_USER * user_score,
                 1,
             )
             is_high = 1 if comprehensive >= HIGH_QUALITY_THRESHOLD else 0
+            was_high = bool(old_high)
+
             cursor.execute(
                 "UPDATE evaluated_dialogues SET user_score = %s, comprehensive_score = %s, is_high_quality = %s WHERE id = %s",
                 (user_score, comprehensive, is_high, dialogue_id),
             )
         conn.commit()
+
+        return {
+            "was_high": was_high,
+            "is_high": bool(is_high),
+            "hash_id": old_hash,
+            "question": old_q,
+            "sql": old_sql,
+            "answer": old_answer,
+            "tables": [t.strip() for t in old_tables.split(",") if t.strip()] if old_tables else [],
+            "fields": [f.strip() for f in old_fields.split(",") if f.strip()] if old_fields else [],
+            "domain_tag": old_domain,
+            "score": comprehensive,
+        }
     finally:
         conn.close()

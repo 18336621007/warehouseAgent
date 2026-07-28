@@ -187,8 +187,28 @@ def submit_score():
             msg["evaluator"]["user_score"] = score
             break
     if dialogue_id:
-        try: update_user_score(dialogue_id, score * 20)
-        except Exception as e: print(f"[server] update score failed: {e}")
+        try:
+            result = update_user_score(dialogue_id, score * 20)
+            # FAISS 同步：原先高分变低分则删，原先低分变高分则加
+            if result and result.get("was_high") != result.get("is_high"):
+                example_store = RUNTIME.get("example_vector_store")
+                if example_store:
+                    hash_id = result.get("hash_id", "")
+                    if hash_id:
+                        example_store.sync_by_score(
+                            hash_id=hash_id,
+                            question=result.get("question", ""),
+                            sql=result.get("sql", ""),
+                            answer=result.get("answer", ""),
+                            tables=result.get("tables", []),
+                            fields=result.get("fields", []),
+                            domain_tag=result.get("domain_tag", ""),
+                            score=result.get("score", 0),
+                            is_high=result.get("is_high", False),
+                        )
+                        print(f"[server] FAISS synced: was_high={result.get('was_high')} -> is_high={result.get('is_high')}")
+        except Exception as e:
+            print(f"[server] update score failed: {e}")
     return jsonify({"success": True})
 
 

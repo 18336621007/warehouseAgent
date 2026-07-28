@@ -15,6 +15,7 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.runtime.graph_logger import (
     log_node_start, log_node_end, log_node_error, elapsed_ms, start_timer,
 )
+import hashlib
 from agentTest.metadata.mysql_store import save_evaluated_dialogue, load_enriched_tables
 
 
@@ -107,6 +108,7 @@ def build_evaluator_node(runtime):
             # ── 步骤5：MySQL 始终入库，返回 ID 供用户后续打分 ──
             dialogue_id = None
             try:
+                example_hash = hashlib.md5((str(question) + str(generated_sql)).encode()).hexdigest()[:16]
                 dialogue_id = save_evaluated_dialogue(
                     question=str(question),
                     resolved_question=resolved_question,
@@ -122,6 +124,7 @@ def build_evaluator_node(runtime):
                     comprehensive_score=comprehensive,
                     domain_tag=domain_tag,
                     user_score=user_score,
+                example_hash=example_hash,
                 )
             except Exception as db_error:
                 log_node_error("evaluator", error=f"MySQL入库失败: {db_error}")
@@ -129,6 +132,7 @@ def build_evaluator_node(runtime):
             # ── 步骤6：FAISS 仅高分入库 ──
             if is_high_quality and example_vector_store is not None:
                 try:
+                    # hash_id already computed above, reuse
                     example_vector_store.add_example(
                         question=resolved_question,
                         sql=str(generated_sql),
