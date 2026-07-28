@@ -4,6 +4,7 @@ import os, json, hashlib
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_community.vectorstores.utils import DistanceStrategy
+from agentTest.config.planner import EXAMPLE_SIMILARITY_THRESHOLD
 
 # 3级向上到agentTest目录，与其他FAISS缓存同路径
 _CACHE_EXAMPLE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "langgraph_app", "cache", "example_faiss_index")
@@ -102,14 +103,15 @@ class ExampleVectorStore:
         else:
             self.remove_example(hash_id)
 
-    def search_similar(self, question: str, current_tables: list = None, k: int = 3) -> list:
+    def search_similar(self, question: str, current_tables: list = None, k: int = 3, min_similarity: float = EXAMPLE_SIMILARITY_THRESHOLD) -> list:
         """结构感知检索：语义相似 -> 按表/字段重叠度重排序"""
         self._ensure_loaded()
         if self._vector_store is None:
             return []
         docs_with_scores = self._vector_store.similarity_search_with_score(question, k=k * 3)
         candidates = [(doc, score) for doc, score in docs_with_scores
-                      if not doc.metadata.get("_placeholder")]
+                      if not doc.metadata.get("_placeholder")
+                      and (1 - score / 2) >= min_similarity]
         if not candidates:
             return []
         if current_tables:
@@ -123,8 +125,12 @@ class ExampleVectorStore:
                 combined = 0.3 * (1 - score / 2) + 0.7 * structure_score
                 scored.append((doc, combined))
             scored.sort(key=lambda x: x[1], reverse=True)
+            # _similarity 已在 candidates 处理阶段写入，此处直接返回
             return [doc for doc, _ in scored[:k]]
         candidates.sort(key=lambda x: x[1])
+        # 将相似度写入 metadata 供日志使用
+        for doc, score in candidates[:k]:
+            doc.metadata["_similarity"] = round(1 - score / 2, 3)
         return [doc for doc, _ in candidates[:k]]
 
     def _save_to_disk(self):

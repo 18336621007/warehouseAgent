@@ -1,4 +1,4 @@
-# generate_sql_node.py —— SQL 生成节点
+﻿# generate_sql_node.py —— SQL 生成节点
 # 新增 SQL 级全量校验：以 confirmed_plan 为基准，校验表名/度量/维度/时间/过滤条件
 # 新增降级 SQL 构造：LLM 重试仍不一致时，根据 confirmed_plan 直接构造标准 SQL
 import re
@@ -40,7 +40,8 @@ DATE_FORMAT_HIVE_EXPR = {
 
 
 def _build_fallback_sql(confirmed_plan: dict) -> str:
-    table = confirmed_plan.get("table", "") or (confirmed_plan.get("tables", [None])[0] if confirmed_plan.get("tables") else "")
+    tables = confirmed_plan.get("tables") or []
+    table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
@@ -72,7 +73,8 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
 def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     issues = []
     sql_upper = sql.upper()
-    table = confirmed_plan.get("table", "") or (confirmed_plan.get("tables", [None])[0] if confirmed_plan.get("tables") else "")
+    tables = confirmed_plan.get("tables") or []
+    table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
@@ -207,7 +209,8 @@ def build_generate_sql_node(runtime):
             return {"generated_sql": "", "sql_error": "缺少已确认的分析方案"}
         confirmed_section = ""
         if confirmed_plan.get("table") or confirmed_plan.get("tables"):
-            table = confirmed_plan.get("table", "") or (confirmed_plan.get("tables", [None])[0] if confirmed_plan.get("tables") else "")
+            tables = confirmed_plan.get("tables") or []
+            table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
             measures = confirmed_plan.get("measures", [])
             dimensions = confirmed_plan.get("dimensions", [])
             time_field = confirmed_plan.get("time_field", "pt_dt")

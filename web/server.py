@@ -120,6 +120,9 @@ def chat():
                 "generated_sql": "",
                 "planner_entities": {},
                 "retry_count": 0,
+                "evaluator_score": 0,
+                "evaluator_self_score": 0,
+                "evaluator_dialogue_id": 0,
             }
 
         state_input = {

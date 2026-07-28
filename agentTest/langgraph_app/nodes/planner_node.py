@@ -123,6 +123,9 @@ def build_planner_node(runtime):
                         q = doc.metadata.get("question", "")
                         lines.append(f"- {q}")
                     example_context = "\n".join(lines)
+                    top_q = examples[0].metadata.get("question", "")[:50]
+                    sim_val = examples[0].metadata.get("_similarity","?") if examples else "?"
+                    log_node_event("planner", f"优秀示例检索: 命中{len(examples)}条, top_sim={sim_val}, q={top_q}")
 
 
             # ── 步骤②：LLM 结构化解析（含 user_response、confirmed_context、advisor_last_answer）──

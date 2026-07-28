@@ -19,8 +19,8 @@ def build_sql_generation_prompt():
        - 维度字段放入 SELECT 和 GROUP BY
        - 度量字段用 SUM/COUNT/AVG 等聚合函数包裹，不得放入 GROUP BY
     10. 分区字段 pt_dt 格式为 yyyyMMdd（8位数字字符串），时间条件必须用函数表达式，严禁写成字符串字面量：
-        - 昨天：pt_dt = regexp_replace(date_sub(current_date(), 1), '-', '')
-        - 今天：pt_dt = regexp_replace(current_date(), '-', '')
+        - 昨天：pt_dt = date_format(date_sub(current_date(), 1), 'yyyyMMdd')
+        - 今天：pt_dt = date_format(current_date(), 'yyyyMMdd')
         - 禁止：pt_dt = 'current_date' 或 pt_dt = '昨天' 等字符串写法
     11. 所有查询必须包含 pt_dt 分区过滤条件
     12. 如果 {example_section} 不为空，请参考历史优质案例：

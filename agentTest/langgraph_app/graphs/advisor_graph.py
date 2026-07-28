@@ -122,6 +122,9 @@ def build_advisor_subgraph(runtime):
                     lines_ex.append(f"{i}. 问题：{q}")
                     lines_ex.append(f"   对应SQL：{s}...")
                 example_context = "\n".join(lines_ex)
+                top_q = examples[0].metadata.get("question","")[:50] if examples else ""
+                sim_val = examples[0].metadata.get("_similarity","?") if examples else "?"
+                log_node_event("advisor_agent", f"优秀示例检索: 命中{len(examples)}条, top_sim={sim_val}, q={top_q}")
 
         # Planner候选表注入，Advisor在此基础上做字段检索
         planner_tables = (state.get("planner_entities") or {}).get("tables", [])
