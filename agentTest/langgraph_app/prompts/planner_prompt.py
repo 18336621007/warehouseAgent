@@ -61,7 +61,7 @@ PLANNER_SYSTEM_PROMPT = """你是一个 SQL 查询需求分析器。根据元数
 2. tables：完整的"库.表"格式，只填你确定要用的表
 3. fields：只填你能唯一确定要用的字段。如果同一语义下有多个候选（如 reflow_addition_order / extend_reflow_old_order / extend_reflow_new_order），填 partial 而不是 full
 4. reason：一句话说明判断依据
-5. 不要输出任何额外解释，只返回结构化字段"""
+5. 不要输出任何额外解释，只返回结构化字段。请以 json 格式输出"""
 
 PLANNER_USER_TEMPLATE = """
 用户问题：{question}
@@ -72,5 +72,8 @@ PLANNER_USER_TEMPLATE = """
 可用元数据（从向量库检索到的相关表/字段信息）：
 {metadata_context}
 
-请判断该问题能映射到哪些表和字段。
+请判断该问题能映射到哪些表和字段，返回 json 格式。
+
+历史相似查询示例（仅供参考，辅助判断模糊度）：
+{example_context}
 """

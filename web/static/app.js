@@ -128,7 +128,8 @@ async function sendMsg() {
     if (conv) conv.messages.push({ role: "user", content: msg });
 
     var loadingId = showLoading();
-    var thinkingText = "";
+        var thinkingText = "";
+    console.log("[sendMsg] user=" + msg.slice(0, 60) + " thread=" + threadId);
     var finalContent = "", finalSql = "", finalEval = null, finalDialogueId = 0;
 
     try {
@@ -158,12 +159,14 @@ async function sendMsg() {
                         updateLoading(loadingId, event.text);
                         thinkingText += event.text + "\n";
                     } else if (event.type === "done") {
-                        finalContent = event.content;
+                                                finalContent = event.content;
+                        console.log("[sendMsg] done: content=" + (finalContent || "").slice(0, 80));
                         finalSql = event.sql;
                         finalEval = event.evaluator;
                         finalDialogueId = event.dialogue_id || 0;
                     } else if (event.type === "error") {
-                        finalContent = "处理出错: " + event.text;
+                                                finalContent = "处理出错: " + event.text;
+                        console.log("[sendMsg] error: " + event.text);
                     }
                 } catch (parseErr) {}
             }
@@ -173,6 +176,7 @@ async function sendMsg() {
     }
 
     removeLoading(loadingId);
+        console.log("[sendMsg] finalContent=" + (finalContent || "(empty)").slice(0, 100));
     appendMessage("assistant", finalContent || "(无响应)", finalSql, thinkingText, finalEval, finalDialogueId);
     if (conv) {
         conv.messages.push({

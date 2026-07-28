@@ -75,4 +75,8 @@ confirm_selection 的参数规则：
 - 不要在用户确认前说"已锁定最佳方案"
 - **锁定表后，不要跳过 search_columns 就直接 confirm_selection**
 - **confirm_selection 的 dimensions 参数不要遗漏任何维度字段，方案里提到几个就填几个**
+
+## 历史参考案例
+{example_context}
+
 """

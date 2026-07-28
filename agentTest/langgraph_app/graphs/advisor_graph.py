@@ -108,13 +108,34 @@ def build_advisor_subgraph(runtime):
         log_node_start("advisor_agent", question=question[:60])
 
         history = list(state.get("advisor_messages") or [])
-                # Planner候选表注入，Advisor在此基础上做字段检索
+
+        # ── 新增：检索历史优质示例，加速澄清 ──
+        example_vs = runtime.get("example_vector_store")
+        example_context = ""
+        if example_vs and question and not history:
+            examples = example_vs.search_similar(question, k=2)
+            if examples:
+                lines_ex = ["【历史相似问题（曾成功解决，仅供参考）】"]
+                for i, doc in enumerate(examples, 1):
+                    q = doc.metadata.get("question", "")
+                    s = doc.metadata.get("sql", "")[:200]
+                    lines_ex.append(f"{i}. 问题：{q}")
+                    lines_ex.append(f"   对应SQL：{s}...")
+                example_context = "\n".join(lines_ex)
+
+        # Planner候选表注入，Advisor在此基础上做字段检索
         planner_tables = (state.get("planner_entities") or {}).get("tables", [])
         if planner_tables and not history:
             table_ctx = "\n(Planner已筛选候选表: " + ", ".join(planner_tables) + "，请在此基础上选择）"
-            history.append(HumanMessage(content=question + table_ctx))
+            msg_content = question + table_ctx
+            if example_context:
+                msg_content = example_context + "\n\n" + msg_content
+            history.append(HumanMessage(content=msg_content))
         else:
-            history.append(HumanMessage(content=question))
+            msg_content = question
+            if example_context:
+                msg_content = example_context + "\n\n" + msg_content
+            history.append(HumanMessage(content=msg_content))
 
         new_history = None
         retries = 0

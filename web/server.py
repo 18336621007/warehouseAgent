@@ -35,33 +35,27 @@ NODE_LABELS = {
     "evaluator": "正在评估对话质量...",
 }
 
-
 def _sse(data_dict):
     return "data: " + json.dumps(data_dict, ensure_ascii=False) + "\n\n"
-
 
 @app.before_request
 def log_request():
     if request.path.startswith("/api/chat"):
         print(f"[server] {request.method} {request.path} (stream)")
 
-
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok", "sessions": len(sessions)})
 
-
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
-
 
 @app.route("/api/conversations", methods=["POST"])
 def create_conversation():
     tid = str(uuid.uuid4())[:8]
     sessions[tid] = {"original_question": "", "advisor_turns": 0, "advisor_last_answer": "", "messages": []}
     return jsonify({"thread_id": tid})
-
 
 @app.route("/api/conversations", methods=["GET"])
 def list_conversations():
@@ -71,7 +65,6 @@ def list_conversations():
         convs.append({"thread_id": tid, "title": first[:50], "message_count": len(sess["messages"])})
     return jsonify({"conversations": convs})
 
-
 @app.route("/api/conversations/<tid>", methods=["PUT"])
 def rename_conversation(tid):
     data = request.get_json()
@@ -80,12 +73,10 @@ def rename_conversation(tid):
     if title: sessions[tid]["title_override"] = title
     return jsonify({"success": True})
 
-
 @app.route("/api/conversations/<tid>", methods=["DELETE"])
 def delete_conversation(tid):
     if tid in sessions: del sessions[tid]
     return jsonify({"success": True})
-
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -119,8 +110,21 @@ def chat():
             session["original_question"] = message
 
         config = {"configurable": {"thread_id": thread_id}}
+        # 新话题时清空跨查询残留状态
+        state_reset = {}
+        if session.pop("_new_topic", False):
+            state_reset = {
+                "confirmed_plan": {},
+                "advisor_messages": [],
+                "final_answer": "",
+                "generated_sql": "",
+                "planner_entities": {},
+                "retry_count": 0,
+            }
+
         state_input = {
             "question": session["original_question"],
+            **state_reset,
             "original_question": session["original_question"],
             "user_response": message,
             "advisor_last_answer": session["advisor_last_answer"],
@@ -160,8 +164,17 @@ def chat():
             "evaluator": {"score": ev_score, "self_score": ev_self} if ev_score else None,
         })
 
-        session["advisor_last_answer"] = final_answer
-        session["advisor_turns"] = session["advisor_turns"] + 1 if route == "advisor" else 0
+        # ── 根据路由管理会话状态 ──
+        if route == "advisor":
+            # 追问：保持 original_question，积累轮次
+            session["advisor_last_answer"] = final_answer
+            session["advisor_turns"] = session["advisor_turns"] + 1
+        else:
+            # seeker 完成，重置状态，准备下一个独立查询
+            session["original_question"] = ""
+            session["advisor_last_answer"] = ""
+            session["advisor_turns"] = 0
+            session["_new_topic"] = True  # 下一条消息为新话题
 
         yield _sse({
             "type": "done", "content": final_answer, "sql": generated_sql,
@@ -171,7 +184,6 @@ def chat():
         })
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
-
 
 @app.route("/api/score", methods=["POST"])
 def submit_score():
@@ -210,7 +222,6 @@ def submit_score():
         except Exception as e:
             print(f"[server] update score failed: {e}")
     return jsonify({"success": True})
-
 
 if __name__ == "__main__":
     print("[server] starting at http://localhost:5000")

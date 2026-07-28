@@ -56,4 +56,5 @@ EVALUATOR_USER_TEMPLATE = """请评估以下对话质量：
 【最终答案】
 {final_answer}
 
-请给出评分。"""
+请给出评分。以 json 格式返回
+"""

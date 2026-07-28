@@ -15,6 +15,22 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 
 MAX_CONSISTENCY_RETRIES = 2  # 方案一致性校验最多重试次数
 
+def _format_examples(docs: list) -> str:
+    """将检索到的历史优质示例转为 Few-shot 文本，LLM 自行从完整 SQL 中学模式"""
+    if not docs:
+        return ""
+    lines = ["【历史相似查询示例 —— 请重点关注 SQL 中的聚合方式、GROUP BY 维度、日期处理】"]
+    for i, doc in enumerate(docs, 1):
+        q = doc.metadata.get("question", "")
+        s = doc.metadata.get("sql", "")
+        tables = doc.metadata.get("tables", "[]")
+        lines.append(f"\n示例{i}：")
+        lines.append(f"  问题：{q}")
+        lines.append(f"  表：{tables}")
+        lines.append(f"  SQL：{s}")
+    return "\n".join(lines)
+
+
 
 # ── 标准日期处理函数映射 ──
 DATE_FORMAT_HIVE_EXPR = {
@@ -221,10 +237,23 @@ def build_generate_sql_node(runtime):
 
         try:
             prompt = default_prompt
+
+            # ── 新增：检索历史优质示例作为 Few-shot ──
+            example_vs = runtime.get("example_vector_store")
+            example_section = ""
+            if example_vs:
+                similar_examples = example_vs.search_similar(
+                    question,
+                    current_tables=confirmed_plan.get("tables", []),
+                    k=2
+                )
+                example_section = _format_examples(similar_examples)
+                log_node_event("generate_sql", f"优秀示例检索: 命中{len(similar_examples)}条")
             prompt_input = {
                 "question": question,
                 "schema_context": schema_context,
-                "confirmed_section": confirmed_section
+                "confirmed_section": confirmed_section,
+                "example_section": example_section
             }
 
             if retry_count > 0:
@@ -265,6 +294,7 @@ def build_generate_sql_node(runtime):
                     fix_input = {
                         "question": question,
                         "confirmed_section": confirmed_section,
+                "example_section": example_section,
                         "schema_context": schema_context,
                         "inconsistency": inconsistency,
                         "previous_sql": generated_sql,

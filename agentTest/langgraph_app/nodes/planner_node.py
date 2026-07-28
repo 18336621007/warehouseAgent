@@ -112,12 +112,26 @@ def build_planner_node(runtime):
                 metadata_lines.append(f"[字段]\n{content}")
             metadata_context = "\n\n".join(metadata_lines)
 
+            # ── 新增：检索历史优质示例，辅助模糊度判定 ──
+            example_vs = runtime.get("example_vector_store")
+            example_context = ""
+            if example_vs:
+                examples = example_vs.search_similar(question, k=2)
+                if examples:
+                    lines = []
+                    for doc in examples:
+                        q = doc.metadata.get("question", "")
+                        lines.append(f"- {q}")
+                    example_context = "\n".join(lines)
+
+
             # ── 步骤②：LLM 结构化解析（含 user_response、confirmed_context、advisor_last_answer）──
             user_response = state.get("user_response", question)
             prompt_value = prompt.invoke({
                 "question": question,
                 "user_response": user_response,
                 "metadata_context": metadata_context,
+                "example_context": example_context,
                 "confirmed_context": confirmed_context,
                 "advisor_last_answer": advisor_last_answer,
             })
@@ -216,6 +230,7 @@ def build_planner_node(runtime):
                 "original_question": original_question,
                 "planner_entities": new_entities,
             }
+
 
             # Planner 路由 seeker 时，若 Advisor 未写入 confirmed_plan，自动提升 planner_entities 为兜底方案
             # 确保 generate_sql 的一致性校验能检测到方案偏差（如误用不在方案中的字段）
