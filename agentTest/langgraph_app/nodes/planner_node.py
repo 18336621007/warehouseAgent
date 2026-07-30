@@ -24,6 +24,7 @@ from agentTest.config.planner import (
     TABLE_SEARCH_K,
     COLUMN_SEARCH_K,
 )
+from agentTest.langgraph_app.message_utils import get_last_ai_content
 
 # 修改触发词：用户说这些词表示在修改方案，应强制路由到 Advisor 重新确认
 MODIFICATION_KEYWORDS = ["不对", "不是", "换成", "修改", "调整", "改", "换", "错了"]
@@ -84,7 +85,11 @@ def build_planner_node(runtime):
             )
 
         # ── 获取 Advisor 上轮回复，帮助 LLM 理解用户的简短选择 ──
-        advisor_last_answer = state.get("advisor_last_answer", "")
+        # 从标准消息记忆获取上一轮Advisor可见回复
+        advisor_last_answer = get_last_ai_content(
+            state.get("messages") or [],
+            "advisor",
+        )
         if advisor_last_answer:
             advisor_last_answer = (
                 "【上一轮 Advisor 的回复】\n"

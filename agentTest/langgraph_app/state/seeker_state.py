@@ -25,8 +25,6 @@ class SeekerState(BaseState, total=False):
     sql_fix_reason: str
     confirmed_plan: dict         # 只读，SQL 一致性校验用
 
-    # Advisor 澄清历史（Evaluator 需要，从父图传递）
-    advisor_messages: list
 
     # Evaluator 评估字段，advisor_turns从TopicState继承并由Graph自动累积
     total_topic_time_ms: float   # 本次话题总耗时（demo 层传入）

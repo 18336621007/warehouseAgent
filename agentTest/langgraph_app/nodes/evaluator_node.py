@@ -12,6 +12,7 @@ from agentTest.config.evaluator import (
 )
 from agentTest.langgraph_app.prompts.evaluator_prompt import EvaluatorSelfScore, EVALUATOR_SYSTEM_PROMPT, EVALUATOR_USER_TEMPLATE
 from agentTest.langgraph_app.state.agent_state import AgentState
+from agentTest.langgraph_app.message_utils import build_advisor_dialogue_context
 from agentTest.langgraph_app.runtime.graph_logger import (
     log_node_start, log_node_end, log_node_error, elapsed_ms, start_timer,
 )
@@ -42,7 +43,7 @@ def build_evaluator_node(runtime):
         advisor_turns = state.get("advisor_turns", 0)
         generated_sql = state.get("generated_sql", "")
         final_answer = state.get("final_answer", "")
-        advisor_messages = state.get("advisor_messages") or []
+        messages = state.get("messages") or []
 
         timer = start_timer()
         log_node_start("evaluator", question=question[:40], turns=advisor_turns)
@@ -54,15 +55,10 @@ def build_evaluator_node(runtime):
             turn_score = map_value_to_score(max(advisor_turns, 0), TURN_SCORE_MAP)
 
             # ── 步骤2：LLM 自评 ──
-            advisor_context = "无澄清过程，直接进入 Seeker"
-            if advisor_messages:
-                user_visible = []
-                for msg in advisor_messages:
-                    content = getattr(msg, "content", "") if hasattr(msg, "content") else str(msg)
-                    if content and not getattr(msg, "tool_calls", None):
-                        user_visible.append(str(content)[:300])
-                if user_visible:
-                    advisor_context = " | ".join(user_visible[-5:])
+            # 只提取用户和Advisor之间的可见澄清对话
+            advisor_context = build_advisor_dialogue_context(messages)
+            if not advisor_context:
+                advisor_context = "无澄清过程，直接进入 Seeker"
 
             prompt_value = prompt.invoke({
                 "question": question,

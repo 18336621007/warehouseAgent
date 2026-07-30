@@ -11,6 +11,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
+from agentTest.langgraph_app.message_utils import get_last_ai_content
 from agentTest.langgraph_app.state.agent_state import AgentState
 
 MAX_CONSISTENCY_RETRIES = 2  # 方案一致性校验最多重试次数
@@ -231,7 +232,11 @@ def build_generate_sql_node(runtime):
         # SQL 生成使用完整原始问题，避免使用“好的”等确认文本
         question = state["original_question"]
         schema_context = state["schema_context"]
-        advisor_last_answer = state.get("advisor_last_answer", "")
+        # 从统一消息中获取最近一次Advisor确认描述
+        advisor_last_answer = get_last_ai_content(
+            state.get("messages") or [],
+            "advisor",
+        )
 
         retry_count = state.get("retry_count", 0)
         sql_fix_reason = state.get("sql_fix_reason", "")

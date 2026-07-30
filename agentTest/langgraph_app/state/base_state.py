@@ -40,7 +40,6 @@ class TopicState(IdentityState, total=False):
     topic_started_at: float
 
     advisor_turns: int
-    advisor_last_answer: str
 
     confirmed_plan: dict
 

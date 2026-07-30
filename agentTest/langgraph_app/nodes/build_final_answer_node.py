@@ -1,11 +1,27 @@
 ﻿from langchain_core.prompts import ChatPromptTemplate
 
+from langchain_core.messages import AIMessage
+
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.state.agent_state import AgentState
+
+
+def _build_answer_update(state, final_answer):
+    # 将Seeker最终回答同时写入标准Topic消息记忆
+    return {
+        "final_answer": final_answer,
+        "messages": [
+            AIMessage(
+                content=final_answer,
+                name="seeker",
+                id=f"{state['request_id']}:seeker",
+            )
+        ],
+    }
 
 
 def build_build_final_answer_node(runtime):
@@ -33,9 +49,10 @@ def build_build_final_answer_node(runtime):
                     ms=elapsed_ms(timer),
                 )
 
-                return {
-                    "final_answer": f"本次未执行 SQL 查询，因为生成的 SQL 未通过校验。原因：{sql_error}"
-                }
+                return _build_answer_update(
+                    state,
+                    f"本次未执行 SQL 查询，因为生成的 SQL 未通过校验。原因：{sql_error}",
+                )
 
             # sql 校验成功
             sql_result = state.get("sql_result", {})
@@ -51,9 +68,10 @@ def build_build_final_answer_node(runtime):
                     ms=elapsed_ms(timer),
                 )
 
-                return {
-                    "final_answer": "SQL 已成功执行，但没有查询到符合条件的数据。"
-                }
+                return _build_answer_update(
+                    state,
+                    "SQL 已成功执行，但没有查询到符合条件的数据。",
+                )
 
             prompt = ChatPromptTemplate.from_messages([
                 (
@@ -81,9 +99,7 @@ def build_build_final_answer_node(runtime):
                 answer_preview=answer_preview,
                 ms=elapsed_ms(timer),
             )
-            return {
-                "final_answer": final_answer,
-            }
+            return _build_answer_update(state, final_answer)
         except Exception as error:
             # 记录节点异常日志
             log_node_error(

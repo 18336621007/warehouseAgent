@@ -23,6 +23,7 @@ print("[server] runtime ready")
 sessions = {}
 
 NODE_LABELS = {
+    "capture_user_message": "正在记录本轮问题...",
     "planner": "正在分析查询需求...",
     "advisor": "需求不够明确，正在检索相关信息...",
     "retrieve_schema": "正在检索数据表结构...",

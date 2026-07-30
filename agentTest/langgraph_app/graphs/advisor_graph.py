@@ -108,12 +108,15 @@ def build_advisor_subgraph(runtime):
         timer = start_timer()
         log_node_start("advisor_agent", question=question[:60])
 
-        history = list(state.get("advisor_messages") or [])
+        # messages是当前Topic唯一的标准消息历史
+        history = list(state.get("messages") or [])
+        advisor_turns = state.get("advisor_turns", 0)
+        is_first_advisor_turn = advisor_turns == 0
 
         # ── 新增：检索历史优质示例，加速澄清 ──
         example_vs = runtime.get("example_vector_store")
         example_context = ""
-        if example_vs and question and not history:
+        if example_vs and question and is_first_advisor_turn:
             examples = example_vs.search_similar(question, k=2)
             if examples:
                 lines_ex = ["【历史相似问题（曾成功解决，仅供参考）】"]
@@ -129,36 +132,55 @@ def build_advisor_subgraph(runtime):
 
         # Planner候选表注入，Advisor在此基础上做字段检索
         planner_tables = (state.get("planner_entities") or {}).get("tables", [])
-        if planner_tables and not history:
+        msg_content = question
+        if planner_tables and is_first_advisor_turn:
             table_ctx = "\n(Planner已筛选候选表: " + ", ".join(planner_tables) + "，请在此基础上选择）"
-            msg_content = question + table_ctx
-            if example_context:
-                msg_content = example_context + "\n\n" + msg_content
-            history.append(HumanMessage(content=msg_content))
+            msg_content += table_ctx
+
+        if example_context:
+            msg_content = example_context + "\n\n" + msg_content
+
+        # 临时增强本轮用户消息，但不把检索上下文写入Checkpoint
+        agent_history = list(history)
+        if agent_history and isinstance(agent_history[-1], HumanMessage):
+            current_user_message = agent_history[-1]
+            agent_history[-1] = HumanMessage(
+                content=msg_content,
+                name=current_user_message.name,
+                id=current_user_message.id,
+            )
         else:
-            msg_content = question
-            if example_context:
-                msg_content = example_context + "\n\n" + msg_content
-            history.append(HumanMessage(content=msg_content))
+            agent_history.append(HumanMessage(
+                content=msg_content,
+                name="user",
+                id=f"{state['request_id']}:user",
+            ))
+
+        # 只持久化Agent调用后新增的消息
+        persist_start_index = len(agent_history)
 
         new_history = None
         retries = 0
 
         while retries <= MAX_COLUMN_CHECK_RETRIES:
-            result = agent.invoke({"messages": history})
+            result = agent.invoke({"messages": agent_history})
             new_history = result["messages"]
 
-            # confirm_selection 前必须调过 search_columns
-            has_confirm = _find_tool_calls(new_history, "confirm_selection")
+            # confirm_selection必须来自本轮，search_columns允许来自Topic之前轮次
+            current_round_messages = new_history[persist_start_index:]
+            has_confirm = _find_tool_calls(current_round_messages, "confirm_selection")
             has_column_search = _find_tool_calls(new_history, "search_columns")
 
             if has_confirm and not has_column_search:
                 retries += 1
                 log_node_event("advisor_agent",
                     f"拦截 confirm_selection（缺少 search_columns），重试 {retries}/{MAX_COLUMN_CHECK_RETRIES}")
-                history.append(HumanMessage(
+                # 丢弃本次违规工具调用，避免后续误用旧confirm_selection参数
+                agent_history = list(new_history[:persist_start_index])
+                agent_history.append(HumanMessage(
                     content="调用 confirm_selection 前必须先调用 search_columns 检索该表的所有字段。"
-                            "请调用 search_columns，列出相关字段供用户选择，不要直接锁定方案。"
+                            "请调用 search_columns，列出相关字段供用户选择，不要直接锁定方案。",
+                    name="internal",
                 ))
                 continue
 
@@ -166,23 +188,34 @@ def build_advisor_subgraph(runtime):
 
         if new_history is None:
             log_node_event("advisor_agent", "Agent 未返回有效结果")
-            return {"final_answer": "系统处理异常，请重试", "advisor_messages": history}
+            error_answer = "系统处理异常，请重试"
+            return {
+                "final_answer": error_answer,
+                "messages": [
+                    AIMessage(
+                        content=error_answer,
+                        name="advisor",
+                        id=f"{state['request_id']}:advisor",
+                    )
+                ],
+            }
 
         last_msg = new_history[-1]
+        current_round_messages = new_history[persist_start_index:]
 
         # 打印本轮所有 tool_calls
         all_tool_names = []
-        for msg in new_history:
+        for msg in current_round_messages:
             for tc in (getattr(msg, "tool_calls", None) or []):
                 all_tool_names.append(tc.get("name", "?"))
         log_node_event("advisor_agent", f"本轮工具调用: {all_tool_names if all_tool_names else '[无]'}")
 
         # 处理 confirm_selection 工具调用
         confirmed_plan = None
-        confirm_args_list = _get_tool_call_args(new_history, "confirm_selection")
+        confirm_args_list = _get_tool_call_args(current_round_messages, "confirm_selection")
 
         if confirm_args_list:
-            args, tc_id = confirm_args_list[-1]
+            args, _ = confirm_args_list[-1]
 
             # 解析新参数结构
             table = args.get("table", "")
@@ -239,11 +272,7 @@ def build_advisor_subgraph(runtime):
                 "confirmed_at": datetime.now().isoformat(),
             }
 
-            # 写入 ToolMessage
-            new_history.append(ToolMessage(
-                content=f"已确认: {args}",
-                tool_call_id=tc_id,
-            ))
+            # confirm_selection已由Agent自动生成ToolMessage，这里只构建confirmed_plan
 
             log_node_event("advisor_agent",
                 f"confirmed_plan: table={table}, measures={measures}, "
@@ -266,14 +295,31 @@ def build_advisor_subgraph(runtime):
             final_answer = last_msg.content if last_msg.content else ""
 
 
+        # 只保存本轮新增的AI和工具消息，不重复返回完整历史
+        messages_to_persist = []
+        for message in new_history[persist_start_index:]:
+            # 内部重试指令不属于用户对话记忆
+            if isinstance(message, HumanMessage):
+                continue
+
+            # Agent原始最终回复由带name的标准消息代替
+            if message is last_msg:
+                continue
+
+            messages_to_persist.append(message)
+
+        # 保存统一的Advisor可见回复，供Planner和Evaluator读取
+        messages_to_persist.append(AIMessage(
+            content=final_answer,
+            name="advisor",
+            id=f"{state['request_id']}:advisor",
+        ))
+
         return_value = {
-            "advisor_messages": new_history,
+            "messages": messages_to_persist,
 
             # Advisor 每执行一次，澄清轮次增加一次
             "advisor_turns": state.get("advisor_turns", 0) + 1,
-
-            # 保存本轮回复，供下一轮 Planner 理解“1”“第二个”等简短回答
-            "advisor_last_answer": final_answer,
             "final_answer": final_answer,
         }
 
