@@ -20,9 +20,9 @@ TopicStatus = Literal[
 # 负责身份信息：它们会自动被 Planner、Advisor、Seeker 继承。
 class IdentityState(TypedDict, total=False):
 
-    conversation_id: str
-    topic_id: str
-    request_id: str
+    conversation_id: str  #前端左端的一个对话
+    topic_id: str   # 该对话中的一次问数任务
+    request_id: str # 一次HTTP请求
 
 # 负责一次问数任务的记忆：
 class TopicState(IdentityState, total=False):

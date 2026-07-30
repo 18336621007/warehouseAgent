@@ -53,40 +53,54 @@ def index():
 
 @app.route("/api/conversations", methods=["POST"])
 def create_conversation():
-    tid = str(uuid.uuid4())[:8]
-    sessions[tid] = {"original_question": "", "advisor_turns": 0, "advisor_last_answer": "", "messages": []}
-    return jsonify({"thread_id": tid})
+    # conversation_id对应前端的一个完整对话
+    conversation_id = uuid.uuid4().hex
+
+    # 新对话默认创建第一个问数Topic
+    topic_id = uuid.uuid4().hex
+
+    sessions[conversation_id] = {
+        "topic_id": topic_id,
+        "original_question": "",
+        "advisor_turns": 0,
+        "advisor_last_answer": "",
+        "messages": [],
+    }
+    # 产品接口统一使用conversation_id，避免与LangGraph内部thread_id混淆
+    return jsonify({
+        "conversation_id": conversation_id
+    })
 
 @app.route("/api/conversations", methods=["GET"])
 def list_conversations():
     convs = []
-    for tid, sess in sessions.items():
+    for conversation_id, sess in sessions.items():
         first = sess.get("title_override") or (sess["messages"][0]["content"] if sess["messages"] else "New Chat")
-        convs.append({"thread_id": tid, "title": first[:50], "message_count": len(sess["messages"])})
+        convs.append({"conversation_id": conversation_id, "title": first[:50], "message_count": len(sess["messages"])})
     return jsonify({"conversations": convs})
 
-@app.route("/api/conversations/<tid>", methods=["PUT"])
-def rename_conversation(tid):
+@app.route("/api/conversations/<conversation_id>", methods=["PUT"])
+def rename_conversation(conversation_id):
     data = request.get_json()
     title = (data.get("title") or "").strip()
-    if tid not in sessions: return jsonify({"error": "invalid"}), 400
-    if title: sessions[tid]["title_override"] = title
+    if conversation_id not in sessions: return jsonify({"error": "invalid"}), 400
+    if title: sessions[conversation_id]["title_override"] = title
     return jsonify({"success": True})
 
-@app.route("/api/conversations/<tid>", methods=["DELETE"])
-def delete_conversation(tid):
-    if tid in sessions: del sessions[tid]
+@app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
+def delete_conversation(conversation_id):
+    if conversation_id in sessions: del sessions[conversation_id]
     return jsonify({"success": True})
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json()
-    thread_id = data.get("thread_id", "")
+    conversation_id = data.get("conversation_id", "")
     message = data.get("message", "").strip()
-    if not thread_id or thread_id not in sessions: return jsonify({"error": "invalid thread_id"}), 400
+    if not conversation_id or conversation_id not in sessions: return jsonify({"error": "invalid conversation_id"}), 400
     if not message: return jsonify({"error": "empty message"}), 400
 
-    session = sessions[thread_id]
+    session = sessions[conversation_id]
 
     def generate():
         # 仅首条消息做意图识别，追问消息跳过（直接走 LangGraph）
@@ -106,29 +120,42 @@ def chat():
                 return
 
         # ── query: LangGraph pipeline ──
+        # 新查数问题创建独立Topic，并使用新的LangGraph Checkpoint
+        if session.pop("_new_topic", False):
+            session["topic_id"] = uuid.uuid4().hex
+            session["original_question"] = ""
+            session["advisor_last_answer"] = ""
+            session["advisor_turns"] = 0
+
         if not session["original_question"]:
             session["original_question"] = message
 
-        config = {"configurable": {"thread_id": thread_id}}
-        # 新话题时清空跨查询残留状态
-        state_reset = {}
-        if session.pop("_new_topic", False):
-            state_reset = {
-                "confirmed_plan": {},
-                "advisor_messages": [],
-                "final_answer": "",
-                "generated_sql": "",
-                "planner_entities": {},
-                "retry_count": 0,
-                "evaluator_score": 0,
-                "evaluator_self_score": 0,
-                "evaluator_dialogue_id": 0,
+        # 当前Topic的多轮追问共享同一个topic_id
+        topic_id = session["topic_id"]
+
+        # 每次HTTP请求使用独立request_id
+        request_id = uuid.uuid4().hex
+
+        # 每个Topic拥有独立的LangGraph Checkpoint
+        graph_thread_id = f"{conversation_id}:{topic_id}"
+
+        config = {
+            "configurable": {
+                "thread_id": graph_thread_id
             }
+        }
 
         state_input = {
-            **state_reset,
+            # 身份字段
+            "conversation_id": conversation_id,
+            "topic_id": topic_id,
+            "request_id": request_id,
+
+            # Topic问题字段
             "original_question": session["original_question"],
             "current_user_input": message,
+
+            # 旧消息迁移完成前暂时保留
             "advisor_last_answer": session["advisor_last_answer"],
             "advisor_turns": session["advisor_turns"],
         }
@@ -190,12 +217,12 @@ def chat():
 @app.route("/api/score", methods=["POST"])
 def submit_score():
     data = request.get_json()
-    thread_id = data.get("thread_id", "")
+    conversation_id = data.get("conversation_id", "")
     score = data.get("score", 0)
     dialogue_id = data.get("dialogue_id", 0)
-    if thread_id not in sessions: return jsonify({"error": "invalid thread_id"}), 400
+    if conversation_id not in sessions: return jsonify({"error": "invalid conversation_id"}), 400
     if not isinstance(score, (int, float)) or score < 1 or score > 5: return jsonify({"error": "score 1-5"}), 400
-    for msg in reversed(sessions[thread_id]["messages"]):
+    for msg in reversed(sessions[conversation_id]["messages"]):
         if msg["role"] == "assistant":
             if msg.get("evaluator") is None: msg["evaluator"] = {}
             msg["evaluator"]["user_score"] = score

@@ -1,6 +1,7 @@
 // 智能数仓助手 - 前端（流式 + 打分 + 重命名/删除）
 var API = "/api";
-var threadId = null;
+// 当前选中的完整前端对话标识
+var conversationId = null;
 var conversations = {};
 
 function $(id) { return document.getElementById(id); }
@@ -10,17 +11,17 @@ async function newChat() {
     try {
         var res = await fetch(API + "/conversations", { method: "POST" });
         var data = await res.json();
-        threadId = data.thread_id;
-        conversations[threadId] = { title: "新对话", messages: [] };
+        conversationId = data.conversation_id;
+        conversations[conversationId] = { title: "新对话", messages: [] };
         $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         refreshConvList();
         return true;
     } catch (e) { return false; }
 }
 
-function loadConversation(tid) {
-    threadId = tid;
-    var conv = conversations[tid];
+function loadConversation(conversationIdToLoad) {
+    conversationId = conversationIdToLoad;
+    var conv = conversations[conversationIdToLoad];
     var area = $("chatArea");
     area.innerHTML = "";
     if (conv && conv.messages && conv.messages.length > 0) {
@@ -31,29 +32,29 @@ function loadConversation(tid) {
     refreshConvList();
 }
 
-async function renameConv(tid, event) {
+async function renameConv(conversationIdToRename, event) {
     event.stopPropagation();
-    var name = prompt("新名称：", conversations[tid] ? conversations[tid].title : "");
+    var name = prompt("新名称：", conversations[conversationIdToRename] ? conversations[conversationIdToRename].title : "");
     if (!name || !name.trim()) return;
     try {
-        await fetch(API + "/conversations/" + tid, {
+        await fetch(API + "/conversations/" + conversationIdToRename, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ title: name.trim() }),
         });
-        if (conversations[tid]) conversations[tid].title = name.trim();
+        if (conversations[conversationIdToRename]) conversations[conversationIdToRename].title = name.trim();
         refreshConvList();
     } catch (e) {}
 }
 
-async function deleteConv(tid, event) {
+async function deleteConv(conversationIdToDelete, event) {
     event.stopPropagation();
     if (!confirm("确定删除此对话？")) return;
     try {
-        await fetch(API + "/conversations/" + tid, { method: "DELETE" });
-        delete conversations[tid];
-        if (threadId === tid) {
-            threadId = null;
+        await fetch(API + "/conversations/" + conversationIdToDelete, { method: "DELETE" });
+        delete conversations[conversationIdToDelete];
+        if (conversationId === conversationIdToDelete) {
+            conversationId = null;
             $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         }
         refreshConvList();
@@ -67,10 +68,10 @@ async function refreshConvList() {
         var data = await res.json();
         list.innerHTML = "";
         data.conversations.forEach(function (c) {
-            conversations[c.thread_id] = conversations[c.thread_id] || { title: c.title, messages: [] };
+            conversations[c.conversation_id] = conversations[c.conversation_id] || { title: c.title, messages: [] };
             var div = document.createElement("div");
-            div.className = "conv-item" + (c.thread_id === threadId ? " active" : "");
-            div.onclick = function () { loadConversation(c.thread_id); };
+            div.className = "conv-item" + (c.conversation_id === conversationId ? " active" : "");
+            div.onclick = function () { loadConversation(c.conversation_id); };
 
             var span = document.createElement("span");
             span.textContent = c.title || "新对话";
@@ -86,14 +87,14 @@ async function refreshConvList() {
             renBtn.className = "conv-action-btn";
             renBtn.textContent = "✎";
             renBtn.title = "重命名";
-            renBtn.onclick = function (e) { renameConv(c.thread_id, e); };
+            renBtn.onclick = function (e) { renameConv(c.conversation_id, e); };
             actions.appendChild(renBtn);
 
             var delBtn = document.createElement("button");
             delBtn.className = "conv-action-btn";
             delBtn.textContent = "✕";
             delBtn.title = "删除";
-            delBtn.onclick = function (e) { deleteConv(c.thread_id, e); };
+            delBtn.onclick = function (e) { deleteConv(c.conversation_id, e); };
             actions.appendChild(delBtn);
 
             div.appendChild(actions);
@@ -112,13 +113,13 @@ async function sendMsg() {
     var input = $("msgInput"); if (!input) return;
     var msg = input.value.trim(); if (!msg) return;
 
-    if (!threadId) {
+    if (!conversationId) {
         lockInput(true);
         var ok = await newChat();
         if (!ok) { appendMessage("assistant", "无法连接服务器，请确认已启动: python web/server.py"); lockInput(false); return; }
     }
 
-    var conv = conversations[threadId];
+    var conv = conversations[conversationId];
     if (conv && (!conv.title || conv.title === "新对话")) conv.title = msg.slice(0, 40);
 
     input.value = "";
@@ -129,14 +130,14 @@ async function sendMsg() {
 
     var loadingId = showLoading();
         var thinkingText = "";
-    console.log("[sendMsg] user=" + msg.slice(0, 60) + " thread=" + threadId);
+    console.log("[sendMsg] user=" + msg.slice(0, 60) + " conversation=" + conversationId);
     var finalContent = "", finalSql = "", finalEval = null, finalDialogueId = 0;
 
     try {
         var res = await fetch(API + "/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ thread_id: threadId, message: msg }),
+            body: JSON.stringify({ conversation_id: conversationId, message: msg }),
         });
 
         var reader = res.body.getReader();
@@ -243,7 +244,7 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId) {
                     try {
                         await fetch(API + "/score", {
                             method: "POST", headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ thread_id: threadId, score: idx, dialogue_id: did }),
+                            body: JSON.stringify({ conversation_id: conversationId, score: idx, dialogue_id: did }),
                         });
                         var done = scoreArea.querySelector(".done"); if (done) done.remove();
                         var d = document.createElement("span"); d.className = "done"; d.textContent = "✓ 感谢反馈";

@@ -1,4 +1,6 @@
 ﻿# LangGraph 多轮交互演示入口 —— Planner 每轮独立判定，Demo 层管理循环
+import uuid
+
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 from agentTest.langgraph_app.runtime.graph_logger import log_round_separator
@@ -9,7 +11,14 @@ from agentTest.config.advisor import MAX_DEMO_ADVISOR_TURNS
 def run_demo():
     runtime = build_graph_runtime()
     app = build_supervisor_graph(runtime)
-    config = {"configurable": {"thread_id": "demo-session-1"}}
+    conversation_id = "cli-demo"
+    topic_id = uuid.uuid4().hex
+
+    config = {
+        "configurable": {
+            "thread_id": f"{conversation_id}:{topic_id}"
+        }
+    }
     print("=" * 60)
     print("  欢迎使用智能数仓助手")
     print("  输入 exit 或 quit 退出对话")
@@ -32,6 +41,9 @@ def run_demo():
         log_user_input(current_question)
 
         result = app.invoke({
+                    "conversation_id": conversation_id,  # CLI运行期间保持同一个完整对话
+                    "topic_id": topic_id,                # 当前独立查数问题标识
+                    "request_id": uuid.uuid4().hex,      # 每轮调用使用独立请求标识
                     "original_question": original_question,  # 始终用原始问题，保持话题一致性
                     "current_user_input": current_question,  # 用户本轮真实输入，Planner/Advisor 据此理解意图
                     "advisor_last_answer": advisor_last_answer,
@@ -56,6 +68,13 @@ def run_demo():
                     print("结束对话。")
                     break
                 original_question = current_question
+                # 超过追问上限后，新问题使用独立Topic和Checkpoint
+                topic_id = uuid.uuid4().hex
+                config = {
+                    "configurable": {
+                        "thread_id": f"{conversation_id}:{topic_id}"
+                    }
+                }
                 continue
 
             current_question = input("\n你: ").strip()
@@ -74,6 +93,13 @@ def run_demo():
             print("结束对话。")
             break
         original_question = current_question
+        # Seeker完成后，下一问题使用独立Topic和Checkpoint
+        topic_id = uuid.uuid4().hex
+        config = {
+            "configurable": {
+                "thread_id": f"{conversation_id}:{topic_id}"
+            }
+        }
 
 
 if __name__ == "__main__":
