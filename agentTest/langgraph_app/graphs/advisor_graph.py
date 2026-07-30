@@ -256,17 +256,30 @@ def build_advisor_subgraph(runtime):
                      retries=retries,
                      ms=elapsed_ms(timer))
 
-        return_value = {
-            "advisor_messages": new_history,
-        }
 
         if confirmed_plan:
             # 确认阶段：用标准化消息代替LLM原文，杜绝编造假结果
-            return_value["confirmed_plan"] = confirmed_plan
-            return_value["final_answer"] = _build_confirmation_message(confirmed_plan)
+            final_answer = _build_confirmation_message(confirmed_plan)
+
         else:
             # 澄清阶段：保留LLM原文
-            return_value["final_answer"] = last_msg.content if last_msg.content else ""
+            final_answer = last_msg.content if last_msg.content else ""
+
+
+        return_value = {
+            "advisor_messages": new_history,
+
+            # Advisor 每执行一次，澄清轮次增加一次
+            "advisor_turns": state.get("advisor_turns", 0) + 1,
+
+            # 保存本轮回复，供下一轮 Planner 理解“1”“第二个”等简短回答
+            "advisor_last_answer": final_answer,
+            "final_answer": final_answer,
+        }
+
+        if confirmed_plan:
+            return_value["confirmed_plan"] = confirmed_plan
+
 
         return return_value
 

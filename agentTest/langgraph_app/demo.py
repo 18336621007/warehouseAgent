@@ -31,10 +31,7 @@ def run_demo():
         print("结束对话。")
         return
 
-    original_question = current_question
-    advisor_turns = 0
     round_num = 1
-    advisor_last_answer = ""
 
     while True:
         log_round_separator(round_num)
@@ -44,10 +41,7 @@ def run_demo():
                     "conversation_id": conversation_id,  # CLI运行期间保持同一个完整对话
                     "topic_id": topic_id,                # 当前独立查数问题标识
                     "request_id": uuid.uuid4().hex,      # 每轮调用使用独立请求标识
-                    "original_question": original_question,  # 始终用原始问题，保持话题一致性
                     "current_user_input": current_question,  # 用户本轮真实输入，Planner/Advisor 据此理解意图
-                    "advisor_last_answer": advisor_last_answer,
-                    "advisor_turns": advisor_turns,      # Evaluator 用：累计追问轮次
                 },
                 config)
 
@@ -56,18 +50,16 @@ def run_demo():
 
         if route == "advisor":
             print(f"\nAI: {result.get('final_answer', '')}")
-            advisor_last_answer = result.get("final_answer", "")
-            advisor_turns += 1
+
+            # Advisor轮次由Graph State自动累积
+            advisor_turns = result.get("advisor_turns", 0)
 
             if advisor_turns >= MAX_DEMO_ADVISOR_TURNS:
                 print("\nAI: 抱歉，经过多轮沟通我仍无法确定您的需求，请尝试重新描述。")
-                advisor_turns = 0
-                advisor_last_answer = ""
                 current_question = input("\n你: ").strip()
                 if not current_question or current_question.lower() in ("exit", "quit"):
                     print("结束对话。")
                     break
-                original_question = current_question
                 # 超过追问上限后，新问题使用独立Topic和Checkpoint
                 topic_id = uuid.uuid4().hex
                 config = {
@@ -85,14 +77,11 @@ def run_demo():
 
         # seeker：已生成最终答案
         print(f"\nAI: {result.get('final_answer', '')}")
-        advisor_turns = 0
-        advisor_last_answer = ""
 
         current_question = input("\n你: ").strip()
         if not current_question or current_question.lower() in ("exit", "quit"):
             print("结束对话。")
             break
-        original_question = current_question
         # Seeker完成后，下一问题使用独立Topic和Checkpoint
         topic_id = uuid.uuid4().hex
         config = {

@@ -62,13 +62,12 @@ def build_planner_node(runtime):
     ])
 
     def planner_node(state):
-        original_question = state["original_question"]
+        # 每次调用只要求传入本轮输入
+        current_user_input = state["current_user_input"]
 
-        # 当前输入用于理解用户本轮补充、选择或确认
-        current_user_input = state.get(
-            "current_user_input",
-            original_question,
-        )
+        # Topic 首轮使用当前输入初始化原始问题，后续轮次读取 checkpoint
+        original_question = state.get("original_question") or current_user_input
+
 
         # ── 读取独立的 confirmed_plan（Advisor 写入，Planner 只读不改）──
         confirmed_plan = state.get("confirmed_plan") or {}

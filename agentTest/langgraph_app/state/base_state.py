@@ -28,16 +28,20 @@ class IdentityState(TypedDict, total=False):
 class TopicState(IdentityState, total=False):
     # messages 只保存当前 Topic 的消息，并通过 Reducer 增量合并
     messages: Annotated[list[AnyMessage], add_messages] # 节点以后只需要返回新增消息,会自动追加到消息列表
-    # 话题原始问题，在同一个 Topic 中保持不变
-    # 新话题创建时更新原始问题
+
+    # 话题原始问题，在同一个 Topic 中保持不变。新话题创建时更新原始问题
     original_question: str
+
     # 当前输入，每轮更新
     current_user_input: str
 
     topic_status: TopicStatus
     topic_summary: str
     topic_started_at: float
+
     advisor_turns: int
+    advisor_last_answer: str
+
     confirmed_plan: dict
 
 

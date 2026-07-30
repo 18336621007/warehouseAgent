@@ -12,4 +12,3 @@ class PlannerState(BaseState, total=False):
     planner_confidence: float
 
     confirmed_plan: dict         # Advisor 写入，Planner 只读
-    advisor_last_answer: str     # Advisor 上轮回复，Planner 用于理解用户选择

@@ -61,9 +61,6 @@ def create_conversation():
 
     sessions[conversation_id] = {
         "topic_id": topic_id,
-        "original_question": "",
-        "advisor_turns": 0,
-        "advisor_last_answer": "",
         "messages": [],
     }
     # 产品接口统一使用conversation_id，避免与LangGraph内部thread_id混淆
@@ -103,32 +100,10 @@ def chat():
     session = sessions[conversation_id]
 
     def generate():
-        # 仅首条消息做意图识别，追问消息跳过（直接走 LangGraph）
-        if not session["original_question"]:
-            yield _sse({"type": "status", "text": "正在识别意图..."})
-            try:
-                intent_result = classify_intent(message)
-            except Exception as e:
-                print(f"[server] intent failed: {e}")
-                intent_result = type("F", (), {"intent": "query", "quick_reply": ""})()
-
-            if intent_result.intent == "chat":
-                reply = intent_result.quick_reply or "你好！有什么可以帮你的吗？"
-                session["messages"].append({"role": "user", "content": message})
-                session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None})
-                yield _sse({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0})
-                return
-
         # ── query: LangGraph pipeline ──
         # 新查数问题创建独立Topic，并使用新的LangGraph Checkpoint
         if session.pop("_new_topic", False):
             session["topic_id"] = uuid.uuid4().hex
-            session["original_question"] = ""
-            session["advisor_last_answer"] = ""
-            session["advisor_turns"] = 0
-
-        if not session["original_question"]:
-            session["original_question"] = message
 
         # 当前Topic的多轮追问共享同一个topic_id
         topic_id = session["topic_id"]
@@ -145,6 +120,27 @@ def chat():
             }
         }
 
+        # 从Checkpoint判断当前Topic是否已经开始
+        checkpoint_snapshot = APP.get_state(config)
+        topic_state = (checkpoint_snapshot and checkpoint_snapshot.values) or {}
+        is_first_topic_turn = not topic_state.get("original_question")
+
+        # 仅首条消息做意图识别，追问消息跳过（直接走 LangGraph）
+        if is_first_topic_turn:
+            yield _sse({"type": "status", "text": "正在识别意图..."})
+            try:
+                intent_result = classify_intent(message)
+            except Exception as e:
+                print(f"[server] intent failed: {e}")
+                intent_result = type("F", (), {"intent": "query", "quick_reply": ""})()
+
+            if intent_result.intent == "chat":
+                reply = intent_result.quick_reply or "你好！有什么可以帮你的吗？"
+                session["messages"].append({"role": "user", "content": message})
+                session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None})
+                yield _sse({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0})
+                return
+
         state_input = {
             # 身份字段
             "conversation_id": conversation_id,
@@ -152,12 +148,9 @@ def chat():
             "request_id": request_id,
 
             # Topic问题字段
-            "original_question": session["original_question"],
             "current_user_input": message,
 
-            # 旧消息迁移完成前暂时保留
-            "advisor_last_answer": session["advisor_last_answer"],
-            "advisor_turns": session["advisor_turns"],
+            # Topic业务记忆由Checkpoint自动恢复
         }
 
         thinking_parts = ["[intent] query"]
@@ -194,15 +187,8 @@ def chat():
         })
 
         # ── 根据路由管理会话状态 ──
-        if route == "advisor":
-            # 追问：保持 original_question，积累轮次
-            session["advisor_last_answer"] = final_answer
-            session["advisor_turns"] = session["advisor_turns"] + 1
-        else:
-            # seeker 完成，重置状态，准备下一个独立查询
-            session["original_question"] = ""
-            session["advisor_last_answer"] = ""
-            session["advisor_turns"] = 0
+        if route != "advisor":
+            # seeker 完成，准备创建下一个独立查询Topic
             session["_new_topic"] = True  # 下一条消息为新话题
 
         yield _sse({

@@ -28,8 +28,7 @@ class SeekerState(BaseState, total=False):
     # Advisor 澄清历史（Evaluator 需要，从父图传递）
     advisor_messages: list
 
-    # Evaluator 评估字段
-    advisor_turns: int           # 本次话题 Advisor 追问轮次（demo 层传入）
+    # Evaluator 评估字段，advisor_turns从TopicState继承并由Graph自动累积
     total_topic_time_ms: float   # 本次话题总耗时（demo 层传入）
     evaluator_score: float       # 综合评分（Evaluator 写入）
 
