@@ -29,11 +29,11 @@ from agentTest.config.planner import (
 MODIFICATION_KEYWORDS = ["不对", "不是", "换成", "修改", "调整", "改", "换", "错了"]
 
 
-def _is_modification(user_response: str) -> bool:
+def _is_modification(current_user_input: str) -> bool:
     """判断用户输入是否为修改意图（简单关键词匹配）"""
-    if not user_response:
+    if not current_user_input:
         return False
-    text = user_response.strip()
+    text = current_user_input.strip()
     for keyword in MODIFICATION_KEYWORDS:
         if keyword in text:
             return True
@@ -62,10 +62,13 @@ def build_planner_node(runtime):
     ])
 
     def planner_node(state):
-        question = state["question"]
+        original_question = state["original_question"]
 
-        # 每轮 Planner 都独立判定：original_question 由 demo 层维护
-        original_question = state.get("original_question", question)
+        # 当前输入用于理解用户本轮补充、选择或确认
+        current_user_input = state.get(
+            "current_user_input",
+            original_question,
+        )
 
         # ── 读取独立的 confirmed_plan（Advisor 写入，Planner 只读不改）──
         confirmed_plan = state.get("confirmed_plan") or {}
@@ -94,12 +97,12 @@ def build_planner_node(runtime):
 
         # ── FAISS + LLM 评估流程 ──
         timer = start_timer()
-        log_node_start("planner", question=question)
+        log_node_start("planner", question=original_question)
 
         try:
             # ── 步骤①：FAISS 检索增强元数据 ──
-            table_docs_with_scores = table_vector_store.similarity_search_with_score(question, k=TABLE_SEARCH_K)
-            column_docs_with_scores = column_vector_store.similarity_search_with_score(question, k=COLUMN_SEARCH_K)
+            table_docs_with_scores = table_vector_store.similarity_search_with_score(original_question, k=TABLE_SEARCH_K)
+            column_docs_with_scores = column_vector_store.similarity_search_with_score(original_question, k=COLUMN_SEARCH_K)
 
             # 拼接元数据上下文：表层在前，字段层在后
             metadata_lines = []
@@ -116,7 +119,7 @@ def build_planner_node(runtime):
             example_vs = runtime.get("example_vector_store")
             example_context = ""
             if example_vs:
-                examples = example_vs.search_similar(question, k=2)
+                examples = example_vs.search_similar(original_question, k=2)
                 if examples:
                     lines = []
                     for doc in examples:
@@ -128,11 +131,10 @@ def build_planner_node(runtime):
                     log_node_event("planner", f"优秀示例检索: 命中{len(examples)}条, top_sim={sim_val}, q={top_q}")
 
 
-            # ── 步骤②：LLM 结构化解析（含 user_response、confirmed_context、advisor_last_answer）──
-            user_response = state.get("user_response", question)
+            # ── 步骤②：LLM 结构化解析（含 current_user_input、confirmed_context、advisor_last_answer）──
             prompt_value = prompt.invoke({
-                "question": question,
-                "user_response": user_response,
+                "question": original_question,
+                "current_user_input": current_user_input,
                 "metadata_context": metadata_context,
                 "example_context": example_context,
                 "confirmed_context": confirmed_context,
@@ -146,7 +148,7 @@ def build_planner_node(runtime):
             completeness = planner_output.completeness
 
             # 后校验：修改场景强制路由 ──
-            is_modifying = has_confirmed and _is_modification(user_response)
+            is_modifying = has_confirmed and _is_modification(current_user_input)
             if is_modifying:
                 completeness = "partial"
                 if not planner_output.reason:

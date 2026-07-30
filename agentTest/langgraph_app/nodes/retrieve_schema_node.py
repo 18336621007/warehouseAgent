@@ -13,7 +13,8 @@ def build_retrieve_schema_node(runtime):
 
     def retrieve_schema_node(state: AgentState) -> dict:
 
-        question = state["question"]
+        # Seeker 使用完整原始问题进行 Schema 检索
+        question = state["original_question"]
         timer = start_timer()
 
         # 记录节点开始日志

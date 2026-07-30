@@ -14,7 +14,7 @@ def build_build_final_answer_node(runtime):
     def build_final_answer_node(state: AgentState):
 
         sql_valid = state.get("sql_valid", False)
-        question = state.get("question", "")
+        question = state.get("original_question", "")
         timer = start_timer()
 
         # 记录节点开始日志

@@ -99,11 +99,12 @@ def build_advisor_subgraph(runtime):
 
     def run_advisor(state):
         """处理用户问题：基于完整对话历史生成回复。
-        用 user_response（用户原话）理解选择，如"1"/"月租订单"/"好的"；
-        Planner 用 question 保证语义完整，两者互不干扰。
+        用 current_user_input（用户原话）理解选择，如"1"/"月租订单"/"好的"；
+        Planner 用 original_question 保证语义完整，两者互不干扰。
         企业级防护：confirm_selection 前必须调过 search_columns，否则拦截重跑。
         图级兜底：从 search_columns 返回中提取字段名，自动补齐遗漏维度。"""
-        question = state.get("user_response", state["question"])
+        # Advisor 使用本轮输入理解用户的选择、补充或确认
+        question = state.get("current_user_input", state["original_question"])
         timer = start_timer()
         log_node_start("advisor_agent", question=question[:60])
 

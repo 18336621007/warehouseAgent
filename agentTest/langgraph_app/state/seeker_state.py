@@ -7,10 +7,19 @@ class SeekerState(BaseState, total=False):
     # Seeker SQL 生成链路
     schema_documents: List[Any]
     schema_context: str
+
+    # 新状态只保存候选标识，避免长期持久化完整 Document
+    schema_candidate_ids: List[str]
+
     generated_sql: str
     sql_valid: bool
     sql_error: str
     sql_result: Any
+
+    # 完整结果后续交由独立存储管理，State只保存引用和预览
+    result_id: str
+    result_preview: List[Any]
+
     final_answer: str
     retry_count: int
     sql_fix_reason: str
@@ -23,5 +32,7 @@ class SeekerState(BaseState, total=False):
     advisor_turns: int           # 本次话题 Advisor 追问轮次（demo 层传入）
     total_topic_time_ms: float   # 本次话题总耗时（demo 层传入）
     evaluator_score: float       # 综合评分（Evaluator 写入）
+
+    # 补充被旧注释覆盖的Evaluator字段
     evaluator_self_score: float  # LLM 自评分数（Evaluator 写入）
     evaluator_dialogue_id: int   # MySQL evaluated_dialogues 主键，供用户打分更新

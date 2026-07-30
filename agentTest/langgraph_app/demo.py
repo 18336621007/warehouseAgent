@@ -32,9 +32,8 @@ def run_demo():
         log_user_input(current_question)
 
         result = app.invoke({
-                    "question": original_question,      # 始终用原始问题，保持话题一致性
-                    "original_question": original_question,
-                    "user_response": current_question,   # 用户本轮真实输入，Planner/Advisor 据此理解意图
+                    "original_question": original_question,  # 始终用原始问题，保持话题一致性
+                    "current_user_input": current_question,  # 用户本轮真实输入，Planner/Advisor 据此理解意图
                     "advisor_last_answer": advisor_last_answer,
                     "advisor_turns": advisor_turns,      # Evaluator 用：累计追问轮次
                 },

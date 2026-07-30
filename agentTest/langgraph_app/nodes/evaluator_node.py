@@ -36,7 +36,7 @@ def build_evaluator_node(runtime):
     ])
 
     def evaluator_node(state: AgentState):
-        question = state.get("question", "")
+        question = state.get("original_question", "")
         route = state.get("route", "seeker")
         planner_reason = state.get("planner_reason", "")
         advisor_turns = state.get("advisor_turns", 0)

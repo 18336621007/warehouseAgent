@@ -228,7 +228,8 @@ def build_generate_sql_node(runtime):
 
             confirmed_section = "【已确认的分析方案 —— 以下规则必须严格遵守】\n" + "\n".join(parts)
 
-        question = state["question"]
+        # SQL 生成使用完整原始问题，避免使用“好的”等确认文本
+        question = state["original_question"]
         schema_context = state["schema_context"]
         advisor_last_answer = state.get("advisor_last_answer", "")
 

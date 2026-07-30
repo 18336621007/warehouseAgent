@@ -126,10 +126,9 @@ def chat():
             }
 
         state_input = {
-            "question": session["original_question"],
             **state_reset,
             "original_question": session["original_question"],
-            "user_response": message,
+            "current_user_input": message,
             "advisor_last_answer": session["advisor_last_answer"],
             "advisor_turns": session["advisor_turns"],
         }
