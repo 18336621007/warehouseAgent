@@ -8,7 +8,7 @@ def capture_user_message_node(state: AgentState):
     request_id = state["request_id"]
     current_user_input = state["current_user_input"]
 
-    return {
+    return_value = {
         "messages": [
             HumanMessage(
                 content=current_user_input,
@@ -18,3 +18,9 @@ def capture_user_message_node(state: AgentState):
             )
         ]
     }
+
+    # 新 Topic 的首轮请求从 new 状态开始
+    if not state.get("original_question"):
+        return_value["topic_status"] = "new"
+
+    return return_value

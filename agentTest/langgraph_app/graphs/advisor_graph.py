@@ -436,6 +436,9 @@ def build_advisor_subgraph(runtime):
             # Advisor 每执行一次，澄清轮次增加一次
             "advisor_turns": state.get("advisor_turns", 0) + 1,
             "final_answer": final_answer,
+
+            # Advisor 返回后都需要等待用户继续补充或确认
+            "topic_status": "clarifying",
         }
 
         if locked_plan:

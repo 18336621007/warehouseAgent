@@ -174,6 +174,7 @@ def chat():
             return
 
         route = result.get("route", "seeker")
+        topic_status = result.get("topic_status", "")
         final_answer = result.get("final_answer", "")
         generated_sql = result.get("generated_sql", "")
         ev_score = result.get("evaluator_score", 0)
@@ -187,15 +188,25 @@ def chat():
             "evaluator": {"score": ev_score, "self_score": ev_self} if ev_score else None,
         })
 
-        # ── 根据路由管理会话状态 ──
-        if route != "advisor":
-            # seeker 完成，准备创建下一个独立查询Topic
-            session["_new_topic"] = True  # 下一条消息为新话题
+        # ── 根据 Topic 终态管理下一次查数任务 ──
+        if topic_status in (
+                "completed",
+                "failed",
+                "cancelled",
+        ):
+            # 当前Topic已经结束，下一条消息创建独立Topic
+            session["_new_topic"] = True
 
         yield _sse({
-            "type": "done", "content": final_answer, "sql": generated_sql,
+            "type": "done",
+            "content": final_answer,
+            "sql": generated_sql,
+            "topic_status": topic_status,
             "thinking": "\n".join(thinking_parts),
-            "evaluator": {"score": ev_score, "self_score": ev_self} if ev_score else None,
+            "evaluator": {
+                "score": ev_score,
+                "self_score": ev_self,
+            } if ev_score else None,
             "dialogue_id": dialogue_id,
         })
 

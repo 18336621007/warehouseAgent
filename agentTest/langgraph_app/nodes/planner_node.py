@@ -334,11 +334,18 @@ def build_planner_node(runtime):
             log_sub_info(f"表: {table_scores_str}")
             log_sub_info(f"字段: {column_scores_str}")
 
+            # Planner 路由结果决定 Topic 下一阶段
+            if route == "seeker":
+                next_topic_status = "confirmed"
+            else:
+                next_topic_status = "clarifying"
+
             return_value = {
                 "route": route,
                 "planner_reason": planner_reason,
                 "original_question": original_question,
                 "planner_entities": new_entities,
+                "topic_status": next_topic_status,
             }
             # 用户最终确认后，写回 status=confirmed 的查询方案
             if updated_plan is not None:

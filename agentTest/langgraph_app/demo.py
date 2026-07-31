@@ -46,9 +46,13 @@ def run_demo():
                 config)
 
         route = result.get("route", "seeker")
+        topic_status = result.get(
+            "topic_status",
+            "",
+        )
         round_num += 1
 
-        if route == "advisor":
+        if topic_status == "clarifying":
             print(f"\nAI: {result.get('final_answer', '')}")
 
             # Advisor轮次由Graph State自动累积

@@ -27,6 +27,9 @@ def validate_sql_node(state: AgentState):
         return {
             "sql_valid": False,
             "sql_error": message,
+
+            # Router 将决定重新生成还是结束
+            "topic_status": "validating_sql",
         }
     # 资源保护校验
     is_valid, message = validate_sql_with_guardrails(generated_sql)
@@ -34,6 +37,9 @@ def validate_sql_node(state: AgentState):
         return {
             "sql_valid": False,
             "sql_error": message,
+
+            # Router 将决定重新生成还是结束
+            "topic_status": "validating_sql",
         }
 
     # 打印节点结束日志
@@ -43,4 +49,6 @@ def validate_sql_node(state: AgentState):
         "sql_valid": True,
         "sql_error": "",
         "generated_sql": generated_sql,
+        # SQL 已通过校验，下一阶段执行查询
+        "topic_status": "executing",
     }

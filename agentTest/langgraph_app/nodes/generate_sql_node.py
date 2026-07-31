@@ -207,7 +207,11 @@ def build_generate_sql_node(runtime):
         # 企业级规则：走到 generate_sql 的请求必须有 confirmed_plan
         if not confirmed_plan.get("table") and not confirmed_plan.get("tables"):
             log_node_error("generate_sql", error="缺少confirmed_plan，无法生成SQL（应在此之前由Planner兜底路由Advisor）")
-            return {"generated_sql": "", "sql_error": "缺少已确认的分析方案"}
+            return {
+                "generated_sql": "",
+                "sql_error": "缺少已确认的分析方案",
+                "topic_status": "failed",
+            }
         confirmed_section = ""
         if confirmed_plan.get("table") or confirmed_plan.get("tables"):
             tables = confirmed_plan.get("tables") or []
@@ -327,7 +331,12 @@ def build_generate_sql_node(runtime):
                 ctx_len=len(schema_context),
                 ms=elapsed_ms(timer),
             )
-            return {"generated_sql": generated_sql}
+            return {
+                "generated_sql": generated_sql,
+
+                # SQL 已生成，下一阶段进行安全和语法校验
+                "topic_status": "validating_sql",
+            }
         except Exception as error:
             log_node_error("generate_sql", retry=retry_count, error=str(error), ms=elapsed_ms(timer))
             raise

@@ -51,6 +51,8 @@ def build_retrieve_schema_node(runtime):
                 "schema_context": resolved_schema[
                     "schema_context"
                 ],
+                # Schema 已准备完成，下一阶段开始生成 SQL
+                "topic_status": "generating_sql",
             }
         except Exception as error:
             log_node_error(

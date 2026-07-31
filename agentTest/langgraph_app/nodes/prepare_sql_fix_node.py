@@ -37,4 +37,7 @@ def prepare_sql_fix_node(state: AgentState):
     return {
         "retry_count": next_retry_count,
         "sql_fix_reason": accumulates_reason,
+
+        # 校验失败后重新进入 SQL 生成阶段
+        "topic_status": "generating_sql",
     }
