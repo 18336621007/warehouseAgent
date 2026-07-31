@@ -4,12 +4,11 @@
 # 三步流程（对齐论文 SQL-MARS 的 Planner 设计）：
 #   ① FAISS 检索：用余弦相似度召回 top-k 增强元数据
 #   ② LLM 解析：将召回元数据 + 用户问题 + 用户实际输入 + 已确认方案 + Advisor 上轮回复传给 LLM
-#   ③ 阈值判定：LLM full → seeker（FAISS 只做极端否决）；
-#      LLM partial/none → advisor
+#   ③ 阈值判定：模糊需求进入 Advisor；明确需求先由 Advisor 锁定方案；
+#       只有用户最终确认 locked 方案后才能进入 Seeker
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from datetime import datetime
-
+from agentTest.langgraph_app.services.query_plan_service import confirm_query_plan
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
 from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
@@ -19,26 +18,13 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.config.planner import (
-    MAX_HIGH_SIMILARITY_COUNT,
-    HIGH_SIMILARITY_THRESHOLD,
     TABLE_SEARCH_K,
     COLUMN_SEARCH_K,
+    HIGH_SIMILARITY_THRESHOLD,
+    MAX_HIGH_SIMILARITY_COUNT
 )
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 
-# 修改触发词：用户说这些词表示在修改方案，应强制路由到 Advisor 重新确认
-MODIFICATION_KEYWORDS = ["不对", "不是", "换成", "修改", "调整", "改", "换", "错了"]
-
-
-def _is_modification(current_user_input: str) -> bool:
-    """判断用户输入是否为修改意图（简单关键词匹配）"""
-    if not current_user_input:
-        return False
-    text = current_user_input.strip()
-    for keyword in MODIFICATION_KEYWORDS:
-        if keyword in text:
-            return True
-    return False
 
 
 def build_planner_node(runtime):
@@ -72,30 +58,42 @@ def build_planner_node(runtime):
 
         # ── 读取独立的 confirmed_plan（Advisor 写入，Planner 只读不改）──
         confirmed_plan = state.get("confirmed_plan") or {}
-        has_confirmed = bool(confirmed_plan.get("tables"))
-        confirmed_context = ""
-        if has_confirmed:
-            tables = confirmed_plan.get("tables", [])
-            fields = confirmed_plan.get("fields", [])
-            confirmed_context = (
-                "【上一轮已确认的分析方案】\n"
-                f"表: {', '.join(tables)}\n"
-                f"字段: {', '.join(fields)}\n"
-                "请根据用户本轮实际输入判断：用户是确认方案（→ full）、修改方案（→ partial）、还是换话题（→ none）"
-            )
+        has_plan = bool(
+            confirmed_plan.get("table")
+            or confirmed_plan.get("tables")
+        )
+        if has_plan:
+            plan_table = confirmed_plan.get("table", "")
+            plan_measures = confirmed_plan.get("measures") or []
+            plan_dimensions = confirmed_plan.get("dimensions") or []
+            plan_fields = confirmed_plan.get("fields") or []
+            plan_time_field = confirmed_plan.get("time_field", "")
+            plan_time_range = confirmed_plan.get("time_range", "")
+            plan_filters = confirmed_plan.get("filters", "")
+            plan_status = confirmed_plan.get("status", "")
 
-        # ── 获取 Advisor 上轮回复，帮助 LLM 理解用户的简短选择 ──
-        # 从标准消息记忆获取上一轮Advisor可见回复
+            confirmed_context = (
+                f"方案状态: {plan_status or '未设置'}\n"
+                f"数据表: {plan_table or '未设置'}\n"
+                f"度量字段: {', '.join(plan_measures) or '无'}\n"
+                f"维度字段: {', '.join(plan_dimensions) or '无'}\n"
+                f"全部字段: {', '.join(plan_fields) or '无'}\n"
+                f"时间字段: {plan_time_field or '未设置'}\n"
+                f"时间范围: {plan_time_range or '未设置'}\n"
+                f"过滤条件: {plan_filters or '无'}"
+            )
+        else:
+            confirmed_context = "当前尚未形成查询方案。"
+
+
+        # Advisor 上轮回复既用于向量检索，也用于 LLM 理解简短选择
         advisor_last_answer = get_last_ai_content(
             state.get("messages") or [],
             "advisor",
         )
+
         if advisor_last_answer:
-            advisor_last_answer = (
-                "【上一轮 Advisor 的回复】\n"
-                f"{advisor_last_answer[:800]}\n"
-                "如果用户输入是数字或简短选择，请从此回复中推断对应的是哪个选项。"
-            )
+            advisor_last_answer = advisor_last_answer[:800]
         else:
             advisor_last_answer = ""
 
@@ -104,9 +102,36 @@ def build_planner_node(runtime):
         log_node_start("planner", question=original_question)
 
         try:
+            # 将对话上下文组合成检索文本，使“1”“A”等简短回答具有候选语义
+            retrieval_parts = [
+                f"原始查数需求：{original_question}",
+            ]
+
+            if has_plan:
+                plan_table = confirmed_plan.get("table", "")
+                plan_fields = confirmed_plan.get("fields") or []
+
+                retrieval_parts.append(
+                    "当前方案："
+                    f"表={plan_table or '未确定'}，"
+                    f"字段={', '.join(plan_fields) or '未确定'}"
+                )
+
+            if advisor_last_answer:
+                retrieval_parts.append(
+                    f"Advisor上轮候选或方案：{advisor_last_answer}"
+                )
+
+            if current_user_input.strip():
+                retrieval_parts.append(
+                    f"用户本轮回答：{current_user_input}"
+                )
+
+            retrieval_question = "\n".join(retrieval_parts)
+
             # ── 步骤①：FAISS 检索增强元数据 ──
-            table_docs_with_scores = table_vector_store.similarity_search_with_score(original_question, k=TABLE_SEARCH_K)
-            column_docs_with_scores = column_vector_store.similarity_search_with_score(original_question, k=COLUMN_SEARCH_K)
+            table_docs_with_scores = table_vector_store.similarity_search_with_score(retrieval_question, k=TABLE_SEARCH_K)
+            column_docs_with_scores = column_vector_store.similarity_search_with_score(retrieval_question, k=COLUMN_SEARCH_K)
 
             # 拼接元数据上下文：表层在前，字段层在后
             metadata_lines = []
@@ -146,17 +171,33 @@ def build_planner_node(runtime):
             })
             planner_output = structured_llm.invoke(prompt_value)
 
+            effective_query = (
+                    planner_output.effective_query.strip()
+                    or original_question
+            )
+            accept_locked_plan = planner_output.accept_locked_plan
+
             # ── 信任 LLM 的 completeness 判定，不做覆盖 ──
             tables = planner_output.tables
             fields = planner_output.fields
             completeness = planner_output.completeness
 
-            # 后校验：修改场景强制路由 ──
-            is_modifying = has_confirmed and _is_modification(current_user_input)
-            if is_modifying:
-                completeness = "partial"
-                if not planner_output.reason:
-                    planner_output.reason = "用户在已确认方案的基础上提出修改，需 Advisor 重新确认"
+            # 使用 LLM 还原后的完整需求重新探测候选数量，避免“1”“A”等短回答携带整组选项
+            ambiguity_table_docs_with_scores = (
+                table_vector_store.similarity_search_with_score(
+                    effective_query,
+                    k=TABLE_SEARCH_K,
+                )
+            )
+
+            ambiguity_column_docs_with_scores = (
+                column_vector_store.similarity_search_with_score(
+                    effective_query,
+                    k=COLUMN_SEARCH_K,
+                )
+            )
+
+
 
             # 兜底：LLM 未填 completeness 或填了无效值
             if completeness not in ("full", "partial", "none"):
@@ -167,10 +208,6 @@ def build_planner_node(runtime):
                 else:
                     completeness = "full"
 
-            # ── 用户确认时，复用 confirmed_plan 的精确字段 ──
-            if completeness == "full" and has_confirmed:
-                tables = confirmed_plan.get("tables", tables)
-                fields = confirmed_plan.get("fields", fields)
 
             # ── 收集 top-k 分数，用于辅助日志 ──
             table_scores = []
@@ -188,32 +225,93 @@ def build_planner_node(runtime):
                 column_scores.append(f"{name}({similarity})")
             column_scores_str = " | ".join(column_scores)
 
-            # ── 步骤③：阈值判定 ──
-            high_similarity_count = 0
-            for doc, score in column_docs_with_scores:
+            # ── 步骤③：基于完整有效需求统计各层高相似度候选数量 ──
+            high_similarity_table_count = 0
+            for doc, score in ambiguity_table_docs_with_scores:
                 similarity = 1 - score / 2
                 if similarity > HIGH_SIMILARITY_THRESHOLD:
-                    high_similarity_count += 1
+                    high_similarity_table_count += 1
 
-            if completeness in ("none", "partial"):
+            high_similarity_column_count = 0
+            selected_tables = set(tables)
+
+            for doc, score in ambiguity_column_docs_with_scores:
+                # 字段歧义只在 Planner 已确定的目标表内统计
+                document_table = doc.metadata.get("table", "")
+                if selected_tables and document_table not in selected_tables:
+                    continue
+
+                similarity = 1 - score / 2
+                if similarity > HIGH_SIMILARITY_THRESHOLD:
+                    high_similarity_column_count += 1
+
+            # 任意层候选过多，都表示当前需求仍存在歧义
+            has_excessive_candidates = (
+                    high_similarity_table_count > MAX_HIGH_SIMILARITY_COUNT
+                    or high_similarity_column_count > MAX_HIGH_SIMILARITY_COUNT
+            )
+
+
+
+            # 只有用户接受完整 locked 方案并通过程序校验后才能进入 Seeker
+            updated_plan = None
+
+            if accept_locked_plan:
+                try:
+                    updated_plan = confirm_query_plan(confirmed_plan)
+
+                    # 最终确认必须严格使用 locked 方案，禁止检索结果覆盖方案
+                    tables = updated_plan.get("tables", [])
+                    fields = updated_plan.get("fields", [])
+                    completeness = "full"
+                    route = "seeker"
+                    planner_reason = (
+                            "用户接受完整 locked 方案，程序校验通过："
+                            + planner_output.reason
+                    )
+                except ValueError as error:
+                    # 即使模型误判为确认，程序校验失败也不能进入 Seeker
+                    accept_locked_plan = False
+                    route = "advisor"
+                    planner_reason = (
+                        f"最终确认未通过程序校验：{error}；"
+                        "返回 Advisor 继续澄清"
+                    )
+
+            elif completeness in ("none", "partial"):
                 route = "advisor"
-                planner_reason = f"LLM判定{completeness}: " + planner_output.reason
-                if is_modifying:
-                    planner_reason = f"LLM判定{completeness}(修改场景强制): " + planner_output.reason
-            elif high_similarity_count > MAX_HIGH_SIMILARITY_COUNT * 3:
+                planner_reason = (
+                        f"LLM 判定元数据映射为 {completeness}："
+                        + planner_output.reason
+                )
+
+            elif has_excessive_candidates:
+                # 保留论文中的候选数量硬规则
+                completeness = "partial"
                 route = "advisor"
-                planner_reason = f"LLM判定full但字段候选过多({high_similarity_count} > {MAX_HIGH_SIMILARITY_COUNT * 3}): {planner_output.reason}"
+                planner_reason = (
+                        "LLM 判定映射完整，但高相似度候选数量过多："
+                        f"表级={high_similarity_table_count}，"
+                        f"字段级={high_similarity_column_count}，"
+                        f"阈值={MAX_HIGH_SIMILARITY_COUNT}；"
+                        + planner_output.reason
+                )
+
             else:
-                route = "seeker"
-                planner_reason = "LLM判定映射完整: " + planner_output.reason
+                # 需求已经明确，但还需要 Advisor 生成并展示 locked 方案
+                route = "advisor"
+                planner_reason = (
+                        "需求映射明确，交由 Advisor 生成并展示完整 locked 方案："
+                        + planner_output.reason
+                )
 
-            # ── planner_entities 只写 Planner 自己的分析结果，不写 confirmed 标记 ──
-            # confirmed 由 confirmed_plan 独立管理
             new_entities = {
+                # Advisor 后续使用完整有效需求，不能直接拿“1”“A”检索
+                "effective_query": effective_query,
                 "table": tables[0] if tables else "",
                 "tables": tables,
                 "fields": fields,
-                "measures": [],       # Planner不区分度量/维度，留空
+                "measures": [],
                 "dimensions": [],
                 "time_field": "pt_dt",
                 "filters": "",
@@ -223,13 +321,16 @@ def build_planner_node(runtime):
             log_node_end(
                 "planner",
                 route=route,
+                accept_locked_plan=accept_locked_plan,
                 completeness=completeness,
                 tables=str(tables),
                 fields=str(fields),
-                high_sim=high_similarity_count,
+                high_sim_tables=high_similarity_table_count,
+                high_sim_columns=high_similarity_column_count,
                 reason=planner_reason,
                 ms=elapsed_ms(timer),
             )
+            log_sub_info(f"有效需求: {effective_query}")
             log_sub_info(f"表: {table_scores_str}")
             log_sub_info(f"字段: {column_scores_str}")
 
@@ -239,19 +340,12 @@ def build_planner_node(runtime):
                 "original_question": original_question,
                 "planner_entities": new_entities,
             }
-
-
-            # Planner 路由 seeker 时，若 Advisor 未写入 confirmed_plan，自动提升 planner_entities 为兜底方案
-            # 确保 generate_sql 的一致性校验能检测到方案偏差（如误用不在方案中的字段）
-            if route == "seeker" and not has_confirmed:
-                # 企业级规则：没有confirmed_plan就不能进Seeker，强制路由Advisor
-                route = "advisor"
-                planner_reason = "无已确认方案（Advisor未调用confirm_selection），需Advisor澄清后重新判定"
-                log_node_event("planner", "强制路由advisor: 缺少confirmed_plan")
-                return_value["route"] = route
-                return_value["planner_reason"] = planner_reason
+            # 用户最终确认后，写回 status=confirmed 的查询方案
+            if updated_plan is not None:
+                return_value["confirmed_plan"] = updated_plan
 
             return return_value
+
 
         except Exception as error:
             log_node_error("planner", error=str(error), ms=elapsed_ms(timer))

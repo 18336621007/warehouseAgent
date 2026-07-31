@@ -52,8 +52,11 @@ def build_schema_rag_app(embedding):
 
 
 # 简要注释：构建当前项目可用的标准 tools 列表。
-def build_langchain_tools():
-    return build_tools()
+def build_langchain_tools(meta_provider=None):
+    # 将共享 Metadata Provider 继续传给 Tool 工厂
+    return build_tools(
+        meta_provider=meta_provider,
+    )
 
 
 # 简要注释：创建基于增强元数据的 Schema RAG 链，用于和原始版对比。

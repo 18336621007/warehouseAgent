@@ -2,7 +2,9 @@
 # Advisor 子图独立字段
 from typing import TypedDict
 from agentTest.langgraph_app.state.base_state import BaseState
+from agentTest.langgraph_app.state.query_plan import QueryPlan
 
 class AdvisorState(BaseState, total=False):
-    confirmed_plan: dict         # Advisor 写入
+    # Advisor 负责生成 status=locked 的标准查询方案
+    confirmed_plan: QueryPlan         # Advisor 写入 locked 方案
     final_answer: str            # Advisor 回复文本

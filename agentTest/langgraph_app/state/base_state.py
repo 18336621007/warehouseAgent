@@ -3,6 +3,7 @@
 from typing import Annotated, Literal, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
+from agentTest.langgraph_app.state.query_plan import QueryPlan
 
 # Topic 状态用于描述一次问数任务的生命周期
 TopicStatus = Literal[
@@ -41,7 +42,9 @@ class TopicState(IdentityState, total=False):
 
     advisor_turns: int
 
-    confirmed_plan: dict
+    # 当前查询方案，后续会统一重命名为 query_plan
+    confirmed_plan: QueryPlan
+
 
 
 class BaseState(TopicState, total=False):

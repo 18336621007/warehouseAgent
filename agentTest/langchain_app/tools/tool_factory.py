@@ -6,8 +6,10 @@ from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 
 
 # 简要注释：Tool 工厂模块，负责统一初始化并返回标准 LangChain tools 列表。
-def build_tools():
-    meta_provider = HiveMetadataProvider()
+def build_tools(meta_provider=None):
+    # Runtime 可以注入共享 Provider，避免重复创建元数据实例
+    if meta_provider is None:
+        meta_provider = HiveMetadataProvider()
     datasource = HiveDataSource()
 
     list_tables_tool = build_list_tables_tool(meta_provider)

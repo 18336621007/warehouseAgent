@@ -1,16 +1,19 @@
 ﻿# Graph 运行时依赖构建模块，负责统一初始化共享对象。
-from agentTest.langchain_app.app_builder import build_schema_rag_app, build_db_rag, build_table_rag, build_column_rag
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
 from agentTest.langchain_app.vectorstores.example_vector_store import ExampleVectorStore
 from agentTest.langgraph_app.runtime.graph_logger import clear_log_file
 from agentTest.langgraph_app.runtime.graph_logger import get_log_file_path
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.llm import LLM
-from agentTest.langchain_app.app_builder import build_enriched_schema_rag_app, build_langchain_tools
 from agentTest.metadata.mysql_store import load_enriched_columns  # 加载字段类型映射
 from agentTest.metadata.mysql_store import init_evaluator_table  # 初始化 Evaluator 评估表
 from agentTest.langgraph_app.prompts.sql_generation_prompt import build_sql_generation_prompt  # 新增
-
+from agentTest.langchain_app.app_builder import build_column_rag
+from agentTest.langchain_app.app_builder import build_db_rag
+from agentTest.langchain_app.app_builder import build_langchain_tools
+from agentTest.langchain_app.app_builder import build_table_rag
+from agentTest.langgraph_app.services.query_plan_schema_resolver import QueryPlanSchemaResolver
+from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 
 def build_graph_runtime():
 
@@ -24,15 +27,24 @@ def build_graph_runtime():
     table_rag = build_table_rag(embedding)
     column_rag = build_column_rag(embedding)
 
-    # 保留：旧的单层版本（Seeker 暂时还用）
-    enriched_context = build_enriched_schema_rag_app(embedding) # 论文增强后的schema
+
 
     # Evaluator 示例向量库（高质量对话存储，供 Planner/Advisor/Seeker 检索）
     example_vector_store = ExampleVectorStore(embedding)
     # 初始化 Evaluator MySQL 表（幂等）
     init_evaluator_table()
 
-    tools = build_langchain_tools()
+    # Provider 由 Runtime 统一创建，Tools 和 Resolver 共享缓存
+    metadata_provider = HiveMetadataProvider()
+    tools = build_langchain_tools(
+        meta_provider=metadata_provider,
+    )
+    query_plan_schema_resolver = (
+        QueryPlanSchemaResolver(
+            metadata_provider=metadata_provider,
+        )
+    )
+
     llm = LLM()
 
     # 从 MySQL 加载字段类型映射（度量/维度），供 generate_sql 生成聚合 SQL
@@ -53,7 +65,10 @@ def build_graph_runtime():
         "embedding": embedding,
         "llm": llm,
         "prompt": build_sql_generation_prompt(),  # prompt 直接构建，不依赖 Hive
-        "retriever": enriched_context["retriever"],  # 增强版检索器
+        # Seeker 使用确认方案精确加载 Schema
+        "query_plan_schema_resolver": (
+            query_plan_schema_resolver
+        ),
         # 新增：三层向量库（Advisor 用）
         "db_vector_store": db_rag["vector_store"],
         "table_vector_store": table_rag["vector_store"],
@@ -63,11 +78,4 @@ def build_graph_runtime():
         "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}
         "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}
     }
-"""
-为什么 prompt 可以直接构建？
-build_sql_generation_prompt() 只是创建一个 ChatPromptTemplate 对象，纯 Python 操作，不需要数据库。
 
-为什么不继续用 build_schema_rag_app？
-因为它的 build_documents() 每次都会连 Hive 做 list_tables + describe_table，
-即使 FAISS 缓存了磁盘也不会跳过这一步。换成增强版后，整个 graph_runtime 启动就只依赖 MySQL + FAISS 磁盘缓存，不再需要 Hive 连接。
-"""

@@ -1,4 +1,4 @@
-﻿# Schema 检索节点，负责根据用户问题召回相关 schema 文档。
+﻿# Schema 精确加载节点，只根据最终确认方案读取物理表结构。
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
@@ -8,33 +8,51 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 
 
 def build_retrieve_schema_node(runtime):
+    query_plan_schema_resolver = (
+        runtime["query_plan_schema_resolver"]
+    )
 
-    retriever = runtime["retriever"]
-
-    def retrieve_schema_node(state: AgentState) -> dict:
-
-        # Seeker 使用完整原始问题进行 Schema 检索
-        question = state["original_question"]
+    def retrieve_schema_node(
+        state: AgentState,
+    ) -> dict:
         timer = start_timer()
+        confirmed_plan = (
+            state.get("confirmed_plan") or {}
+        )
 
-        # 记录节点开始日志
-        log_node_start("retrieve_schema", question=question)
+        # 记录最终确认方案的 Schema 加载过程
+        log_node_start(
+            "retrieve_schema",
+            plan_status=confirmed_plan.get(
+                "status",
+                "",
+            ),
+        )
 
         try:
-            schema_documents = retriever.retrieve(question)
+            resolved_schema = (
+                query_plan_schema_resolver.resolve(
+                    confirmed_plan
+                )
+            )
 
-            # 记录节点结束日志
             log_node_end(
                 "retrieve_schema",
-                docs=len(schema_documents),
+                table=resolved_schema[
+                    "table_identifier"
+                ],
+                fields=resolved_schema[
+                    "column_count"
+                ],
                 ms=elapsed_ms(timer),
             )
 
             return {
-                "schema_documents": schema_documents
+                "schema_context": resolved_schema[
+                    "schema_context"
+                ],
             }
         except Exception as error:
-            # 记录节点异常日志
             log_node_error(
                 "retrieve_schema",
                 error=str(error),

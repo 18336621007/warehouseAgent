@@ -2,6 +2,7 @@
 # Seeker 子图字段 + Evaluator 字段（同属一条执行链路）
 from typing import List, Any, TypedDict
 from agentTest.langgraph_app.state.base_state import BaseState
+from agentTest.langgraph_app.state.query_plan import QueryPlan
 
 class SeekerState(BaseState, total=False):
     # Seeker SQL 生成链路
@@ -23,7 +24,8 @@ class SeekerState(BaseState, total=False):
     final_answer: str
     retry_count: int
     sql_fix_reason: str
-    confirmed_plan: dict         # 只读，SQL 一致性校验用
+    # Seeker 只接受 status=confirmed 的完整查询方案
+    confirmed_plan: QueryPlan         # 只读，SQL 一致性校验用
 
 
     # Evaluator 评估字段，advisor_turns从TopicState继承并由Graph自动累积
