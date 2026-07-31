@@ -6,7 +6,15 @@ from flask_cors import CORS
 import uuid, os, sys, json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from agentTest.langgraph_app.runtime.graph_logger import bind_log_context
+from agentTest.langgraph_app.runtime.graph_logger import reset_log_context
+from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
+from agentTest.langgraph_app.runtime.graph_logger import log_node_degraded
+from agentTest.langgraph_app.runtime.graph_logger import log_request_end
+from agentTest.langgraph_app.runtime.graph_logger import log_request_error
+from agentTest.langgraph_app.runtime.graph_logger import log_request_start
+from agentTest.langgraph_app.runtime.graph_logger import log_state_change
+from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 from web.intent_classifier import classify_intent
@@ -35,6 +43,10 @@ NODE_LABELS = {
     "build_final_answer": "正在整理查询结果...",
     "evaluator": "正在评估对话质量...",
 }
+
+# 前端只展示安全错误信息，内部异常通过error_id在日志中定位
+QUERY_ERROR_CODE = "QUERY_EXECUTION_FAILED"
+QUERY_SAFE_ERROR_MESSAGE = "系统暂时无法完成本次查询，请稍后重试。"
 
 def _sse(data_dict):
     return "data: " + json.dumps(data_dict, ensure_ascii=False) + "\n\n"
@@ -99,46 +111,57 @@ def chat():
     if not message: return jsonify({"error": "empty message"}), 400
 
     session = sessions[conversation_id]
+    # 新查数问题创建独立Topic，并使用新的LangGraph Checkpoint
+    if session.pop("_new_topic", False):
+        session["topic_id"] = uuid.uuid4().hex
 
-    def generate():
-        # ── query: LangGraph pipeline ──
-        # 新查数问题创建独立Topic，并使用新的LangGraph Checkpoint
-        if session.pop("_new_topic", False):
-            session["topic_id"] = uuid.uuid4().hex
+    # 当前Topic的多轮追问共享同一个topic_id
+    topic_id = session["topic_id"]
 
-        # 当前Topic的多轮追问共享同一个topic_id
-        topic_id = session["topic_id"]
+    # 每次HTTP请求使用独立request_id
+    request_id = uuid.uuid4().hex
 
-        # 每次HTTP请求使用独立request_id
-        request_id = uuid.uuid4().hex
-
-        # 每个Topic拥有独立的LangGraph Checkpoint
-        graph_thread_id = f"{conversation_id}:{topic_id}"
-
-        config = {
-            "configurable": {
-                "thread_id": graph_thread_id
-            }
+    # 每个Topic拥有独立的LangGraph Checkpoint
+    graph_thread_id = f"{conversation_id}:{topic_id}"
+    config = {
+        "configurable": {
+            "thread_id": graph_thread_id,
         }
+    }
 
-        # 从Checkpoint判断当前Topic是否已经开始
-        checkpoint_snapshot = APP.get_state(config)
-        topic_state = (checkpoint_snapshot and checkpoint_snapshot.values) or {}
+    def generate(request_timer, topic_state):
+        # ── query: LangGraph pipeline ──
         is_first_topic_turn = not topic_state.get("original_question")
+
+        # 保存请求开始前的Topic状态，用于识别真实状态变化
+        observed_topic_status = topic_state.get(
+            "topic_status",
+            "",
+        )
 
         # 仅首条消息做意图识别，追问消息跳过（直接走 LangGraph）
         if is_first_topic_turn:
             yield _sse({"type": "status", "text": "正在识别意图..."})
             try:
                 intent_result = classify_intent(message)
-            except Exception as e:
-                print(f"[server] intent failed: {e}")
+            except Exception as error:
+                log_node_degraded(
+                    "intent_classifier",
+                    error,
+                    error_code="INTENT_CLASSIFIER_DEGRADED",
+                    fallback="query",
+                )
                 intent_result = type("F", (), {"intent": "query", "quick_reply": ""})()
 
             if intent_result.intent == "chat":
                 reply = intent_result.quick_reply or "你好！有什么可以帮你的吗？"
                 session["messages"].append({"role": "user", "content": message})
                 session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None})
+                log_request_end(
+                    result_type="chat",
+                    node_count=0,
+                    ms=elapsed_ms(request_timer),
+                )
                 yield _sse({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0})
                 return
 
@@ -157,21 +180,36 @@ def chat():
         thinking_parts = ["[intent] query"]
         seen = set()
 
-        try:
-            for chunk in APP.stream(state_input, config, subgraphs=True):
-                node_dict = chunk[1] if isinstance(chunk, tuple) else chunk
-                for node_name, _ in node_dict.items():
-                    if not node_name or node_name in seen: continue
-                    seen.add(node_name)
-                    label = NODE_LABELS.get(node_name, node_name)
-                    thinking_parts.append("[" + node_name + "] " + label)
-                    yield _sse({"type": "thinking", "node": node_name, "text": label})
+        for chunk in APP.stream(state_input, config, subgraphs=True):
+            node_dict = chunk[1] if isinstance(chunk, tuple) else chunk
+            for node_name, node_update in node_dict.items():
+                # 从LangGraph节点增量更新中统一观察Topic状态变化
+                if isinstance(node_update, dict):
+                    next_topic_status = node_update.get(
+                        "topic_status",
+                        "",
+                    )
 
-            final_state = APP.get_state(config)
-            result = (final_state and final_state.values) or {}
-        except Exception as e:
-            yield _sse({"type": "error", "text": str(e)})
-            return
+                    if (
+                            next_topic_status
+                            and next_topic_status != observed_topic_status
+                    ):
+                        log_state_change(
+                            node_name=node_name,
+                            field_name="topic_status",
+                            previous_value=observed_topic_status,
+                            current_value=next_topic_status,
+                        )
+                        observed_topic_status = next_topic_status
+
+                if not node_name or node_name in seen: continue
+                seen.add(node_name)
+                label = NODE_LABELS.get(node_name, node_name)
+                thinking_parts.append("[" + node_name + "] " + label)
+                yield _sse({"type": "thinking", "node": node_name, "text": label})
+
+        final_state = APP.get_state(config)
+        result = (final_state and final_state.values) or {}
 
         route = result.get("route", "seeker")
         topic_status = result.get("topic_status", "")
@@ -197,6 +235,14 @@ def chat():
             # 当前Topic已经结束，下一条消息创建独立Topic
             session["_new_topic"] = True
 
+        log_request_end(
+            result_type="query",
+            route=route,
+            topic_status=topic_status,
+            node_count=len(seen),
+            ms=elapsed_ms(request_timer),
+        )
+
         yield _sse({
             "type": "done",
             "content": final_answer,
@@ -210,7 +256,108 @@ def chat():
             "dialogue_id": dialogue_id,
         })
 
-    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+    def generate_with_log_context():
+        # 为本次流式请求绑定独立日志上下文，避免并发日志相互混淆
+        context_token = bind_log_context(
+            conversation_id=conversation_id,
+            topic_id=topic_id,
+            request_id=request_id,
+            graph_thread_id=graph_thread_id,
+        )
+        request_timer = start_timer()
+        topic_state = {}
+
+        try:
+            log_request_start(
+                input_length=len(message),
+            )
+
+            # Checkpoint读取也属于统一请求异常边界
+            checkpoint_snapshot = APP.get_state(config)
+            topic_state = (
+                checkpoint_snapshot
+                and checkpoint_snapshot.values
+            ) or {}
+
+            yield from generate(
+                request_timer,
+                topic_state,
+            )
+
+        except Exception as error:
+            error_id = uuid.uuid4().hex
+            previous_topic_status = topic_state.get(
+                "topic_status",
+                "",
+            )
+
+            try:
+                # 异常可能发生在部分节点已经完成后，重新读取最新状态
+                latest_snapshot = APP.get_state(config)
+                latest_state = (
+                    latest_snapshot
+                    and latest_snapshot.values
+                ) or {}
+                previous_topic_status = latest_state.get(
+                    "topic_status",
+                    previous_topic_status,
+                )
+
+                # State只保存安全错误编号，不保存内部异常文本
+                APP.update_state(
+                    config,
+                    {
+                        "topic_status": "failed",
+                        "error_message": (
+                            f"{QUERY_ERROR_CODE}:{error_id}"
+                        ),
+                    },
+                )
+
+                if previous_topic_status != "failed":
+                    log_state_change(
+                        node_name="request_boundary",
+                        field_name="topic_status",
+                        previous_value=previous_topic_status,
+                        current_value="failed",
+                    )
+
+            except Exception as state_error:
+                # Checkpoint写入失败不能覆盖最初的业务异常
+                log_node_degraded(
+                    "request_boundary",
+                    state_error,
+                    error_code="FAILED_STATE_PERSIST_DEGRADED",
+                    related_error_id=error_id,
+                    stage="persist_failed_state",
+                )
+
+            # failed是Topic终态，下一条消息创建新的Topic
+            session["_new_topic"] = True
+
+            log_request_error(
+                error=error,
+                error_id=error_id,
+                error_code=QUERY_ERROR_CODE,
+                topic_status="failed",
+                ms=elapsed_ms(request_timer),
+            )
+
+            yield _sse({
+                "type": "error",
+                "text": QUERY_SAFE_ERROR_MESSAGE,
+                "error_code": QUERY_ERROR_CODE,
+                "error_id": error_id,
+            })
+
+        finally:
+            # 流式响应正常结束、异常或客户端断开时都释放日志上下文
+            reset_log_context(context_token)
+
+    return Response(
+        stream_with_context(generate_with_log_context()),
+        mimetype="text/event-stream",
+    )
 
 @app.route("/api/score", methods=["POST"])
 def submit_score():

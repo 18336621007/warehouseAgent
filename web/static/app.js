@@ -166,8 +166,15 @@ async function sendMsg() {
                         finalEval = event.evaluator;
                         finalDialogueId = event.dialogue_id || 0;
                     } else if (event.type === "error") {
-                                                finalContent = "处理出错: " + event.text;
-                        console.log("[sendMsg] error: " + event.text);
+                        var errorIdText = event.error_id
+                            ? "\n错误编号：" + event.error_id
+                            : "";
+
+                        finalContent = event.text + errorIdText;
+                        console.log(
+                            "[sendMsg] request failed, error_id="
+                            + (event.error_id || "")
+                        );
                     }
                 } catch (parseErr) {}
             }

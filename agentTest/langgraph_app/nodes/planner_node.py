@@ -284,19 +284,6 @@ def build_planner_node(runtime):
                         f"LLM 判定元数据映射为 {completeness}："
                         + planner_output.reason
                 )
-
-            elif has_excessive_candidates:
-                # 保留论文中的候选数量硬规则
-                completeness = "partial"
-                route = "advisor"
-                planner_reason = (
-                        "LLM 判定映射完整，但高相似度候选数量过多："
-                        f"表级={high_similarity_table_count}，"
-                        f"字段级={high_similarity_column_count}，"
-                        f"阈值={MAX_HIGH_SIMILARITY_COUNT}；"
-                        + planner_output.reason
-                )
-
             else:
                 # 需求已经明确，但还需要 Advisor 生成并展示 locked 方案
                 route = "advisor"

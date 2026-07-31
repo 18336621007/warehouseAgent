@@ -1,7 +1,6 @@
-﻿# Graph 运行时依赖构建模块，负责统一初始化共享对象。
+# Graph 运行时依赖构建模块，负责统一初始化共享对象。
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
 from agentTest.langchain_app.vectorstores.example_vector_store import ExampleVectorStore
-from agentTest.langgraph_app.runtime.graph_logger import clear_log_file
 from agentTest.langgraph_app.runtime.graph_logger import get_log_file_path
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.llm import LLM
@@ -16,9 +15,7 @@ from agentTest.langgraph_app.services.query_plan_schema_resolver import QueryPla
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 
 def build_graph_runtime():
-
-    # 清空旧日志，保证每次运行都从新日志开始
-    clear_log_file()
+    # 结构化日志由TimedRotatingFileHandler按天滚动，服务启动时保留历史日志
 
     embedding = BailianEmbeddings()
 

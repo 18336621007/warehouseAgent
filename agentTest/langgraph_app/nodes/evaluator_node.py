@@ -14,7 +14,7 @@ from agentTest.langgraph_app.prompts.evaluator_prompt import EvaluatorSelfScore,
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.message_utils import build_advisor_dialogue_context
 from agentTest.langgraph_app.runtime.graph_logger import (
-    log_node_start, log_node_end, log_node_error, elapsed_ms, start_timer,
+    log_node_start, log_node_end, log_node_degraded, elapsed_ms, start_timer,
 )
 import hashlib
 from agentTest.metadata.mysql_store import save_evaluated_dialogue, load_enriched_tables
@@ -123,7 +123,12 @@ def build_evaluator_node(runtime):
                 example_hash=example_hash,
                 )
             except Exception as db_error:
-                log_node_error("evaluator", error=f"MySQL入库失败: {db_error}")
+                log_node_degraded(
+                    "evaluator",
+                    db_error,
+                    error_code="EVALUATOR_MYSQL_DEGRADED",
+                    stage="mysql_persist",
+                )
 
             # ── 步骤6：FAISS 仅高分入库 ──
             if is_high_quality and example_vector_store is not None:
@@ -139,7 +144,12 @@ def build_evaluator_node(runtime):
                         score=comprehensive,
                     )
                 except Exception as faiss_error:
-                    log_node_error("evaluator", error=f"FAISS入库失败: {faiss_error}")
+                    log_node_degraded(
+                        "evaluator",
+                        faiss_error,
+                        error_code="EVALUATOR_FAISS_DEGRADED",
+                        stage="faiss_persist",
+                    )
 
             log_node_end(
                 "evaluator",
@@ -161,7 +171,19 @@ def build_evaluator_node(runtime):
             }
 
         except Exception as error:
-            log_node_error("evaluator", error=str(error), ms=elapsed_ms(timer))
-            raise
+            log_node_degraded(
+                "evaluator",
+                error,
+                error_code="EVALUATOR_DEGRADED",
+                stage="evaluation",
+                ms=elapsed_ms(timer),
+            )
+
+            # Evaluator属于查询完成后的附加能力，失败不能影响最终答案
+            return {
+                "evaluator_score": 0,
+                "evaluator_self_score": 0,
+                "evaluator_dialogue_id": 0,
+            }
 
     return evaluator_node
