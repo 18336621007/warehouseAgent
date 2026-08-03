@@ -55,7 +55,8 @@ flowchart TD
 3. **职责分离**：Advisor 负责澄清或形成 `locked` 方案；Planner 负责理解用户是否接受完整方案；Seeker 只执行 `confirmed` 方案。
 4. **不允许执行层猜测**：Seeker 不再通过向量检索重新选表选字段，方案缺失或物理 Schema 不一致时直接失败。
 5. **检索证据不直接决定路由**：高相似候选数量保留为日志和调优指标，但不再作为把 `full` 强制降为 `partial` 的硬门禁；业务完整度由对话语义、元数据映射、QueryPlan 校验和用户确认共同决定。
-6. **当前单表优先**：QueryPlan 为未来 `tables` 和多表 Join 预留，但上线主链路明确限制为单表查询。
+6. **当前实现仍为单表**：QueryPlan 已预留 `tables`，但 `lock_query_plan()`、Resolver 和 SQL 一致性校验仍按单表工作。
+7. **下一阶段功能优先**：在保留 confirmed_plan 业务契约的基础上新增 ExecutionPlan、关系元数据和确定性 Join Planner，再扩展分析性查询。
 
 ## 三、模块职责
 

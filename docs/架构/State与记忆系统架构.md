@@ -516,7 +516,9 @@ sequenceDiagram
 - 增加同一 Topic 的并发请求控制和完整请求幂等。
 - 删除 `SeekerState.schema_documents/schema_candidate_ids` 以及子 State 中重复声明的 `confirmed_plan`，仅保留继承字段。
 - 将字符串 `filters` 升级为结构化表达后，再按所需字段裁剪 Schema。
-- 单表链路上线后再建设语义层编译和确定性多表 Join Planner。
+- 下一阶段优先拆分用户确认的 QueryPlan 与系统内部 ExecutionPlan。
+- 新增关系元数据、TableCoverageAnalyzer 和确定性多表 Join Planner。
+- 多表与分析查询功能完成后，再进行 Topic 摘要、持久化和并发优化。
 
 ---
 

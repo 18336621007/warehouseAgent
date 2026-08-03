@@ -405,6 +405,16 @@ def build_advisor_subgraph(runtime):
                 "当前分析方案还不完整，我需要继续确认指标、"
                 "维度、时间范围或过滤条件。"
             )
+        elif can_submit_plan:
+            # Plan 模式下 Agent 未调用 submit_query_plan，禁止展示 LLM 原文伪装方案已锁定
+            log_node_event(
+                "advisor_agent",
+                "Plan模式下Agent未调用submit_query_plan，拒绝展示未锁定方案的LLM文本",
+            )
+            final_answer = (
+                "我已经分析了您的查询需求，但在形成正式方案时遇到了问题。"
+                "您的需求已被记录，请重新发送消息，我会继续处理。"
+            )
         else:
             # 澄清阶段保留 LLM 原文
             final_answer = last_msg.content if last_msg.content else ""

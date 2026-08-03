@@ -245,14 +245,6 @@ def build_planner_node(runtime):
                 if similarity > HIGH_SIMILARITY_THRESHOLD:
                     high_similarity_column_count += 1
 
-            # 任意层候选过多，都表示当前需求仍存在歧义
-            has_excessive_candidates = (
-                    high_similarity_table_count > MAX_HIGH_SIMILARITY_COUNT
-                    or high_similarity_column_count > MAX_HIGH_SIMILARITY_COUNT
-            )
-
-
-
             # 只有用户接受完整 locked 方案并通过程序校验后才能进入 Seeker
             updated_plan = None
 
