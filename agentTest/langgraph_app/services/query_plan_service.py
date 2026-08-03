@@ -20,24 +20,36 @@ def _deduplicate(values: list[str]) -> list[str]:
 
 
 def lock_query_plan(proposed_plan: dict) -> QueryPlan:
-    """将 Advisor 生成的完整方案标准化为 locked 方案。"""
+    """将 Advisor 生成的完整方案标准化为 locked 方案。table 从 tables[0] 推导。"""
     plan = deepcopy(proposed_plan)
 
-    table = plan.get("table", "")
     measures = plan.get("measures") or []
     dimensions = plan.get("dimensions") or []
     time_field = plan.get("time_field", "")
+    advisors_tables = plan.get("tables") or []
+    advisors_field_sources = plan.get("field_sources") or []  # ["db.table.field", ...]
 
-    # 根据字段来源推导参与表，不再固定为单表
-    # 当前字段来源由 Advisor 在 submit_query_plan 时通过 search_columns 的 metadata 提供
-    field_sources = plan.get("_field_sources") or {}
-    derived_tables = list(dict.fromkeys(field_sources.values()))  # 去重保留顺序
-    if derived_tables:
+    if advisors_field_sources:
+        # 从 "db.table.field" 字符串提取 {field: table} 映射
+        source_map: dict[str, str] = {}
+        derived_tables: list[str] = []
+        for fs in advisors_field_sources:
+            parts = fs.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            table_name = parts[0]   # ads_trip.xxx
+            field_name = parts[1]   # company_name
+            source_map[field_name] = table_name
+            if table_name not in derived_tables:
+                derived_tables.append(table_name)
         plan["tables"] = derived_tables
+        plan["field_sources"] = source_map                      # {field: table} dict
     else:
-        # 无字段来源信息时回退为单表，保持向后兼容
-        plan["tables"] = [table] if table else []
-    # _field_sources 是内部传递用，不写入最终 QueryPlan
+        plan["tables"] = advisors_tables
+
+    # table 统一从 tables[0] 推导
+    plan["table"] = plan["tables"][0] if plan["tables"] else ""
+
     plan.pop("_field_sources", None)
 
     fields = list(measures) + list(dimensions)

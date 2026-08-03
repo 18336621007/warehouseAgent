@@ -6,7 +6,61 @@
 from agentTest.db.hive_guardrails import validate_sql_with_guardrails
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_event, log_node_start
 from agentTest.langgraph_app.state.agent_state import AgentState
+import re
 from agentTest.validate.sql_validate import validate_hive_sql
+
+
+def _validate_multi_table(sql: str, confirmed_plan: dict) -> list[str]:
+    """多表场景下的额外安全校验：表完整性、笛卡尔积检测、JOIN键匹配"""
+    issues = []
+    tables = confirmed_plan.get("tables") or []
+    joins = confirmed_plan.get("joins") or []
+
+    if len(tables) <= 1 and not joins:
+        return issues
+
+    sql_upper = sql.upper()
+
+    # 1. 禁止逗号分隔的多表（笛卡尔积风险）
+    # 匹配 FROM table1, table2 或 FROM table1 t1, table2 t2
+    from_match = re.search(
+        r'FROM\s+(.+?)(?:WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|$|\))',
+        sql_upper, re.DOTALL
+    )
+    if from_match:
+        from_clause = from_match.group(1)
+        if ',' in from_clause and 'JOIN' not in from_clause:
+            issues.append("禁止使用逗号分隔多表（笛卡尔积风险），请使用明确的 JOIN 语法")
+
+    # 2. 所有方案表必须出现在 SQL 中
+    for t in tables:
+        t_normalized = t.replace(".", "\\.").lower()
+        if not re.search(t_normalized, sql.lower()):
+            issues.append(f"方案表 {t} 未出现在 SQL 中")
+
+    # 3. JOIN 键匹配（针对每条约定的 JOIN 边）
+    if joins:
+        if 'JOIN' not in sql_upper:
+            issues.append("方案要求多表 JOIN 但 SQL 中未包含 JOIN 关键字")
+        else:
+            for edge in joins:
+                left_key = edge["left_key"].lower()
+                right_key = edge["right_key"].lower()
+                on_match = re.search(
+                    r'ON\s+(.+?)(?:WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|$|\bAND\b)',
+                    sql_upper + ' AND', re.DOTALL
+                )
+                if on_match:
+                    on_clause = on_match.group(1).lower()
+                    if left_key not in on_clause or right_key not in on_clause:
+                        issues.append(
+                            f"JOIN 键不匹配：方案要求 {left_key}={right_key}，"
+                            f"但 SQL ON 条件中未找到"
+                        )
+                else:
+                    issues.append("SQL 中未找到 JOIN ON 条件")
+
+    return issues
 
 
 def validate_sql_node(state: AgentState):
@@ -37,6 +91,18 @@ def validate_sql_node(state: AgentState):
         return {
             "sql_valid": False,
             "sql_error": message,
+
+            # Router 将决定重新生成还是结束
+            "topic_status": "validating_sql",
+        }
+
+    # 多表安全校验（新增）
+    confirmed_plan = state.get("confirmed_plan") or {}
+    join_issues = _validate_multi_table(generated_sql, confirmed_plan)
+    if join_issues:
+        return {
+            "sql_valid": False,
+            "sql_error": "; ".join(join_issues),
 
             # Router 将决定重新生成还是结束
             "topic_status": "validating_sql",

@@ -7,7 +7,7 @@ PlanStatus = Literal["locked", "confirmed"]
 
 
 class QueryPlan(TypedDict, total=False):
-    # 当前阶段只支持单表，table 作为主表，tables 为后续多表查询预留
+    # table 由 lock_query_plan 从 tables[0] 推导，不作为独立概念暴露给 Advisor
     table: str
     tables: list[str]
 
@@ -53,9 +53,12 @@ def validate_query_plan(
     filters = plan.get("filters", "")
     status = plan.get("status", "")
 
-    # 当前单表阶段要求 table 和 tables 同时存在
+    # table 由 lock_query_plan 从 tables[0] 推导
+    if not table and tables:
+        table = tables[0]
+
     if not isinstance(table, str) or not table.strip():
-        errors.append("缺少主表 table")
+        errors.append("缺少主表")
 
     if not isinstance(tables, list) or not tables:
         errors.append("缺少数据表列表 tables")

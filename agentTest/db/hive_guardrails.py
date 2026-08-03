@@ -18,11 +18,11 @@ PARTITION_FIELDS = [
 
 
 # 是否允许 join
-ALLOW_JOIN = False
+ALLOW_JOIN = True
 # 是否必须Limit
 REQUIRE_LIMIT = True
 #是否允许with
-ALLOW_WITH = False
+ALLOW_WITH = True
 
 # 最大返回行数
 MAX_RESULT_ROWS = 100

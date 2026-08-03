@@ -1,4 +1,4 @@
-# Advisor 子图：ReAct Agent，内部用工具查元数据，对外说业务语言
+﻿# Advisor 子图：ReAct Agent，内部用工具查元数据，对外说业务语言
 # 一问一答模式，不保留内部状态机。Planner 是唯一的调度中心。
 # 企业级三层防护：Prompt 指引 → 图级拦截(硬保障) → 可观测日志
 # Advisor 提交完整方案后，由领域服务统一生成 status=locked 的标准查询方案
@@ -26,33 +26,32 @@ def _get_tool_call_args(messages, tool_name):
                 results.append((tc.get("args", {}), tc.get("id", "")))
     return results
 
-def _has_column_search_for_table(messages, table: str) -> bool:
-    """检查 Advisor 是否检索过当前方案的目标表字段。"""
-    if not table:
+def _has_column_search_for_tables(messages, tables: list[str]) -> bool:
+    """检查 Advisor 是否对所有目标表都检索过字段"""
+    if not tables:
         return False
-
     search_args_list = _get_tool_call_args(
         messages,
         "search_columns",
     )
-
-    for args, _ in search_args_list:
-        searched_table = args.get("table", "")
-        if searched_table == table:
-            return True
-
-    return False
+    searched = {
+        args.get("table", "")
+        for args, _ in search_args_list
+        if args.get("table")
+    }
+    return all(t in searched for t in tables)
 
 def _build_confirmation_message(plan: dict) -> str:
     """用locked_plan构造标准化确认消息，杜绝LLM编造查询结果"""
-    table = plan.get("table", "")
+    tables = plan.get("tables") or []
     measures = plan.get("measures", [])
     dimensions = plan.get("dimensions", [])
     time_field = plan.get("time_field", "pt_dt")
     time_range = plan.get("time_range", "") or "昨天"
     filters = plan.get("filters", "")
+    field_sources = plan.get("field_sources") or {}
 
-    lines = ["已锁定分析方案：", f"- 数据表：{table}"]
+    lines = ["已锁定分析方案：", f"- 数据表：{', '.join(tables)}"]
     if measures:
         lines.append(f"- 度量：{', '.join(measures)}")
     if dimensions:
@@ -60,6 +59,10 @@ def _build_confirmation_message(plan: dict) -> str:
     lines.append(f"- 时间：{time_field} = {time_range}")
     if filters:
         lines.append(f"- 过滤：{filters}")
+    if len(tables) > 1 and field_sources:
+        lines.append("- 字段来源：")
+        for f, t in field_sources.items():
+            lines.append(f"  {f} \u2190 {t}")
     lines.append("")
     lines.append('以上信息确认无误？回复"好"开始查询。')
     return "\n".join(lines)
@@ -278,11 +281,11 @@ def build_advisor_subgraph(runtime):
 
             if submit_args_list and not submission_blocked:
                 submit_args, _ = submit_args_list[-1]
-                proposed_table = submit_args.get("table", "")
+                proposed_tables = submit_args.get("tables") or []
 
-                has_target_column_search = _has_column_search_for_table(
+                has_target_column_search = _has_column_search_for_tables(
                     new_history,
-                    proposed_table,
+                    proposed_tables,
                 )
 
                 if not has_target_column_search:
@@ -290,7 +293,7 @@ def build_advisor_subgraph(runtime):
                     log_node_event(
                         "advisor_agent",
                         "拦截 submit_query_plan："
-                        f"尚未检索目标表 {proposed_table} 的字段，"
+                        f"尚未检索所有目标表 {proposed_tables} 的字段，"
                         f"重试 {retries}/{MAX_COLUMN_CHECK_RETRIES}",
                     )
 
@@ -310,7 +313,7 @@ def build_advisor_subgraph(runtime):
                     agent_history.append(HumanMessage(
                         content=(
                             "提交完整方案前，必须先调用 search_columns，"
-                            f"并将 table 明确设置为 {proposed_table}。"
+                            f"并将 tables 明确设置为 {proposed_tables}。"
                             "请核对该表的指标、维度和时间字段后再提交方案。"
                         ),
                         name="internal",
@@ -356,12 +359,13 @@ def build_advisor_subgraph(runtime):
             args, _ = submit_args_list[-1]
 
             proposed_plan = {
-                "table": args.get("table", ""),
+                "tables": list(args.get("tables") or []),
                 "measures": list(args.get("measures") or []),
                 "dimensions": list(args.get("dimensions") or []),
                 "time_field": args.get("time_field") or "pt_dt",
                 "time_range": args.get("time_range") or "昨天",
                 "filters": args.get("filters") or "",
+                "field_sources": list(args.get("field_sources") or []),
             }
 
             try:
@@ -463,3 +467,7 @@ def build_advisor_subgraph(runtime):
     graph.add_edge("advisor_agent", END)
 
     return graph.compile()
+
+
+
+

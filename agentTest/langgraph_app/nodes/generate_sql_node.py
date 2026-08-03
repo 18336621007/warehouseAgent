@@ -13,6 +13,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 from agentTest.langgraph_app.state.agent_state import AgentState
+from agentTest.langgraph_app.prompts.sql_audit_prompt import SQL_AUDIT_SYSTEM_PROMPT, SQL_AUDIT_HUMAN_TEMPLATE
 
 MAX_CONSISTENCY_RETRIES = 2  # 方案一致性校验最多重试次数
 
@@ -47,6 +48,7 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
     filters = confirmed_plan.get("filters", "")
+    joins = confirmed_plan.get("joins") or []  # 多表Join边
 
     if not table or not measures:
         return ""
@@ -57,18 +59,41 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
 
     date_expr = DATE_FORMAT_HIVE_EXPR.get("yyyyMMdd", "date_sub(current_date(), 1)")
 
-    where_parts = [f"{time_field} = {date_expr}"]
+    # 多表：主表 + JOIN 子句，使用短表名作为别名
+    def _short_name(full_name: str) -> str:
+        """从 database.table 中提取 table 短名"""
+        return full_name.split(".")[-1] if "." in full_name else full_name
+
+    left_alias = _short_name(table)
+    from_clause = f"FROM {table} {left_alias}"
+
+    # 多表时 time_field 需要加左表别名，避免歧义
+    qualified_time = f"{left_alias}.{time_field}" if joins else time_field
+    where_parts = [f"{qualified_time} = {date_expr}"]
     if filters and filters.strip():
         where_parts.append(filters.strip())
+    for edge in joins:
+        right_table = edge["right_table"]
+        right_alias = _short_name(right_table)
+        left_key = edge["left_key"]
+        right_key = edge["right_key"]
+        join_type = edge.get("join_type", "LEFT")
+        from_clause += (
+            f"\n{join_type} JOIN {right_table} {right_alias} "
+            f"ON {left_alias}.{left_key} = {right_alias}.{right_key}"
+        )
 
     sql_lines = [
         f"SELECT {', '.join(select_parts)}",
-        f"FROM {table}",
+        from_clause,
         f"WHERE {' AND '.join(where_parts)}",
-        f"GROUP BY {', '.join(dimensions)}",
-        "LIMIT 1000",
     ]
+    if dimensions:
+        sql_lines.append(f"GROUP BY {', '.join(dimensions)}")
+    sql_lines.append("LIMIT 1000")
     return "\n".join(sql_lines)
+
+
 
 
 def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
@@ -85,10 +110,11 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     if not table:
         return issues
 
-    # 1. 表名校验
-    table_normalized = table.replace(".", "\\.").lower()
-    if not re.search(table_normalized, sql.lower()):
-        issues.append(f"SQL 中未找到方案指定的表: {table}")
+    # 1. 表名校验（支持多表）
+    for t in tables:
+        t_normalized = t.replace(".", "\\.").lower()
+        if not re.search(t_normalized, sql.lower()):
+            issues.append(f"SQL 中未找到方案指定的表: {t}")
 
     # 2. 度量字段校验
     for m in measures:
@@ -146,39 +172,28 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
     filters = confirmed_plan.get("filters", "")
+    joins = confirmed_plan.get("joins") or []  # 多表Join边
 
     # ── 先做程序化校验 ──
     programmatic_issues = _validate_sql_against_plan(sql, confirmed_plan)
     if programmatic_issues:
         return "; ".join(programmatic_issues)
 
+    # ── 构造Join描述 ──
+    joins_desc = ""
+    if joins and len(tables) > 1:
+        join_lines = []
+        for edge in joins:
+            join_lines.append(
+                f"  {edge['left_table']}.{edge['left_key']} = "
+                f"{edge['right_table']}.{edge['right_key']} ({edge.get('join_type', 'LEFT')} JOIN)"
+            )
+        joins_desc = "\n".join(join_lines)
+
     # ── 程序化校验通过，再用 LLM 做语义校验 ──
     check_prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是一个 SQL 审计助手。请对比已确认的分析方案和生成的 SQL，判断 SQL 是否忠实实现了方案。
-
-检查要点：
-- SQL 是否使用了方案中指定的表和字段
-- SQL 的时间分区条件是否与方案描述一致
-- SQL 的过滤条件是否覆盖了方案中提到的筛选条件
-- SQL 的聚合方式是否符合方案描述
-
-返回格式：
-- 如果一致，只返回一个词：PASS
-- 如果不一致，一句话说明哪里不一致（中文），不要输出 SQL。
-"""),
-        ("human", """已确认的分析方案：
-- 数据表: {table}
-- 度量字段: {measures}
-- 维度字段: {dimensions}
-- 时间分区: {time_field}
-- 额外过滤: {filters}
-- Advisor 对方案的描述：
-{advisor_answer}
-
-生成的 SQL：
-{sql}
-
-请判断 SQL 是否忠实实现了上述方案。"""),
+        ("system", SQL_AUDIT_SYSTEM_PROMPT),
+        ("human", SQL_AUDIT_HUMAN_TEMPLATE),
     ])
 
     prompt_value = check_prompt.invoke({
@@ -187,15 +202,16 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
         "dimensions": ", ".join(dimensions) if dimensions else "无",
         "time_field": time_field,
         "filters": filters or "无",
+        "joins": joins_desc or "无（单表查询）",
         "advisor_answer": advisor_last_answer[:1200],
         "sql": sql,
     })
     result = llm.invoke(prompt_value)
-    content = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+    content_result = result.content.strip() if hasattr(result, 'content') else str(result).strip()
 
-    if content.upper().startswith("PASS"):
+    if content_result.upper().startswith("PASS"):
         return ""
-    return content
+    return content_result
 
 
 def build_generate_sql_node(runtime):
@@ -219,9 +235,13 @@ def build_generate_sql_node(runtime):
             measures = confirmed_plan.get("measures", [])
             dimensions = confirmed_plan.get("dimensions", [])
             time_field = confirmed_plan.get("time_field", "pt_dt")
+            joins = confirmed_plan.get("joins") or []  # 多表Join边
+            field_sources = confirmed_plan.get("field_sources") or {}  # 字段来源映射
             filters = confirmed_plan.get("filters", "")
 
-            parts = [f"- 数据表: {table}"]
+            # 涉及表列表（多表时用逗号拼接）
+            tables_str = ", ".join(tables)
+            parts = [f"- 数据表: {tables_str}"]
             if measures:
                 parts.append(f"- 度量字段（必须用聚合函数 SUM/COUNT/AVG）: {', '.join(measures)}")
             if dimensions:
@@ -230,8 +250,23 @@ def build_generate_sql_node(runtime):
             parts.append(f"- 时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
             if filters:
                 parts.append(f"- 额外过滤条件（必须在 WHERE 中）: {filters}")
+            # 多表时追加字段来源和JOIN约束
+            if len(tables) > 1 and field_sources:
+                field_items = [
+                    f"  {f} → {field_sources.get(f, '?')}"
+                    for f in confirmed_plan.get("fields", [])
+                ]
+                parts.append("- 字段来源:\n" + "\n".join(field_items))
+            if joins:
+                join_items = [
+                    f"  {e['left_table']} JOIN {e['right_table']} "
+                    f"ON {e['left_key']}={e['right_key']} ({e.get('join_type', 'LEFT')})"
+                    for e in joins
+                ]
+                parts.append("- 表关联（严格按此JOIN，不得修改）:\n" + "\n".join(join_items))
 
             confirmed_section = "【已确认的分析方案 —— 以下规则必须严格遵守】\n" + "\n".join(parts)
+
 
         # SQL 生成使用完整原始问题，避免使用“好的”等确认文本
         question = state["original_question"]
@@ -342,3 +377,4 @@ def build_generate_sql_node(runtime):
             raise
 
     return generate_sql_node
+

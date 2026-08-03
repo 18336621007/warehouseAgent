@@ -1,37 +1,40 @@
-# Advisor 方案提交工具：将完整查询方案提交给程序校验并锁定
+﻿# Advisor 方案提交工具：将完整查询方案提交给程序校验并锁定
+# 支持单表和多表，field_sources 使用 "db.table.field" 完整标识避免同名字段歧义
 from langchain_core.tools import tool
 
 
 @tool
 def submit_query_plan(
-    table: str,
-    measures: list[str],
-    dimensions: list[str],
+    tables: list[str],
+    measures: list[str] = None,
+    dimensions: list[str] = None,
     time_field: str = "pt_dt",
     time_range: str = "",
     filters: str = "",
+    field_sources: list[str] = None,   # ["db.table.field", ...]
 ) -> str:
     """当当前需求已经能够形成完整、唯一的查询方案时调用。
 
     该工具仅提交方案并等待用户最终确认，不会执行查询。
 
     参数说明：
-    - table: 完整表名，如 ads_trip.ads_exchange_platform_operations_report_day
-    - measures: 度量字段列表，纯维度查询允许为空列表
-    - dimensions: 维度字段列表，无维度时为空列表
-    - time_field: 时间字段，如 pt_dt
+    - tables: 查询涉及的全部表列表，单表如 ["ads_trip.xxx"]，多表如 ["ads_trip.xxx", "dim_trip.yyy"]
+    - measures: 度量字段列表（裸字段名）。纯维度查询时传空列表 []
+    - dimensions: 维度字段列表（裸字段名）。无维度时传空列表 []
+    - time_field: 目标表中的时间字段
     - time_range: 用户确认的时间范围，如 昨天、最近7天
-    - filters: 额外过滤条件，没有时为空字符串
+    - filters: 额外过滤条件，没有时传空字符串 ""
+    - field_sources: 每个字段的完整物理标识列表，格式 ["db.table.field", ...]
+      字段跨多表时必须传入。示例：["ads_trip.report.new_order", "dim_trip.company.true_name"]
+      仅当所有字段都在同一张表时可省略
 
     调用要求：
-    - 方案中的表、度量、维度、时间和过滤条件必须完整
-    - 必须先在目标表内调用 search_columns
+    - 必须先对所有目标表调用 search_columns 核对字段
     - 存在多个未确定口径时不能调用
-    - 用户局部修改方案时，必须提交修改后的完整方案
-    - 该工具不是用户最终执行确认，最终确认由 Planner 处理
+    - 字段跨多表时必须传 field_sources 标注每个字段的物理来源
     """
     return (
-        f"方案已提交: 表={table}, 度量={measures}, "
+        f"方案已提交: 表={tables}, 度量={measures}, "
         f"维度={dimensions}, 时间={time_field}({time_range or '未指定'}), "
-        f"过滤={filters or '无'}"
+        f"过滤={filters or '无'}, field_sources={len(field_sources or [])}条"
     )
