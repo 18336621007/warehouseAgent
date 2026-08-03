@@ -28,8 +28,17 @@ def lock_query_plan(proposed_plan: dict) -> QueryPlan:
     dimensions = plan.get("dimensions") or []
     time_field = plan.get("time_field", "")
 
-    # 派生字段只由程序维护，禁止 LLM 直接决定
-    plan["tables"] = [table] if table else []
+    # 根据字段来源推导参与表，不再固定为单表
+    # 当前字段来源由 Advisor 在 submit_query_plan 时通过 search_columns 的 metadata 提供
+    field_sources = plan.get("_field_sources") or {}
+    derived_tables = list(dict.fromkeys(field_sources.values()))  # 去重保留顺序
+    if derived_tables:
+        plan["tables"] = derived_tables
+    else:
+        # 无字段来源信息时回退为单表，保持向后兼容
+        plan["tables"] = [table] if table else []
+    # _field_sources 是内部传递用，不写入最终 QueryPlan
+    plan.pop("_field_sources", None)
 
     fields = list(measures) + list(dimensions)
     if time_field:

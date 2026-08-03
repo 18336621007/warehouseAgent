@@ -15,8 +15,8 @@ def validate_sql_node(state: AgentState):
     # 缺少 LIMIT → 程序自动追加，无需 LLM 重生成（所有 Hive 查询都必须带 LIMIT）
     sql_clean = generated_sql.rstrip(";").strip()
     if "LIMIT" not in sql_clean.upper():
-        generated_sql = sql_clean + " LIMIT 1000"
-        log_node_event("validate_sql", "自动追加 LIMIT 1000")
+        generated_sql = sql_clean + " LIMIT 50"
+        log_node_event("validate_sql", "自动追加 LIMIT 50")
 
     # 打印节点开始日志
     log_node_start("validate_sql", sql=str(generated_sql))

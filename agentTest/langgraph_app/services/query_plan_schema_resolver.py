@@ -65,6 +65,21 @@ def _format_table_schema(
 
     return "\n".join(lines)
 
+def _format_joins(joins: list[dict]) -> str:
+    """将 Join 边列表格式化为 SQL 生成上下文中的关联说明"""
+    if not joins:
+        return ""
+
+    lines = ["", "表关联:"]
+    for edge in joins:
+        left_side = f"{edge['left_table']}.{edge['left_key']}"
+        right_side = f"{edge['right_table']}.{edge['right_key']}"
+        join_type = edge.get("join_type", "LEFT")
+        lines.append(
+            f"- {left_side} = {right_side} ({join_type} JOIN)"
+        )
+    return "\n".join(lines)
+
 
 class QueryPlanSchemaResolver:
     """根据 confirmed_plan 解析当前单表物理 Schema。"""
@@ -72,10 +87,7 @@ class QueryPlanSchemaResolver:
     def __init__(self, metadata_provider):
         self.metadata_provider = metadata_provider
 
-    def resolve(
-        self,
-        confirmed_plan: dict,
-    ) -> dict:
+    def resolve(self, confirmed_plan: dict) -> dict:
         # Seeker 入口必须再次执行完整方案校验
         plan_errors = validate_query_plan(
             confirmed_plan,
@@ -88,22 +100,22 @@ class QueryPlanSchemaResolver:
             )
 
         tables = confirmed_plan.get("tables") or []
-        primary_table = confirmed_plan.get(
-            "table",
-            "",
-        )
+        if not tables:
+            raise ValueError("查询方案未指定任何数据表")
 
-        # 当前上线版本明确限制为单表查询
-        if len(tables) != 1:
-            raise ValueError(
-                "当前上线版本仅支持单表查询"
+        # ---- 单表：保持原有逻辑完全不变 ----
+        if len(tables) == 1:
+            return self._resolve_single_table(
+                confirmed_plan, tables[0]
             )
 
-        if primary_table != tables[0]:
-            raise ValueError(
-                "查询方案中的 table 与 tables 不一致"
-            )
+        # ---- 多表：逐表加载 Schema + 拼接 Join 信息 ----
+        return self._resolve_multi_table(confirmed_plan, tables)
 
+    def _resolve_single_table(
+            self, confirmed_plan: dict, primary_table: str
+    ) -> dict:
+        """单表解析，维持原有逻辑不变"""
         database_name, table_name = (
             _parse_table_identifier(primary_table)
         )
@@ -116,10 +128,10 @@ class QueryPlanSchemaResolver:
             table
             for table in available_tables
             if (
-                table.get("database_name")
-                == database_name
-                and table.get("table_name")
-                == table_name
+                    table.get("database_name")
+                    == database_name
+                    and table.get("table_name")
+                    == table_name
             )
         ]
         if len(exact_matches) != 1:
@@ -148,7 +160,6 @@ class QueryPlanSchemaResolver:
                 + ", ".join(same_name_identifiers)
             )
 
-        # 只有库表身份唯一时才调用现有 Provider
         table_schema = (
             self.metadata_provider.describe_table(
                 table_name
@@ -160,8 +171,8 @@ class QueryPlanSchemaResolver:
             f"{table_schema.get('table_name', '')}"
         )
         if (
-            resolved_identifier.lower()
-            != primary_table.lower()
+                resolved_identifier.lower()
+                != primary_table.lower()
         ):
             raise ValueError(
                 "加载到的物理表与确认方案不一致："
@@ -175,7 +186,7 @@ class QueryPlanSchemaResolver:
             if column.get("name")
         }
         confirmed_fields = (
-            confirmed_plan.get("fields") or []
+                confirmed_plan.get("fields") or []
         )
 
         missing_fields = [
@@ -189,7 +200,6 @@ class QueryPlanSchemaResolver:
                 + ", ".join(missing_fields)
             )
 
-        # filters 仍是字符串，当前先加载确认表完整物理结构
         schema_context = _format_table_schema(
             table_schema
         )
@@ -198,4 +208,89 @@ class QueryPlanSchemaResolver:
             "schema_context": schema_context,
             "table_identifier": primary_table,
             "column_count": len(available_fields),
+        }
+
+    def _resolve_multi_table(
+            self, confirmed_plan: dict, tables: list[str]
+    ) -> dict:
+        """多表解析：逐表加载 Schema，拼接 Join 信息"""
+        field_sources = confirmed_plan.get("field_sources") or {}
+        joins = confirmed_plan.get("joins") or []
+        confirmed_fields = confirmed_plan.get("fields") or []
+
+        schema_parts = []
+        all_available_fields: dict[str, set[str]] = {}
+        total_columns = 0
+
+        for table_identifier in tables:
+            database_name, table_name = (
+                _parse_table_identifier(table_identifier)
+            )
+
+            # 加载该表的完整 Schema
+            table_schema = (
+                self.metadata_provider.describe_table(
+                    table_name
+                )
+            )
+
+            resolved_identifier = (
+                f"{table_schema.get('database_name', '')}."
+                f"{table_schema.get('table_name', '')}"
+            )
+            if (
+                    resolved_identifier.lower()
+                    != table_identifier.lower()
+            ):
+                raise ValueError(
+                    "加载到的物理表与确认方案不一致："
+                    f"expected={table_identifier}, "
+                    f"actual={resolved_identifier}"
+                )
+
+            schema_parts.append(
+                _format_table_schema(table_schema)
+            )
+
+            available_fields = {
+                column.get("name", "")
+                for column in table_schema.get("columns") or []
+                if column.get("name")
+            }
+            all_available_fields[table_identifier] = available_fields
+            total_columns += len(available_fields)
+
+        # 按 field_sources 校验每个字段在对应表中存在
+        missing: list[str] = []
+        for field_name in confirmed_fields:
+            source_table = field_sources.get(field_name)
+            if not source_table:
+                missing.append(f"{field_name}（未找到来源表）")
+                continue
+            available = all_available_fields.get(source_table)
+            if available is None:
+                missing.append(
+                    f"{field_name}（来源表 {source_table} 未加载）"
+                )
+            elif field_name not in available:
+                missing.append(
+                    f"{field_name}（不存在于 {source_table}）"
+                )
+
+        if missing:
+            raise ValueError(
+                "以下字段校验失败：\n" + "\n".join(missing)
+            )
+
+        # 拼接多表 Schema 上下文
+        schema_context = "\n\n".join(schema_parts)
+
+        # 拼接 Join 信息
+        if joins:
+            schema_context += _format_joins(joins)
+
+        return {
+            "schema_context": schema_context,
+            "table_identifier": ", ".join(tables),
+            "column_count": total_columns,
         }

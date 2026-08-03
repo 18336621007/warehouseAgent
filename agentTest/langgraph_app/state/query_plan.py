@@ -21,6 +21,12 @@ class QueryPlan(TypedDict, total=False):
     time_range: str
     filters: str
 
+    # ── 系统派生的物理执行字段（单表时为空，多表时由 JoinPlanner 填充）──
+    joins: list[dict]           # 多表 Join 边，每边包含 left_table/right_table/left_key/right_key/join_type/cardinality
+    field_sources: dict         # {字段名: database.table}，标识每个业务字段的物理来源
+    target_grain: list[str]     # 查询粒度维度，用于校验 GROUP BY
+    metadata_version: str       # 关系元数据版本，用于审计追溯
+
     # 方案确认状态和时间
     status: PlanStatus
     locked_at: str

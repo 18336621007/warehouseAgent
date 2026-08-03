@@ -60,6 +60,7 @@ def _enrich_columns(meta_provider, datasource, llm):
     """遍历白名单表的所有字段，采样真实值后调用 LLM 生成字段级增强元数据
     返回: (enriched_columns_dict, new_column_tables_set)
     new_column_tables 用于标记哪些表有新增字段，供 _enrich_tables 判断是否需要重跑表级增强"""
+    meta_provider.clear_tables_cache()
     tables = meta_provider.list_tables()
     result = {}
     new_column_tables = set()  # 记录哪些表有新增字段

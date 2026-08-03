@@ -53,7 +53,7 @@ def main():
 
         try:
             print(f"\n[{name}] 开始构建...")
-            result = builder(embedding)
+            result = builder(embedding, force_rebuild=args.force)
             doc_count = len(result.get("documents", []))
             print(f"[{name}] 完成: {doc_count} 条记录 -> {cache_dir}")
         except Exception as e:
@@ -68,3 +68,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -13,7 +13,7 @@ from agentTest.langchain_app.app_builder import build_langchain_tools
 from agentTest.langchain_app.app_builder import build_table_rag
 from agentTest.langgraph_app.services.query_plan_schema_resolver import QueryPlanSchemaResolver
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
-
+from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 def build_graph_runtime():
     # 结构化日志由TimedRotatingFileHandler按天滚动，服务启动时保留历史日志
 
@@ -74,5 +74,6 @@ def build_graph_runtime():
         "tools": tools,
         "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}
         "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}
+        "semantic_metadata_provider": SemanticMetadataProvider(),  # join关系
     }
 

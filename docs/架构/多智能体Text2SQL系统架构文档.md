@@ -1,6 +1,6 @@
-# 多智能体 Text2SQL 系统架构文档
+﻿# 多智能体 Text2SQL 系统架构文档
 
-> 最后更新：2026-07-31 | QueryPlan 两阶段确认与 Seeker 精确 Schema 执行已完成  
+> 最后更新：2026-08-03 | 多表覆盖分析 + 安全Join路径规划已完成（第9课），多表Schema解析（第10课）进行中  
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -55,7 +55,7 @@ flowchart TD
 3. **职责分离**：Advisor 负责澄清或形成 `locked` 方案；Planner 负责理解用户是否接受完整方案；Seeker 只执行 `confirmed` 方案。
 4. **不允许执行层猜测**：Seeker 不再通过向量检索重新选表选字段，方案缺失或物理 Schema 不一致时直接失败。
 5. **检索证据不直接决定路由**：高相似候选数量保留为日志和调优指标，但不再作为把 `full` 强制降为 `partial` 的硬门禁；业务完整度由对话语义、元数据映射、QueryPlan 校验和用户确认共同决定。
-6. **当前实现仍为单表**：QueryPlan 已预留 `tables`，但 `lock_query_plan()`、Resolver 和 SQL 一致性校验仍按单表工作。
+6. **多表覆盖分析已实现**：`TableCoverageAnalyzer` + `JoinPlanner` 已集成到 `retrieve_schema_node`，BFS安全Join路径规划从 `semantic_metadata.json` 驱动，找不到关系时安全拒绝。多表 Schema 解析（加载多表结构）将在第10课实现。
 7. **下一阶段功能优先**：在保留 confirmed_plan 业务契约的基础上新增 ExecutionPlan、关系元数据和确定性 Join Planner，再扩展分析性查询。
 
 ## 三、模块职责
@@ -461,6 +461,7 @@ agentTest/
 
 - [State 与记忆系统架构](./State与记忆系统架构.md)
 - [元数据与向量检索架构](./元数据与向量检索架构.md)
+
 
 
 
