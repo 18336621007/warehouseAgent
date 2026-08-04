@@ -13,6 +13,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 from agentTest.langgraph_app.state.agent_state import AgentState
+from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
 from agentTest.langgraph_app.prompts.sql_audit_prompt import SQL_AUDIT_SYSTEM_PROMPT, SQL_AUDIT_HUMAN_TEMPLATE
 
 MAX_CONSISTENCY_RETRIES = 2  # 方案一致性校验最多重试次数
@@ -39,6 +40,23 @@ DATE_FORMAT_HIVE_EXPR = {
     "yyyyMMdd": "regexp_replace(date_sub(current_date(), 1), '-', '')",
     "yyyy-MM-dd": "date_sub(current_date(), 1)",
 }
+
+
+def _normalize_join_keys(keys) -> list[str]:
+    """统一单字段和复合字段Join键格式。"""
+    if isinstance(keys, str):
+        return [keys]
+    return [key for key in (keys or []) if isinstance(key, str) and key]
+
+
+def _invert_join_type(join_type: str) -> str:
+    """Join边反向使用时同步反转左右连接类型。"""
+    normalized = (join_type or "LEFT").upper()
+    if normalized == "LEFT":
+        return "RIGHT"
+    if normalized == "RIGHT":
+        return "LEFT"
+    return normalized
 
 
 def _build_fallback_sql(confirmed_plan: dict) -> str:
@@ -90,40 +108,79 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
 
     # 逐表 WHERE：根据 table_plans 为每张表生成时间过滤条件
     table_plans = confirmed_plan.get("table_plans") or []
-    where_parts = []
+    table_conditions: dict[str, list[str]] = {}
     if table_plans:
-        # 按 table_plans 逐表生成 WHERE
+        # 按 table_plans 逐表生成过滤条件，右表条件稍后放入JOIN ON以保留外连接语义。
         for tp in table_plans:
             tp_table = tp.get("table", "")
             tp_alias = _get_alias(tp_table)
             tp_time = tp.get("time_field", "pt_dt")
             tp_filters = tp.get("filters", "")
-            # 为每张表的时间字段加别名
             tp_date_expr = DATE_FORMAT_HIVE_EXPR.get("yyyyMMdd", "date_sub(current_date(), 1)")
-            where_parts.append(f"{tp_alias}.{tp_time} = {tp_date_expr}")
+            table_conditions.setdefault(tp_table, []).append(
+                f"{tp_alias}.{tp_time} = {tp_date_expr}"
+            )
             if tp_filters and tp_filters.strip():
-                where_parts.append(f"{tp_alias}.{tp_filters.strip()}")
+                table_conditions.setdefault(tp_table, []).append(
+                    f"{tp_alias}.{tp_filters.strip()}"
+                )
     else:
         # 兼容旧格式：只用全局 time_field
         qualified_time = f"{left_alias}.{time_field}" if joins else time_field
-        where_parts = [f"{qualified_time} = {date_expr}"]
+        table_conditions[table] = [f"{qualified_time} = {date_expr}"]
         if filters and filters.strip():
-            where_parts.append(filters.strip())
-    for edge in joins:
-        right_table = edge["right_table"]
-        right_alias = _get_alias(right_table)
-        left_key = edge["left_key"]
-        right_key = edge["right_key"]
-        join_type = edge.get("join_type", "LEFT")
-        from_clause += (
-            f"\n{join_type} JOIN {right_table} {right_alias} "
-            f"ON {left_alias}.{left_key} = {right_alias}.{right_key}"
-        )
+            table_conditions[table].append(filters.strip())
 
+    where_parts = list(table_conditions.pop(table, []))
+    joined_tables = {table}
+    pending_edges = list(joins)
+    while pending_edges:
+        edge_added = False
+        for edge in list(pending_edges):
+            edge_left_table = edge["left_table"]
+            edge_right_table = edge["right_table"]
+            left_keys = _normalize_join_keys(edge["left_key"])
+            right_keys = _normalize_join_keys(edge["right_key"])
+            if len(left_keys) != len(right_keys) or not left_keys:
+                return ""
+
+            if edge_left_table in joined_tables and edge_right_table not in joined_tables:
+                source_table = edge_left_table
+                target_table = edge_right_table
+                source_keys = left_keys
+                target_keys = right_keys
+                join_type = edge.get("join_type", "LEFT")
+            elif edge_right_table in joined_tables and edge_left_table not in joined_tables:
+                source_table = edge_right_table
+                target_table = edge_left_table
+                source_keys = right_keys
+                target_keys = left_keys
+                join_type = _invert_join_type(edge.get("join_type", "LEFT"))
+            else:
+                continue
+
+            source_alias = _get_alias(source_table)
+            target_alias = _get_alias(target_table)
+            on_parts = [
+                f"{source_alias}.{source_key} = {target_alias}.{target_key}"
+                for source_key, target_key in zip(source_keys, target_keys)
+            ]
+            # 被连接表的分区和过滤条件放入ON，避免LEFT JOIN被WHERE条件退化为INNER JOIN。
+            on_parts.extend(table_conditions.pop(target_table, []))
+            from_clause += (
+                f"\n{join_type} JOIN {target_table} {target_alias} "
+                f"ON {' AND '.join(on_parts)}"
+            )
+            joined_tables.add(target_table)
+            pending_edges.remove(edge)
+            edge_added = True
+
+        if not edge_added:
+            return ""
     sql_lines = [
         f"SELECT {', '.join(select_parts)}",
         from_clause,
-        f"WHERE {' AND '.join(where_parts)}",
+        f"WHERE {' AND '.join(where_parts) if where_parts else '1 = 1'}",
     ]
     if dimensions:
         group_parts = [_qualify(d) for d in dimensions]
@@ -140,6 +197,38 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     result_limit = confirmed_plan.get("result_limit", 1000)
     sql_lines.append(f"LIMIT {result_limit}")
     return "\n".join(sql_lines)
+
+
+def _repair_missing_table_filters(sql: str, confirmed_plan: dict) -> tuple[str, list[str]]:
+    """简单查询缺少逐表过滤时，使用已确认方案确定性重建安全SQL。"""
+    tables = confirmed_plan.get("tables") or []
+    table_plans = confirmed_plan.get("table_plans") or []
+    filter_issues = validate_table_plan_filters(sql, tables, table_plans)
+    if not filter_issues or confirmed_plan.get("complex", False):
+        return sql, filter_issues
+
+    # 当前确定性构造器只支持“昨天”，其他时间范围继续交给现有LLM重试链。
+    unsupported_ranges = [
+        table_plan.get("time_range", "")
+        for table_plan in table_plans
+        if table_plan.get("time_range") and "昨天" not in table_plan.get("time_range", "")
+    ]
+    if unsupported_ranges:
+        return sql, filter_issues
+
+    fallback_sql = _build_fallback_sql(confirmed_plan)
+    if not fallback_sql:
+        return sql, filter_issues
+
+    repaired_issues = validate_table_plan_filters(
+        fallback_sql,
+        tables,
+        table_plans,
+    )
+    if repaired_issues:
+        return sql, filter_issues
+    return fallback_sql, filter_issues
+
 
 def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     issues = []
@@ -163,7 +252,13 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
 
     # 2. 度量字段校验
     for m in measures:
-        agg_pattern = r"(SUM|COUNT|AVG|MAX|MIN)\s*\(\s*" + re.escape(m) + r"\s*\)"
+        # 多表SQL允许使用表别名前缀，例如SUM(a.new_order)。
+        agg_pattern = (
+            r"(SUM|COUNT|AVG|MAX|MIN)\s*\(\s*"
+            r"(?:[A-Za-z_][A-Za-z0-9_]*\.)?"
+            + re.escape(m)
+            + r"\s*\)"
+        )
         if not re.search(agg_pattern, sql, re.IGNORECASE):
             issues.append(f"度量字段 {m} 未使用聚合函数（需要 SUM/COUNT/AVG/MAX/MIN 包裹）")
 
@@ -192,6 +287,14 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
         if time_field.lower() not in where_part.lower():
             issues.append(f"时间分区字段 {time_field} 不在 WHERE 条件中")
 
+    # 5. 多表逐表过滤校验：每张表都必须实际使用自身table_plan中的过滤字段。
+    table_filter_issues = validate_table_plan_filters(
+        sql,
+        tables or [table],
+        confirmed_plan.get("table_plans") or [],
+    )
+    issues.extend(table_filter_issues)
+
     # 5. 日期值校验：time_range说"昨天"但SQL没用date_sub → 报错
     if time_range:
         sql_lower = sql.lower()
@@ -218,11 +321,21 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
     time_field = confirmed_plan.get("time_field", "pt_dt")
     filters = confirmed_plan.get("filters", "")
     joins = confirmed_plan.get("joins") or []  # 多表Join边
+    table_plans = confirmed_plan.get("table_plans") or []
 
     # ── 先做程序化校验 ──
     programmatic_issues = _validate_sql_against_plan(sql, confirmed_plan)
     if programmatic_issues:
         return "; ".join(programmatic_issues)
+
+    # ── 构造逐表过滤描述 ──
+    table_plans_desc = "\n".join(
+        f"  {table_plan.get('table', '')}: "
+        f"time_field={table_plan.get('time_field', '')}, "
+        f"time_range={table_plan.get('time_range', '')}, "
+        f"filters={table_plan.get('filters', '') or '无'}"
+        for table_plan in table_plans
+    )
 
     # ── 构造Join描述 ──
     joins_desc = ""
@@ -246,6 +359,7 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
         "measures": ", ".join(measures) if measures else "无（仅查询维度信息）",
         "dimensions": ", ".join(dimensions) if dimensions else "无",
         "time_field": time_field,
+        "table_plans": table_plans_desc or "无",
         "filters": filters or "无",
         "joins": joins_desc or "无（单表查询）",
         "advisor_answer": advisor_last_answer[:1200],
@@ -292,7 +406,7 @@ def build_generate_sql_node(runtime):
             if dimensions:
                 parts.append(f"- 维度字段（必须在 SELECT 和 GROUP BY 中）: {', '.join(dimensions)}")
             time_range_cs = confirmed_plan.get("time_range", "") or "昨天"
-            parts.append(f"- 时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
+            parts.append(f"- 主表时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
             if filters:
                 parts.append(f"- 额外过滤条件（必须在 WHERE 中）: {filters}")
             # 多表时追加字段来源和JOIN约束以及别名规则
@@ -331,7 +445,7 @@ def build_generate_sql_node(runtime):
                 tp_lines = []
                 for tp in table_plans:
                     tp_lines.append(f"  {tp.get('table','')}: time={tp.get('time_field','pt_dt')}({tp.get('time_range','')}), filters={tp.get('filters','') or '无'}")
-                parts.append("- 逐表时间过滤（每张表都必须加对应 WHERE）:\n" + "\n".join(tp_lines))
+                parts.append("- 逐表时间过滤（主表放WHERE，被连接表放对应JOIN ON；每张表都必须过滤）:\n" + "\n".join(tp_lines))
             # 排序规则
             order_by = confirmed_plan.get("order_by") or []
             if order_by:
@@ -412,6 +526,18 @@ def build_generate_sql_node(runtime):
             prompt_value = prompt.invoke(prompt_input)
             generated_sql = llm.invoke(prompt_value)
             generated_sql = clear_sql(generated_sql)
+
+            # 简单查询缺少某张表过滤时优先确定性修复，避免带膨胀风险的SQL进入执行链。
+            repaired_sql, missing_filter_issues = _repair_missing_table_filters(
+                generated_sql,
+                confirmed_plan,
+            )
+            if repaired_sql != generated_sql:
+                log_node_event(
+                    "generate_sql",
+                    "逐表过滤自动修复: " + "; ".join(missing_filter_issues),
+                )
+                generated_sql = repaired_sql
 
             # ── 方案一致性校验 ──
             consistency_retry = 0

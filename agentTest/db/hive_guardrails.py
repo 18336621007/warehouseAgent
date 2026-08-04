@@ -17,6 +17,12 @@ PARTITION_FIELDS = [
     "pt_dt",
 ]
 
+# 所有参与查询的表都必须包含的过滤字段，例如pt_dt分区过滤。
+# 空列表表示不启用全局逐表强制过滤。
+REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES = [
+    "pt_dt",
+]
+
 
 # 是否允许 join
 ALLOW_JOIN = True

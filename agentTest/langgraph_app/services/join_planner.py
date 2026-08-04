@@ -107,14 +107,27 @@ class JoinPlanner:
 
     def _normalize_edge(self, rel: dict) -> dict:
         """Normalize relation edge"""
+        left_keys = self._normalize_keys(rel["left_key"])
+        right_keys = self._normalize_keys(rel["right_key"])
+        if len(left_keys) != len(right_keys):
+            raise ValueError(f"Join关系 {rel.get('id', '?')} 左右键数量不一致")
+
         return {
             "left_table": rel["left_table"],
             "right_table": rel["right_table"],
-            "left_key": rel["left_key"],
-            "right_key": rel["right_key"],
+            "left_key": left_keys,
+            "right_key": right_keys,
             "join_type": rel.get("join_type", "LEFT"),
             "cardinality": rel.get("cardinality", ""),
+            "version": rel.get("version", ""),
         }
+
+    @staticmethod
+    def _normalize_keys(keys) -> list[str]:
+        """统一单字段和复合字段Join键格式。"""
+        if isinstance(keys, str):
+            return [keys]
+        return [key for key in (keys or []) if isinstance(key, str) and key]
 
     def _resolve_grain(self, tables: list[str]) -> list[str]:
         """Merge grain dimensions across tables"""

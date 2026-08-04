@@ -9,6 +9,14 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 import re
 from agentTest.validate.sql_validate import validate_hive_sql
 from agentTest.langgraph_app.services.sql_safety_validator import validate_sql_safety_simple
+from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
+
+
+def _normalize_join_keys(keys) -> list[str]:
+    """统一单字段和复合字段Join键格式。"""
+    if isinstance(keys, str):
+        return [keys]
+    return [key for key in (keys or []) if isinstance(key, str) and key]
 
 
 def _validate_multi_table(sql: str, confirmed_plan: dict) -> list[str]:
@@ -44,22 +52,34 @@ def _validate_multi_table(sql: str, confirmed_plan: dict) -> list[str]:
         if 'JOIN' not in sql_upper:
             issues.append("方案要求多表 JOIN 但 SQL 中未包含 JOIN 关键字")
         else:
+            # 提取每个完整ON片段，复合键中的AND不能作为片段结束标记。
+            on_clauses = re.findall(
+                r'\bON\s+(.+?)(?=\b(?:LEFT|RIGHT|INNER|FULL|CROSS)?\s*JOIN\b|\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bHAVING\b|$)',
+                sql_upper,
+                re.DOTALL,
+            )
             for edge in joins:
-                left_key = edge["left_key"].lower()
-                right_key = edge["right_key"].lower()
-                on_match = re.search(
-                    r'ON\s+(.+?)(?:WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|$|\bAND\b)',
-                    sql_upper + ' AND', re.DOTALL
+                left_keys = _normalize_join_keys(edge["left_key"])
+                right_keys = _normalize_join_keys(edge["right_key"])
+                if len(left_keys) != len(right_keys) or not left_keys:
+                    issues.append("JOIN关系配置中的左右键数量不一致")
+                    continue
+
+                matched = any(
+                    all(
+                        left_key.upper() in on_clause and right_key.upper() in on_clause
+                        for left_key, right_key in zip(left_keys, right_keys)
+                    )
+                    for on_clause in on_clauses
                 )
-                if on_match:
-                    on_clause = on_match.group(1).lower()
-                    if left_key not in on_clause or right_key not in on_clause:
-                        issues.append(
-                            f"JOIN 键不匹配：方案要求 {left_key}={right_key}，"
-                            f"但 SQL ON 条件中未找到"
-                        )
-                else:
-                    issues.append("SQL 中未找到 JOIN ON 条件")
+                if not matched:
+                    expected = " AND ".join(
+                        f"{left_key}={right_key}"
+                        for left_key, right_key in zip(left_keys, right_keys)
+                    )
+                    issues.append(
+                        f"JOIN 键不匹配：方案要求 {expected}，但 SQL ON 条件中未完整找到"
+                    )
 
     return issues
 
@@ -119,6 +139,19 @@ def validate_sql_node(state: AgentState):
             "sql_error": "; ".join(join_issues),
 
             # Router 将决定重新生成还是结束
+            "topic_status": "validating_sql",
+        }
+
+    # 逐表过滤属于执行前硬门禁，防止历史分区重复参与Join导致数据膨胀。
+    table_filter_issues = validate_table_plan_filters(
+        generated_sql,
+        confirmed_plan.get("tables") or [confirmed_plan.get("table", "")],
+        confirmed_plan.get("table_plans") or [],
+    )
+    if table_filter_issues:
+        return {
+            "sql_valid": False,
+            "sql_error": "; ".join(table_filter_issues),
             "topic_status": "validating_sql",
         }
 

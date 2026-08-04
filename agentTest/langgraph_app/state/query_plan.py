@@ -68,6 +68,7 @@ def validate_query_plan(
     result_limit = plan.get("result_limit", 1000)
     complex_flag = plan.get("complex", False)
     status = plan.get("status", "")
+    table_plans = plan.get("table_plans") or []
 
     # table 由 lock_query_plan 从 tables[0] 推导
     if not table and tables:
@@ -126,6 +127,35 @@ def validate_query_plan(
             "fields 缺少已确认字段: "
             + ", ".join(missing_fields)
         )
+
+    # 每张参与表都必须拥有独立时间过滤计划，业务过滤按表配置且不要求一致。
+    if not isinstance(table_plans, list):
+        errors.append("table_plans 必须是列表")
+    else:
+        plan_by_table = {
+            table_plan.get("table", ""): table_plan
+            for table_plan in table_plans
+            if isinstance(table_plan, dict) and table_plan.get("table")
+        }
+        for table_name in tables:
+            table_plan = plan_by_table.get(table_name)
+            if not table_plan:
+                errors.append(f"表 {table_name} 缺少独立过滤计划 table_plan")
+                continue
+
+            table_time_field = table_plan.get("time_field", "")
+            table_time_range = table_plan.get("time_range", "")
+            table_filters = table_plan.get("filters", "")
+            if not isinstance(table_time_field, str):
+                errors.append(f"表 {table_name} 的 time_field 必须是字符串")
+            if not isinstance(table_time_range, str):
+                errors.append(f"表 {table_name} 的 time_range 必须是字符串")
+            if not isinstance(table_filters, str):
+                errors.append(f"表 {table_name} 的 filters 必须是字符串")
+            if not str(table_time_field).strip():
+                errors.append(f"表 {table_name} 缺少独立时间字段 time_field")
+            elif not str(table_time_range).strip():
+                errors.append(f"表 {table_name} 设置了 time_field 但缺少 time_range")
 
     if status not in ("locked", "confirmed"):
         errors.append("status 必须是 locked 或 confirmed")

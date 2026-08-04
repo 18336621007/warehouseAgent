@@ -68,6 +68,29 @@ def _build_confirmation_message(plan: dict) -> str:
     return "\n".join(lines)
 
 
+def _normalize_clarification_message(message: str) -> str:
+    """未生成locked_plan时统一标记为澄清信息，避免用户误以为可以执行。"""
+    content = (message or "").strip()
+    misleading_phrases = (
+        "已确认查询方案如下",
+        "已确认所需字段和时间维度",
+        "已确认所需字段",
+        "查询方案已确认",
+        "方案已锁定",
+        "请确认是否执行",
+        "回复确认开始查询",
+    )
+
+    for phrase in misleading_phrases:
+        content = content.replace(phrase, "当前已识别的信息如下")
+
+    if not content:
+        return "当前仍有查询口径需要确认，请补充最关键的指标、维度或过滤条件。"
+
+    # 只有真实locked_plan才能请求最终执行确认。
+    return "当前方案尚未锁定，以下内容仅用于继续核对：\n" + content
+
+
 def build_advisor_subgraph(runtime):
     """构建 Advisor ReAct Agent 子图 —— 一问一答，含方案提交合规校验。"""
     llm = ChatOpenAI(
@@ -155,14 +178,10 @@ def build_advisor_subgraph(runtime):
         planner_completeness = planner_entities.get("completeness", "")
         planner_reason = state.get("planner_reason", "")
 
-        # 只有 Planner 判定需求完整时才允许 Advisor 提交方案
-        can_submit_plan = planner_completeness == "full"
-        if can_submit_plan:
-            agent = plan_agent
-            advisor_mode = "plan"
-        else:
-            agent = clarification_agent
-            advisor_mode = "clarify"
+        # Advisor 可以在本轮工具核验后直接锁定方案，避免用户额外发送一次消息触发锁定。
+        can_submit_plan = True
+        agent = plan_agent if can_submit_plan else clarification_agent
+        advisor_mode = "plan" if planner_completeness == "full" else "adaptive"
 
         log_node_event(
             "advisor_agent",
@@ -214,10 +233,11 @@ def build_advisor_subgraph(runtime):
             "【本轮操作模式】",
             (
                 "需求已经完整，可以在核对元数据后提交完整方案。"
-                if can_submit_plan
+                if planner_completeness == "full"
                 else
-                "需求仍存在歧义，本轮只能检索并向用户澄清，"
-                "不得提交或锁定查询方案。"
+                "Planner仅完成初步判断。请先使用工具核验；如果存在多个业务口径，"
+                "只向用户询问一个关键问题；如果用户本轮已解决歧义且字段唯一，"
+                "必须在本轮直接调用submit_query_plan，不要再让用户发送确认来触发锁定。"
             ),
         ])
 
@@ -435,7 +455,7 @@ def build_advisor_subgraph(runtime):
                 "当前分析方案还不完整，我需要继续确认指标、"
                 "维度、时间范围或过滤条件。"
             )
-        elif can_submit_plan:
+        elif planner_completeness == "full":
             # Plan 模式下 Agent 未调用 submit_query_plan，禁止展示 LLM 原文伪装方案已锁定
             log_node_event(
                 "advisor_agent",
@@ -446,8 +466,10 @@ def build_advisor_subgraph(runtime):
                 "您的需求已被记录，请重新发送消息，我会继续处理。"
             )
         else:
-            # 澄清阶段保留 LLM 原文
-            final_answer = last_msg.content if last_msg.content else ""
+            # 澄清阶段统一标识为未锁定，避免用户误以为已经进入最终确认。
+            final_answer = _normalize_clarification_message(
+                last_msg.content if last_msg.content else ""
+            )
 
 
         # 只保存本轮新增的AI和工具消息，不重复返回完整历史

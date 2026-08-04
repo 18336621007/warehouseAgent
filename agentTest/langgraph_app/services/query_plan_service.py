@@ -4,6 +4,7 @@ from datetime import datetime
 
 from agentTest.langgraph_app.state.query_plan import QueryPlan
 from agentTest.langgraph_app.state.query_plan import validate_query_plan
+from agentTest.db.hive_guardrails import REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES
 
 
 def _deduplicate(values: list[str]) -> list[str]:
@@ -68,23 +69,38 @@ def lock_query_plan(proposed_plan: dict) -> QueryPlan:
         plan["complex"] = False
     # table_plans: 自动为所有涉及的表生成独立子方案
     advisors_table_plans = plan.get("table_plans") or []
-    if not advisors_table_plans:
-        # Advisor 未提供时，自动为 tables 中的每张表生成，共享 time_field/time_range/filters
-        all_tables = plan.get("tables", [])
-        shared_time = plan.get("time_field", "pt_dt")
-        shared_range = plan.get("time_range", "昨天")
-        shared_filters = plan.get("filters", "")
-        plan["table_plans"] = [
-            {
-                "table": t,
-                "time_field": shared_time,
-                "time_range": shared_range,
-                "filters": shared_filters
-            }
-            for t in all_tables
-        ]
-    else:
-        plan["table_plans"] = advisors_table_plans
+    all_tables = plan.get("tables", [])
+    default_filter_field = (
+        REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES[0]
+        if REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES
+        else "pt_dt"
+    )
+    shared_time = plan.get("time_field") or default_filter_field
+    shared_range = plan.get("time_range", "昨天")
+    shared_filters = plan.get("filters", "")
+    primary_table = plan.get("table", "")
+    advisor_plan_map = {
+        table_plan.get("table", ""): table_plan
+        for table_plan in advisors_table_plans
+        if isinstance(table_plan, dict) and table_plan.get("table")
+    }
+
+    # 即使Advisor只提交部分table_plan，也必须为每张参与表补齐独立时间过滤计划。
+    normalized_table_plans = []
+    for table_name in all_tables:
+        source_plan = advisor_plan_map.get(table_name) or {}
+        source_filters = source_plan.get("filters", "")
+        # 全局filters只兼容主表；其他表必须使用各自table_plan中的业务过滤。
+        table_filters = source_filters or (
+            shared_filters if table_name == primary_table else ""
+        )
+        normalized_table_plans.append({
+            "table": table_name,
+            "time_field": source_plan.get("time_field") or shared_time,
+            "time_range": source_plan.get("time_range") or shared_range,
+            "filters": table_filters,
+        })
+    plan["table_plans"] = normalized_table_plans
     plan["status"] = "locked"
     plan["locked_at"] = datetime.now().isoformat()
     plan.pop("confirmed_at", None)

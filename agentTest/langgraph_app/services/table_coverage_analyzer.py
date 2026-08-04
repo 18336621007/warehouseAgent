@@ -23,11 +23,21 @@ class TableCoverageAnalyzer:
         """分析 confirmed_plan 中的字段分别属于哪些表"""
         fields = confirmed_plan.get("fields") or []
         primary_table = confirmed_plan.get("table", "")
+        declared_sources = confirmed_plan.get("field_sources") or {}
 
         field_sources: dict[str, str] = {}
         uncovered: list[str] = []
 
         for field_name in fields:
+            declared_table = declared_sources.get(field_name, "")
+            if declared_table:
+                # 已锁定的字段来源只能做精确校验，禁止执行阶段静默换表。
+                if self._field_exists_in_table(field_name, declared_table):
+                    field_sources[field_name] = declared_table
+                else:
+                    uncovered.append(field_name)
+                continue
+
             table_found = self._find_field_table(
                 field_name, primary_table=primary_table
             )
@@ -44,6 +54,18 @@ class TableCoverageAnalyzer:
             field_sources=field_sources,
             needed_tables=needed_tables if needed_tables else [primary_table],
             uncovered_fields=uncovered,
+        )
+
+    def _field_exists_in_table(self, field_name: str, table_name: str) -> bool:
+        """精确校验字段是否属于已锁定的物理表。"""
+        docs = self._column_vector_store.similarity_search(
+            field_name,
+            k=5,
+            filter={"table": table_name},
+        )
+        return any(
+            doc.metadata.get("column", "") == field_name
+            for doc in docs
         )
 
     def _find_field_table(self, field_name: str, primary_table: str = "") -> str:
