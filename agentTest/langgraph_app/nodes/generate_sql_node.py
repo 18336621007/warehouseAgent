@@ -68,9 +68,17 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
         if not joins:
             return field_name
         source_table = field_sources.get(field_name, table)
-        return f"{_short_name(source_table)}.{field_name}"
+        return f"{_get_alias(source_table)}.{field_name}"
 
-    left_alias = _short_name(table)
+    # 使用简短别名 a, b, c...，维护表名->别名映射
+    _alias_counter = [0]
+    _table_alias_map = {}
+    def _get_alias(table_name: str) -> str:
+        if table_name not in _table_alias_map:
+            _alias_counter[0] += 1
+            _table_alias_map[table_name] = chr(96 + _alias_counter[0])  # a, b, c...
+        return _table_alias_map[table_name]
+    left_alias = _get_alias(table)
 
     select_parts = []
     for dim in dimensions:
@@ -87,7 +95,7 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
         # 按 table_plans 逐表生成 WHERE
         for tp in table_plans:
             tp_table = tp.get("table", "")
-            tp_alias = _short_name(tp_table)
+            tp_alias = _get_alias(tp_table)
             tp_time = tp.get("time_field", "pt_dt")
             tp_filters = tp.get("filters", "")
             # 为每张表的时间字段加别名
@@ -103,7 +111,7 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
             where_parts.append(filters.strip())
     for edge in joins:
         right_table = edge["right_table"]
-        right_alias = _short_name(right_table)
+        right_alias = _get_alias(right_table)
         left_key = edge["left_key"]
         right_key = edge["right_key"]
         join_type = edge.get("join_type", "LEFT")
@@ -385,7 +393,7 @@ def build_generate_sql_node(runtime):
             complex_flag = confirmed_plan.get("complex", False)
             if complex_flag:
                 prompt = ChatPromptTemplate.from_messages([
-                    ("system", "你是面向 Hive 数仓的 SQL 专家。当前为复杂查询模式，可以使用窗口函数(ROW_NUMBER/RANK/DENSE_RANK)、子查询、CTE(WITH)等高级 SQL 特性。请根据已确认的方案信息和 schema 生成正确的 SQL。返回纯 SQL，不含解释和结尾分号。"),
+                    ("system", "你是面向 Hive 数仓的 SQL 专家。当前为复杂查询模式，多表时使用简短别名（a、b、t1、t2）。，可以使用窗口函数(ROW_NUMBER/RANK/DENSE_RANK)、子查询、CTE(WITH)等高级 SQL 特性。请根据已确认的方案信息和 schema 生成正确的 SQL。返回纯 SQL，不含解释和结尾分号。"),
                     ("human", "用户问题：\n{question}\n\n{confirmed_section}\n\n相关 schema：\n{schema_context}\n\n{example_section}")
                 ])
 

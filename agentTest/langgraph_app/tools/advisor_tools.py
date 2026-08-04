@@ -1,4 +1,4 @@
-﻿# Advisor 的分层检索工具与方案提交工具，k 值从 config/advisor.py 读取
+# Advisor 的分层检索工具与方案提交工具，k 值从 config/advisor.py 读取
 from langchain.tools import tool
 from agentTest.config.advisor import SEARCH_DB_K, SEARCH_TABLE_K, SEARCH_COLUMN_K
 from agentTest.langgraph_app.tools.submit_query_plan import submit_query_plan  # 完整方案提交工具

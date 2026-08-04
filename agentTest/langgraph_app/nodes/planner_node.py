@@ -39,6 +39,9 @@ def build_planner_node(runtime):
         model=get_model_name(),
         temperature=0,                   # 判定任务不需要随机性
     )
+    # with_structured_output：告诉 LLM 按 PlannerOutput 的格式返回 JSON
+    structured_llm = chat_openai.with_structured_output(PlannerOutput)
+
     # 组装 Prompt：system 定义角色和规则，human 传入用户问题和检索到的元数据
     prompt = ChatPromptTemplate.from_messages([
         ("system", PLANNER_SYSTEM_PROMPT),
@@ -141,6 +144,23 @@ def build_planner_node(runtime):
                 metadata_lines.append(f"[字段]\n{content}")
             metadata_context = "\n\n".join(metadata_lines)
 
+            # 构建候选池（带分数+注释），供 Advisor 精排使用
+            table_candidates = []
+            for doc, score in table_docs_with_scores:
+                table_candidates.append({
+                    "table": doc.metadata.get("table", ""),
+                    "score": float(round(1 - float(score) / 2, 4)),
+                    "comment": (doc.page_content or "")[:200]
+                })
+            column_candidates = []
+            for doc, score in column_docs_with_scores:
+                column_candidates.append({
+                    "table": doc.metadata.get("table", ""),
+                    "field": doc.metadata.get("field", doc.metadata.get("column", "")),
+                    "score": float(round(1 - float(score) / 2, 4)),
+                    "comment": (doc.page_content or "")[:200]
+                })
+
             # ── 新增：检索历史优质示例，辅助模糊度判定 ──
             example_vs = runtime.get("example_vector_store")
             example_context = ""
@@ -166,24 +186,7 @@ def build_planner_node(runtime):
                 "confirmed_context": confirmed_context,
                 "advisor_last_answer": advisor_last_answer,
             })
-            raw_response = chat_openai.invoke(prompt_value)
-            import json as json_lib
-            import re as re_lib
-            raw_text = raw_response.content if hasattr(raw_response, 'content') else str(raw_response)
-            json_match = re_lib.search(r'\{[\s\S]*\}', raw_text)
-            if json_match:
-                parsed = json_lib.loads(json_match.group())
-            else:
-                parsed = {}
-            planner_output = PlannerOutput(
-                effective_query=parsed.get("effective_query", ""),
-                accept_locked_plan=parsed.get("accept_locked_plan", False),
-                tables=parsed.get("tables", []),
-                fields=parsed.get("fields", []),
-                completeness=parsed.get("completeness", "none"),
-                reason=parsed.get("reason", ""),
-                complex=parsed.get("complex", False),
-            )
+            planner_output = structured_llm.invoke(prompt_value)
 
             effective_query = (
                     planner_output.effective_query.strip()
@@ -309,7 +312,9 @@ def build_planner_node(runtime):
                 "time_field": "pt_dt",
                 "filters": "",
                 "complex": planner_output.complex,
-                "completeness": completeness,
+                                "completeness": completeness,
+                "table_candidates": table_candidates,
+                "column_candidates": column_candidates,
             }
 
             log_node_end(

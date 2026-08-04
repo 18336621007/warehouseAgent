@@ -244,7 +244,24 @@ def build_advisor_subgraph(runtime):
 
 
         # 临时增强本轮用户消息，但不把检索上下文写入Checkpoint
+                # 构建 Planner 候选池摘要，注入消息上下文
+        from langchain_core.messages import SystemMessage
+        table_candidates = planner_entities.get("table_candidates") or []
+        column_candidates = planner_entities.get("column_candidates") or []
+        candidate_lines = []
+        if table_candidates:
+            candidate_lines.append("Planner 检索结果 - 候选表：")
+            for tc in table_candidates:
+                candidate_lines.append(f"  {tc['table']} (相似度={tc['score']}) - {tc['comment'][:100]}")
+        if column_candidates:
+            candidate_lines.append("Planner 检索结果 - 候选字段：")
+            for cc in column_candidates:
+                candidate_lines.append(f"  {cc['table']}.{cc['field']} (相似度={cc['score']}) - {cc['comment'][:100]}")
+        candidate_text = "\n".join(candidate_lines) if candidate_lines else ""
+
         agent_history = list(history)
+        if candidate_text:
+            agent_history.insert(0, SystemMessage(content=candidate_text))
         if agent_history and isinstance(agent_history[-1], HumanMessage):
             current_user_message = agent_history[-1]
             agent_history[-1] = HumanMessage(

@@ -33,7 +33,7 @@ class PlannerOutput(BaseModel):
         "none",
     ] = Field(
         default="none",
-        description="元数据映射完整度"
+        description="completeness: full=unique, partial=ambiguous, none=unmapped"
     )
 
     complex: bool = Field(
@@ -105,7 +105,7 @@ Advisor：
 
 【元数据映射规则】
 completeness：
-- full：目标表和主要字段均唯一确定
+- partial：能确定表但存在候选口径冲突，如用户说新增订单而检索结果里有 new_order, dealership_new_order, really_add_order 等多个候选，必须判 partial
 - partial：部分确定，但存在候选口径冲突
 - none：无法映射现有元数据
 
