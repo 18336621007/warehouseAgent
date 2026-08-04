@@ -1,4 +1,4 @@
-﻿# Advisor 方案提交工具：将完整查询方案提交给程序校验并锁定
+# Advisor 方案提交工具：将完整查询方案提交给程序校验并锁定
 # 支持单表和多表，field_sources 使用 "db.table.field" 完整标识避免同名字段歧义
 from langchain_core.tools import tool
 
@@ -12,6 +12,10 @@ def submit_query_plan(
     time_range: str = "",
     filters: str = "",
     field_sources: list[str] = None,   # ["db.table.field", ...]
+    order_by: list[dict] = None,       # [{"field": "new_order", "direction": "DESC"}]
+    having: str = "",                  # 聚合后过滤条件，如 "SUM(new_order) > 1000"
+    result_limit: int = 1000,          # 返回行数限制
+    complex: bool = False,             # Planner 判定的复杂查询标记（窗口函数/子查询/CTE）
 ) -> str:
     """当当前需求已经能够形成完整、唯一的查询方案时调用。
 

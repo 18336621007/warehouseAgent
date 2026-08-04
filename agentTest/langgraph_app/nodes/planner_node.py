@@ -294,6 +294,7 @@ def build_planner_node(runtime):
                 "dimensions": [],
                 "time_field": "pt_dt",
                 "filters": "",
+                "complex": planner_output.complex,
                 "completeness": completeness,
             }
 

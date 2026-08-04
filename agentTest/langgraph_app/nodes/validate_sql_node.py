@@ -8,6 +8,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_
 from agentTest.langgraph_app.state.agent_state import AgentState
 import re
 from agentTest.validate.sql_validate import validate_hive_sql
+from agentTest.langgraph_app.services.sql_safety_validator import validate_sql_safety_simple
 
 
 def _validate_multi_table(sql: str, confirmed_plan: dict) -> list[str]:
@@ -96,7 +97,20 @@ def validate_sql_node(state: AgentState):
             "topic_status": "validating_sql",
         }
 
-    # 多表安全校验（新增）
+    # 复杂查询 AST 安全校验（Layer 1）
+    confirmed_plan = state.get("confirmed_plan") or {}
+    complex_flag = confirmed_plan.get("complex", False)
+    if complex_flag:
+        safety_result = validate_sql_safety_simple(generated_sql)
+        if not safety_result.passed:
+            log_node_event("validate_sql", f"Complex query safety check failed (Layer {safety_result.layer}): {safety_result.error[:100]}")
+            return {
+                "sql_valid": False,
+                "sql_error": f"[复杂查询安全校验 Layer {safety_result.layer}] {safety_result.error}",
+                "topic_status": "validating_sql",
+            }
+
+    # 多表安全校验（已有）
     confirmed_plan = state.get("confirmed_plan") or {}
     join_issues = _validate_multi_table(generated_sql, confirmed_plan)
     if join_issues:

@@ -366,6 +366,10 @@ def build_advisor_subgraph(runtime):
                 "time_range": args.get("time_range") or "昨天",
                 "filters": args.get("filters") or "",
                 "field_sources": list(args.get("field_sources") or []),
+                "order_by": list(args.get("order_by") or []),
+                "having": args.get("having") or "",
+                "result_limit": args.get("result_limit", 1000),
+                "complex": args.get("complex", False),
             }
 
             try:

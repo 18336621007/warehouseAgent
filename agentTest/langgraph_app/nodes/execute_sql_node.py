@@ -20,6 +20,25 @@ def build_execute_sql_node(runtime):
         # 记录节点开始日志
         log_node_start("execute_sql", sql=str(generated_sql))
 
+        # 复杂查询：执行前做 Hive EXPLAIN + LIMIT 0 试跑
+        confirmed_plan = state.get("confirmed_plan") or {}
+        complex_flag = confirmed_plan.get("complex", False)
+        if complex_flag and generated_sql:
+            try:
+                from agentTest.langgraph_app.services.sql_safety_validator import validate_sql_safety
+                # Try to get hive_datasource from the tool or runtime
+                hive_ds = getattr(sql_query_tool, "_datasource", None)
+                safety = validate_sql_safety(generated_sql, hive_datasource=hive_ds)
+                if not safety.passed:
+                    log_node_error("execute_sql", error=f"Safety check Layer {safety.layer}: {safety.error}", ms=0)
+                    return {
+                        "sql_exec_failed": True,
+                        "sql_exec_error": f"[复杂查询安全校验 Layer {safety.layer}] {safety.error}",
+                        "sql_result": None,
+                    }
+            except Exception as safety_err:
+                log_node_event("execute_sql", f"Safety check skipped: {safety_err}")
+
         try:
             sql_result = sql_query_tool.invoke({
                 "sql": generated_sql
@@ -35,14 +54,21 @@ def build_execute_sql_node(runtime):
 
             return {
                 "sql_result": sql_result,
+                "sql_exec_failed": False,
+                "sql_exec_error": "",
             }
         except Exception as error:
-            # 记录节点异常日志
+            # 记录节点异常日志，不抛异常，交给路由决定重试还是降级
+            error_str = str(error)
             log_node_error(
                 "execute_sql",
-                error=str(error),
+                error=error_str,
                 ms=elapsed_ms(timer),
             )
-            raise
+            return {
+                "sql_exec_failed": True,
+                "sql_exec_error": error_str,
+                "sql_result": None,
+            }
 
     return execute_sql_node

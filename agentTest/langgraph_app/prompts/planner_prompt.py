@@ -1,4 +1,4 @@
-﻿# Planner LLM 结构化输出的 Pydantic 模型 + Prompt 模板
+# Planner LLM 结构化输出的 Pydantic 模型 + Prompt 模板
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -36,13 +36,18 @@ class PlannerOutput(BaseModel):
         description="元数据映射完整度"
     )
 
+    complex: bool = Field(
+        default=False,
+        description="是否为复杂查询：需要窗口函数(ROW_NUMBER/RANK)、子查询、CTE 等超出平铺 GROUP BY 的 SQL 结构"
+    )
+
     reason: str = Field(
         default="",
         description="确认判断和模糊度判断的主要依据"
     )
 
 
-PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责通过分层元数据识别感知查询需求的模糊度。
+PLANNER_SYSTEM_PROMPT = """输出为 JSON 格式。你是 Text2SQL 系统中的 Planner，负责通过分层元数据识别感知查询需求的模糊度。
 
 你需要完成：
 
@@ -120,7 +125,17 @@ fields：
 - 如果当前方案不是 locked，必须返回 false
 
 不确定时采取保守策略，不得让模糊需求进入执行阶段。
-"""
+
+
+## 复杂查询判定 complex
+
+当用户需求明显需要以下任一能力时，设置 complex=true：
+- 窗口函数（如"每个渠道前3名"、"排名"、"分组内排序"）
+- 子查询/嵌套查询（如"离职率最高的部门里新增订单最多的经销商"）
+- CTE/WITH 子句
+- 跨粒度的对比分析
+
+普通聚合+排序不属于复杂查询（用 order_by 字段处理即可）。"""
 
 
 PLANNER_USER_TEMPLATE = """
@@ -142,3 +157,5 @@ PLANNER_USER_TEMPLATE = """
 【历史相似问题】
 {example_context}
 """
+
+

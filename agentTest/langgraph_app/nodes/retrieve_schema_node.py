@@ -64,7 +64,7 @@ def build_retrieve_schema_node(runtime):
                 )
 
                 if not join_result.success:
-                    # 安全拒绝：缺失关系配置
+                    # 安全拒绝：缺少关系配置且不允许 AI 推断
                     error_msg = (
                         "当前查询涉及多张表，但缺少必要的关联关系配置，"
                         "无法安全执行 Join：\n"
@@ -77,6 +77,20 @@ def build_retrieve_schema_node(runtime):
                     log_node_error("retrieve_schema", error=error_msg, ms=elapsed_ms(timer))
                     raise ValueError(error_msg)
 
+                # Join 路径已找到（或允许 AI 推断），更新 confirmed_plan
+                confirmed_plan["joins"] = join_result.join_edges
+                confirmed_plan["field_sources"] = join_result.field_sources
+                confirmed_plan["target_grain"] = join_result.target_grain
+                confirmed_plan["tables"] = coverage.needed_tables
+                confirmed_plan["table"] = coverage.needed_tables[0]
+
+                if join_result.needs_ai_inference:
+                    confirmed_plan["ai_inferred_join"] = True
+                    log_node_event(
+                        "retrieve_schema",
+                        f"AI 推断 Join 模式: edges={len(join_result.join_edges)}, "
+                        f"missing_relations={join_result.missing_relations}",
+                    )
                 # Join 路径已找到，更新 confirmed_plan
                 confirmed_plan["joins"] = join_result.join_edges
                 confirmed_plan["field_sources"] = join_result.field_sources

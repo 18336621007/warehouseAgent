@@ -42,6 +42,7 @@ DATE_FORMAT_HIVE_EXPR = {
 
 
 def _build_fallback_sql(confirmed_plan: dict) -> str:
+    """根据 confirmed_plan 构造标准 SQL，多表时使用 field_sources 为维度字段加表别名"""
     tables = confirmed_plan.get("tables") or []
     table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
     measures = confirmed_plan.get("measures", [])
@@ -49,13 +50,11 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     time_field = confirmed_plan.get("time_field", "pt_dt")
     filters = confirmed_plan.get("filters", "")
     joins = confirmed_plan.get("joins") or []  # 多表Join边
+    field_sources = confirmed_plan.get("field_sources") or {}  # {字段名: db.table}
+    having = confirmed_plan.get("having", "")
 
     if not table or not measures:
         return ""
-
-    select_parts = list(dimensions)
-    for m in measures:
-        select_parts.append(f"SUM({m}) AS {m}")
 
     date_expr = DATE_FORMAT_HIVE_EXPR.get("yyyyMMdd", "date_sub(current_date(), 1)")
 
@@ -64,7 +63,21 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
         """从 database.table 中提取 table 短名"""
         return full_name.split(".")[-1] if "." in full_name else full_name
 
+    # 多表时根据 field_sources 给字段加表别名，field_sources 为空则回退到主表
+    def _qualify(field_name: str) -> str:
+        if not joins:
+            return field_name
+        source_table = field_sources.get(field_name, table)
+        return f"{_short_name(source_table)}.{field_name}"
+
     left_alias = _short_name(table)
+
+    select_parts = []
+    for dim in dimensions:
+        select_parts.append(_qualify(dim))
+    for m in measures:
+        select_parts.append(f"SUM({_qualify(m)}) AS {m}")
+
     from_clause = f"FROM {table} {left_alias}"
 
     # 多表时 time_field 需要加左表别名，避免歧义
@@ -89,12 +102,20 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
         f"WHERE {' AND '.join(where_parts)}",
     ]
     if dimensions:
-        sql_lines.append(f"GROUP BY {', '.join(dimensions)}")
-    sql_lines.append("LIMIT 1000")
+        group_parts = [_qualify(d) for d in dimensions]
+        sql_lines.append(f"GROUP BY {', '.join(group_parts)}")
+    # HAVING 聚合后过滤
+    if having and having.strip():
+        sql_lines.append(f"HAVING {having.strip()}")
+    # ORDER BY
+    order_by = confirmed_plan.get("order_by") or []
+    if order_by:
+        order_items = [f"{item['field']} {item.get('direction', 'ASC')}" for item in order_by]
+        sql_lines.append(f"ORDER BY {', '.join(order_items)}")
+    # LIMIT
+    result_limit = confirmed_plan.get("result_limit", 1000)
+    sql_lines.append(f"LIMIT {result_limit}")
     return "\n".join(sql_lines)
-
-
-
 
 def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     issues = []
@@ -250,13 +271,22 @@ def build_generate_sql_node(runtime):
             parts.append(f"- 时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
             if filters:
                 parts.append(f"- 额外过滤条件（必须在 WHERE 中）: {filters}")
-            # 多表时追加字段来源和JOIN约束
+            # 多表时追加字段来源和JOIN约束以及别名规则
             if len(tables) > 1 and field_sources:
                 field_items = [
                     f"  {f} → {field_sources.get(f, '?')}"
                     for f in confirmed_plan.get("fields", [])
                 ]
                 parts.append("- 字段来源:\n" + "\n".join(field_items))
+                # 追加别名规则，LLM 根据 field_sources 自行推导
+                alias_lines = []
+                seen_aliases = {}
+                for f, src in field_sources.items():
+                    short = src.split(".")[-1] if "." in src else src
+                    seen_aliases[src] = short
+                for src_full, src_short in seen_aliases.items():
+                    alias_lines.append(f"  {src_full} → 别名: {src_short}")
+                parts.append("- 多表别名规则（SELECT 和 GROUP BY 中的每个字段必须加表别名前缀）:\n" + "\n".join(alias_lines))
             if joins:
                 join_items = [
                     f"  {e['left_table']} JOIN {e['right_table']} "
@@ -264,6 +294,30 @@ def build_generate_sql_node(runtime):
                     for e in joins
                 ]
                 parts.append("- 表关联（严格按此JOIN，不得修改）:\n" + "\n".join(join_items))
+
+            # AI 推断 Join 模式：部分表缺少预配置关联关系，LLM 需自行推断 JOIN 条件
+            ai_inferred_join = confirmed_plan.get("ai_inferred_join", False)
+            if ai_inferred_join:
+                parts.append(
+                    "- 注意：部分表之间缺少预配置关联关系，请根据各表字段语义推断合适的 JOIN 键（如 company_id、order_id 等）"
+                )
+            # 排序规则
+            order_by = confirmed_plan.get("order_by") or []
+            if order_by:
+                order_strs = [f"{item['field']} {item.get('direction', 'ASC')}" for item in order_by]
+                parts.append(f"- 排序规则（必须 ORDER BY）: {', '.join(order_strs)}")
+            # 聚合后过滤
+            having = confirmed_plan.get("having", "")
+            if having and having.strip():
+                parts.append(f"- 聚合后过滤（必须 HAVING）: {having}")
+            # 返回行数
+            result_limit = confirmed_plan.get("result_limit", 1000)
+            if result_limit != 1000:
+                parts.append(f"- 返回行数（必须 LIMIT）: {result_limit}")
+            # 复杂查询模式
+            complex_flag = confirmed_plan.get("complex", False)
+            if complex_flag:
+                parts.append("- 复杂查询模式：允许使用窗口函数(ROW_NUMBER/RANK)、子查询、CTE，不受平铺 GROUP BY 约束")
 
             confirmed_section = "【已确认的分析方案 —— 以下规则必须严格遵守】\n" + "\n".join(parts)
 
@@ -304,7 +358,15 @@ def build_generate_sql_node(runtime):
                 "example_section": example_section
             }
 
-            if retry_count > 0:
+            # 复杂查询模式：使用专门的 prompt，允许窗口函数/子查询/CTE
+            complex_flag = confirmed_plan.get("complex", False)
+            if complex_flag:
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", "你是面向 Hive 数仓的 SQL 专家。当前为复杂查询模式，可以使用窗口函数(ROW_NUMBER/RANK/DENSE_RANK)、子查询、CTE(WITH)等高级 SQL 特性。请根据已确认的方案信息和 schema 生成正确的 SQL。返回纯 SQL，不含解释和结尾分号。"),
+                    ("human", "用户问题：\n{question}\n\n{confirmed_section}\n\n相关 schema：\n{schema_context}\n\n{example_section}")
+                ])
+
+            if retry_count > 0 or sql_fix_reason:
                 if confirmed_section:
                     prompt_input["schema_context"] = confirmed_section + "\n\n" + schema_context
 
@@ -337,7 +399,7 @@ def build_generate_sql_node(runtime):
 
                     fix_prompt = ChatPromptTemplate.from_messages([
                         ("system", "你是一个面向 Hive 数仓场景的 SQL 助手。请根据用户问题、schema 信息和方案不一致的原因，重新生成 SQL。返回纯 SQL，不要包含解释，也不要带结尾分号。"),
-                        ("human", "用户问题：\n{question}\n\n已确认的方案信息：\n{confirmed_section}\n\n相关 schema 信息：\n{schema_context}\n\n方案不一致的原因：\n{inconsistency}\n\n上次生成的 SQL：\n{previous_sql}")
+                        ("human", "用户问题：\n{question}\n\n已确认的方案信息：\n{confirmed_section}\n\n相关 schema 信息：\n{schema_context}\n\n方案不一致的原因：\n{inconsistency}\n\n上次生成的 SQL：\n{previous_sql}\n\n提示：多表 JOIN 时所有字段必须加表别名前缀（如 dim_company_snapshot_day.company_name），参考字段来源表确认每个字段属于哪张表。")
                     ])
                     fix_input = {
                         "question": question,

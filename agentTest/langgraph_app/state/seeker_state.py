@@ -1,4 +1,4 @@
-# ── state/seeker.py ──
+﻿# ── state/seeker.py ──
 # Seeker 子图字段 + Evaluator 字段（同属一条执行链路）
 from typing import List, Any, TypedDict
 from agentTest.langgraph_app.state.base_state import BaseState
@@ -26,6 +26,11 @@ class SeekerState(BaseState, total=False):
     sql_fix_reason: str
     # Seeker 只接受 status=confirmed 的完整查询方案
     confirmed_plan: QueryPlan         # 只读，SQL 一致性校验用
+
+    # SQL 执行重试相关字段
+    sql_exec_failed: bool         # SQL 执行是否失败
+    sql_exec_error: str           # Hive 返回的错误信息
+    exec_retry_count: int         # SQL 执行重试次数
 
 
     # Evaluator 评估字段，advisor_turns从TopicState继承并由Graph自动累积

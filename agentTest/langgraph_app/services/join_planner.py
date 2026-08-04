@@ -1,22 +1,23 @@
-# Join 路径规划器：从 semantic_metadata.json 中查找安全 Join 路径
-# 不降级到 LLM 推测，只在已配置关系中查找，找不到时安全拒绝
+# Join path planner: finds safe Join paths from semantic_metadata.json
+# Supports ALLOW_AI_INFERRED_JOIN switch: allows AI-inferred joins when relations not configured
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 
 
 @dataclass
 class JoinPlanResult:
-    """Join 路径规划结果"""
-    success: bool                                           # 是否成功找到路径
-    join_edges: list[dict] = field(default_factory=list)    # Join 边列表
-    field_sources: dict = field(default_factory=dict)       # 同 CoverageResult
-    target_grain: list[str] = field(default_factory=list)   # 查询粒度维度
-    missing_relations: list[str] = field(default_factory=list)  # 缺失的关系描述
+    """Join plan result"""
+    success: bool                                           # Whether path found successfully
+    join_edges: list[dict] = field(default_factory=list)    # Join edge list
+    field_sources: dict = field(default_factory=dict)       # Same as CoverageResult
+    target_grain: list[str] = field(default_factory=list)   # Query grain dimensions
+    missing_relations: list[str] = field(default_factory=list)  # Missing relation descriptions
+    needs_ai_inference: bool = False                        # Whether AI needs to infer Join conditions
 
 
 class JoinPlanner:
-    """安全 Join 规划器，仅使用 semantic_metadata.json 中 enabled=true 的关系"""
+    """Join planner using semantic_metadata.json enabled=true relations, supports AI inference fallback"""
 
     def __init__(self, semantic_provider: SemanticMetadataProvider):
         self._provider = semantic_provider
@@ -26,9 +27,9 @@ class JoinPlanner:
         needed_tables: list[str],
         field_sources: dict,
     ) -> JoinPlanResult:
-        """为多表查询规划 Join 路径"""
+        """Plan Join paths for multi-table queries"""
         if len(needed_tables) <= 1:
-            # 单表，不需要 Join
+            # Single table, no Join needed
             return JoinPlanResult(
                 success=True,
                 join_edges=[],
@@ -36,20 +37,33 @@ class JoinPlanner:
                 target_grain=self._resolve_grain(needed_tables),
             )
 
-        # BFS 找最小生成树，连接所有 needed_tables
+        # BFS to find minimum spanning tree connecting all needed_tables
         join_edges, unreachable = self._find_join_spanning_tree(needed_tables)
 
         if unreachable:
+            from agentTest.db.hive_guardrails import ALLOW_AI_INFERRED_JOIN
             missing = []
             for table in unreachable:
+                others = set(needed_tables) - {table}
                 missing.append(
-                    f"表 {table} 与其他表（{', '.join(set(needed_tables) - {table})}）之间未配置关联关系"
+                    f"Table {table} has no configured relation with ({', '.join(others)})"
                 )
-            return JoinPlanResult(
-                success=False,
-                field_sources=field_sources,
-                missing_relations=missing,
-            )
+            if ALLOW_AI_INFERRED_JOIN:
+                # Allow AI inference: return success but mark as needing inference
+                return JoinPlanResult(
+                    success=True,
+                    join_edges=join_edges,
+                    field_sources=field_sources,
+                    target_grain=self._resolve_grain(needed_tables),
+                    missing_relations=missing,
+                    needs_ai_inference=True,
+                )
+            else:
+                return JoinPlanResult(
+                    success=False,
+                    field_sources=field_sources,
+                    missing_relations=missing,
+                )
 
         return JoinPlanResult(
             success=True,
@@ -59,11 +73,11 @@ class JoinPlanner:
         )
 
     def _find_join_spanning_tree(self, tables: list[str]) -> tuple[list[dict], list[str]]:
-        """BFS 构建表的最小连接树，返回 (join_edges, unreachable_tables)"""
+        """BFS to build minimum spanning tree, returns (join_edges, unreachable_tables)"""
         if not tables:
             return [], []
 
-        # 构建邻接表
+        # Build adjacency list
         adjacency: dict[str, list[tuple[str, dict]]] = defaultdict(list)
         for table in tables:
             relations = self._provider.get_relations_for_table(table)
@@ -77,7 +91,6 @@ class JoinPlanner:
         # BFS
         visited: set[str] = set()
         edges: list[dict] = []
-        from collections import deque
         queue = deque([tables[0]])
         visited.add(tables[0])
 
@@ -93,7 +106,7 @@ class JoinPlanner:
         return edges, unreachable
 
     def _normalize_edge(self, rel: dict) -> dict:
-        """标准化关系边，左表始终是被访问表"""
+        """Normalize relation edge"""
         return {
             "left_table": rel["left_table"],
             "right_table": rel["right_table"],
@@ -104,7 +117,7 @@ class JoinPlanner:
         }
 
     def _resolve_grain(self, tables: list[str]) -> list[str]:
-        """合并多表的查询粒度"""
+        """Merge grain dimensions across tables"""
         grains = []
         for t in tables:
             grain = self._provider.get_table_grain(t)

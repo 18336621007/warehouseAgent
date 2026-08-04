@@ -21,6 +21,15 @@ class QueryPlan(TypedDict, total=False):
     time_range: str
     filters: str
 
+    # 聚合后过滤（HAVING 子句），可选
+    having: str
+    # 排序规则，可选，如 [{"field": "new_order", "direction": "DESC"}]
+    order_by: list[dict]
+    # 返回行数限制，默认 1000
+    result_limit: int
+    # 是否为复杂查询（需要窗口函数/子查询/CTE），默认 False
+    complex: bool
+
     # ── 系统派生的物理执行字段（单表时为空，多表时由 JoinPlanner 填充）──
     joins: list[dict]           # 多表 Join 边，每边包含 left_table/right_table/left_key/right_key/join_type/cardinality
     field_sources: dict         # {字段名: database.table}，标识每个业务字段的物理来源
@@ -51,6 +60,10 @@ def validate_query_plan(
     time_field = plan.get("time_field", "")
     time_range = plan.get("time_range", "")
     filters = plan.get("filters", "")
+    having = plan.get("having", "")
+    order_by = plan.get("order_by") or []
+    result_limit = plan.get("result_limit", 1000)
+    complex_flag = plan.get("complex", False)
     status = plan.get("status", "")
 
     # table 由 lock_query_plan 从 tables[0] 推导

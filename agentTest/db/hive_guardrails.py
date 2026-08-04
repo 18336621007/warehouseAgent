@@ -8,7 +8,8 @@ ALLOWED_TABLES = [
     "dwd_exchange_order_rent_detail_hour",
     "dwm_exchange_order_addition_detail_hour",
     "ads_exchange_platform_operations_report_day",
-    "dim_company_snapshot_day"
+    "dim_company_snapshot_day",
+    "ads_exchange_order_device_info_day"
 ]
 
 # 允许作为时间/分区过滤条件的字段
@@ -19,6 +20,8 @@ PARTITION_FIELDS = [
 
 # 是否允许 join
 ALLOW_JOIN = True
+# 是否允许 AI 推测 Join（semantic_metadata.json 未配置关联关系时，由 LLM 推断 Join 条件）
+ALLOW_AI_INFERRED_JOIN = True
 # 是否必须Limit
 REQUIRE_LIMIT = True
 #是否允许with

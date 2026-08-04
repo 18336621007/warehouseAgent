@@ -57,6 +57,15 @@ def lock_query_plan(proposed_plan: dict) -> QueryPlan:
         fields.append(time_field)
 
     plan["fields"] = _deduplicate(fields)
+    # optional fields passthrough
+    if "having" not in plan:
+        plan["having"] = ""
+    if "order_by" not in plan:
+        plan["order_by"] = []
+    if "result_limit" not in plan:
+        plan["result_limit"] = 1000
+    if "complex" not in plan:
+        plan["complex"] = False
     plan["status"] = "locked"
     plan["locked_at"] = datetime.now().isoformat()
     plan.pop("confirmed_at", None)
