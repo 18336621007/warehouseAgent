@@ -60,3 +60,7 @@ Advisor 在 `submit_query_plan` 时通过 `_field_sources` 传递每个字段的
 ### 30 秒版本
 
 多表 Join 需要在 QueryPlan 中承载物理执行信息。我考虑过独立拆一个 ExecutionPlan，但单表场景下完全是冗余翻译。最终选择直接在 QueryPlan 上追加四个可选字段，用 total=False 保证不填就不出现。当前单表链路零影响，多表 JoinPlanner 完成后直接写入这些字段即可。
+
+## 六、2026-08-04 当前架构补充
+
+QueryPlan 的多表字段已实际投入执行：`field_sources` 用于锁定字段物理来源，`table_plans` 用于表达每张表独立的时间与业务过滤，`joins` 支持复合键，`target_grain` 保存粒度信息。当前仍计划在分析功能稳定后拆出 ExecutionPlan，避免用户确认的业务方案在执行阶段被直接补充物理字段。

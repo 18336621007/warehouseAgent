@@ -1,6 +1,6 @@
 # 智能数仓助手 — 多智能体 Text2SQL 系统
 
-> 最后更新：2026-07-30  
+> 最后更新：2026-08-04
 > [查看完整文档索引](./文档索引.md)
 
 基于 LangGraph 的多智能体协同框架，将自然语言分析需求自动转换为 Hive SQL 并执行查询。
@@ -202,7 +202,7 @@ Get-Content agentTest/logs/langgraph_app.jsonl -Tail 50 -Wait
 $logs = Get-Content agentTest/logs/langgraph_app.jsonl |
     ForEach-Object { # 智能数仓助手 — 多智能体 Text2SQL 系统
 
-> 最后更新：2026-07-30  
+> 最后更新：2026-08-04
 > [查看完整文档索引](./文档索引.md)
 
 基于 LangGraph 的多智能体协同框架，将自然语言分析需求自动转换为 Hive SQL 并执行查询。
@@ -448,7 +448,7 @@ MySQL 重算综合分 → is_high_quality 变化时 → FAISS 自动增删
 $logs |
     Where-Object { # 智能数仓助手 — 多智能体 Text2SQL 系统
 
-> 最后更新：2026-07-30  
+> 最后更新：2026-08-04
 > [查看完整文档索引](./文档索引.md)
 
 基于 LangGraph 的多智能体协同框架，将自然语言分析需求自动转换为 Hive SQL 并执行查询。
@@ -732,3 +732,42 @@ FAISS（example_faiss_index）→ 后续查询的 RAG Few-shot 示例
   ↓ 用户打分（1-5 星）
 MySQL 重算综合分 → is_high_quality 变化时 → FAISS 自动增删
 ```
+
+## 2026-08-04 当前稳定架构
+
+当前系统已从“单表 Text2SQL 原型”演进为具备多轮澄清、安全多表规划、确定性降级和全链路审计能力的智能数仓助手。
+
+### 当前完整链路
+
+```text
+Web / CLI 请求
+  → capture_user_message
+  → Planner：还原有效需求、识别确认意图、选择 Advisor 或 Seeker
+  → Advisor：元数据检索、消除业务歧义、同轮生成 locked QueryPlan
+  → 用户仅确认一次 locked QueryPlan
+  → Seeker：字段覆盖分析 → JoinPlanner → 精确 Schema → SQL 生成
+  → 逐表过滤自动修复 → SQL 安全校验 → Hive 执行 → 最终答案 → Evaluator
+```
+
+### 本轮架构强化
+
+- **单次确认协议**：未生成 `locked_plan` 时禁止展示最终确认话术；Advisor 在用户解决歧义的同一轮直接调用 `submit_query_plan`。
+- **多表字段来源锁定**：执行阶段优先校验 QueryPlan 中已经锁定的 `field_sources`，禁止静默换表。
+- **复合 Join 键**：关系元数据支持字符串和字段列表，当前运营日报与经销商维表按 `pt_platform + company_id` 关联。
+- **Join 推测开关**：`ALLOW_AI_INFERRED_JOIN=True` 时允许缺少人工关系的场景进入 LLM 推测；关闭时安全拒绝。
+- **全局逐表过滤**：`hive_guardrails.py` 中的 `REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES` 定义所有参与表都必须单独过滤的字段，当前配置为 `pt_dt`。
+- **业务过滤独立**：时间分区要求对所有表生效，但 `filters` 按表独立，可以不同，禁止把主表业务条件复制到维表。
+- **确定性自动修复**：简单查询缺少维表分区过滤时，系统优先根据 confirmed QueryPlan 重建安全 SQL；无法重建才进入 LLM 重试。
+- **执行前硬门禁**：字段对字段条件如 `a.pt_dt = b.pt_dt` 只算 Join 对齐，不算独立日期过滤。
+
+### 当前能力边界
+
+- Checkpointer 仍为进程内 `MemorySaver`，服务重启后不能恢复 Topic。
+- 时间表达式的确定性 SQL 构造目前优先覆盖“昨天”场景，复杂时间范围继续走 LLM 修复链。
+- JoinPlanner 当前连接 QueryPlan 涉及表，尚未自动引入桥表或基于成本选择最优路径。
+- Hive 执行仍是主要耗时来源，需要继续建设超时、异步执行、查询成本控制和结果缓存。
+
+### 求职材料
+
+- [大厂 AI 数据开发岗位简历项目](./求职/大厂AI数据开发岗位简历项目.md)
+- [项目面试问题、困难与参考答案](./求职/项目面试问题与参考答案.md)

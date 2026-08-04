@@ -134,3 +134,7 @@ topic_status in (
 ### 为什么 completed 不由 Evaluator 写？
 
 Evaluator 是结果后的评估与经验沉淀，不属于查询核心成功条件。即使评估服务失败，已经成功执行并生成答案的查询也不应该被改成失败。
+
+## 九、2026-08-04 当前架构补充
+
+Topic 状态机保持不变，但 `clarifying` 期间现在允许 Advisor 写入 `status=locked` 的 QueryPlan。locked 只表示方案已经形成，不表示允许执行；用户下一轮明确接受后 Planner 才写入 confirmed 并把 Topic 切换为 confirmed。这样既保持单次最终确认，又避免把“方案形成”和“用户授权执行”混为一个状态。

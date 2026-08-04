@@ -1,6 +1,6 @@
 # State 与记忆系统架构
 
-> 最后更新：2026-07-31  
+> 最后更新：2026-08-04
 > [返回文档索引](../文档索引.md)
 
 ## 一、设计目标
@@ -544,3 +544,56 @@ sequenceDiagram
 - [多智能体 Text2SQL 系统架构](./多智能体Text2SQL系统架构文档.md)
 - [元数据与向量检索架构](./元数据与向量检索架构.md)
 - [后续课程规划](../课程/后续课程规划.md)
+
+## 十三、2026-08-04 State 契约同步
+
+### 13.1 QueryPlan 当前关键字段
+
+- `status`：`locked` 表示等待用户最终确认，`confirmed` 表示允许进入 Seeker。
+- `tables/table`：完整参与表列表和主表。
+- `measures/dimensions/fields`：业务字段及统一字段集合。
+- `field_sources`：字段到物理表的锁定映射，执行阶段只能校验，不能静默改写。
+- `table_plans`：每张表独立的 `time_field/time_range/filters`。
+- `joins`：Join 边，支持单字段或复合字段列表。
+- `target_grain`：参与表粒度说明，为后续聚合膨胀分析预留。
+
+### 13.2 table_plans 语义
+
+`table_plans` 不是全局过滤条件的复制结果：
+
+```python
+[
+    {
+        "table": "ads_trip.fact_table",
+        "time_field": "pt_dt",
+        "time_range": "昨天",
+        "filters": "platform_type = '换电'",
+    },
+    {
+        "table": "dim_trip.dim_table",
+        "time_field": "pt_dt",
+        "time_range": "昨天",
+        "filters": "",
+    },
+]
+```
+
+时间计划可统一补齐，但业务过滤按表独立。全局必须过滤哪些字段由 Guardrails 配置决定，不由 State 写死。
+
+### 13.3 Topic 与确认状态
+
+推荐观察顺序：
+
+```text
+new → clarifying → confirmed → generating_sql
+→ validating_sql → executing → completed / failed
+```
+
+`clarifying` 期间允许 Advisor 在同轮完成元数据核验并写入 locked QueryPlan，但 Topic 仍不会进入执行。只有下一轮 Planner 识别用户明确接受整份 locked 方案，才将其转换为 confirmed。
+
+### 13.4 当前记忆边界
+
+- `messages` 是 Topic 唯一标准消息历史。
+- `request_id` 用于同轮消息去重和日志关联。
+- `MemorySaver` 仅提供进程内恢复，不等于生产级持久化。
+- 未来持久化时应优先保存 QueryPlan、Topic 状态、关键消息摘要和元数据版本，Schema Context 与大结果集按需重建。

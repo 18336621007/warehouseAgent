@@ -1,6 +1,6 @@
 ﻿# 多智能体 Text2SQL 系统架构文档
 
-> 最后更新：2026-08-03 | 多表 SQL 生成、校验与执行链路已完成（第11课）
+> 最后更新：2026-08-04 | 多表 SQL 生成、校验与执行链路已完成（第11课）
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -462,7 +462,63 @@ agentTest/
 - [State 与记忆系统架构](./State与记忆系统架构.md)
 - [元数据与向量检索架构](./元数据与向量检索架构.md)
 
+## 十六、2026-08-04 架构同步：确认协议与多表安全闭环
 
+### 16.1 Agent 职责边界
 
+- Planner 是唯一父图路由中心，但不再把 `completeness` 当作不可变化的最终结论。
+- Advisor 使用 Adaptive 模式：先依据 Planner 初判检索元数据；若仍有业务歧义，只提一个关键问题；若本轮已经解决歧义，则同轮提交 `locked` QueryPlan。
+- 只有真实存在 `status=locked` 的 QueryPlan 时，系统才向用户请求最终执行确认。
+- Seeker 不理解模糊业务语义，只执行 `status=confirmed` 的方案。
 
+### 16.2 多表执行计划
 
+QueryPlan 当前同时承载业务方案和部分物理执行字段：
+
+```text
+tables / measures / dimensions / time_range
+field_sources / table_plans
+joins / target_grain / metadata_version
+```
+
+执行阶段依次完成：
+
+1. Coverage Analyzer 校验每个字段的锁定来源。
+2. JoinPlanner 根据关系元数据生成 Join 边；配置允许时可标记为 AI 推测 Join。
+3. Schema Resolver 精确加载所有参与表字段。
+4. SQL Generator 依据 Join、字段来源和逐表过滤计划生成 SQL。
+5. 程序化校验、LLM 语义审计和 AST/资源保护共同决定是否执行。
+
+### 16.3 全局逐表过滤规则
+
+`agentTest/db/hive_guardrails.py` 提供：
+
+```python
+REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES = [
+    "pt_dt",
+]
+```
+
+含义是每张参与表都必须出现自己的真实过滤，例如：
+
+```sql
+LEFT JOIN dim_trip.dim_company_snapshot_day b
+  ON a.pt_platform = b.pt_platform
+ AND a.company_id = b.company_id
+ AND b.pt_dt = yesterday_expression
+WHERE a.pt_dt = yesterday_expression
+```
+
+其中 `a.pt_dt = b.pt_dt` 仅表示字段对齐，不能替代两张表各自的日期过滤。业务过滤条件由各自 `table_plan.filters` 管理，可以不同。
+
+### 16.4 自动修复与最终门禁
+
+- 简单 SQL 缺少某张表必选过滤字段时，优先根据 confirmed QueryPlan 确定性重建。
+- 确定性构造不支持的复杂时间或复杂 SQL，进入已有 LLM 修复循环。
+- 如果修复后的 SQL 仍不满足全局过滤、Join 键、白名单或只读规则，执行前校验拒绝并进入重试/降级分支。
+
+### 16.5 当前技术债
+
+- 建议后续将物理字段从 QueryPlan 拆分为独立 ExecutionPlan。
+- 需要为桥表、复合关系优先级、基数成本和聚合膨胀建立更完整的 Join Optimizer。
+- 需要将进程内 Checkpointer 替换为持久化存储，并增加 request_id 幂等控制。
