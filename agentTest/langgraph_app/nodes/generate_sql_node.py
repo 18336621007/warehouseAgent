@@ -80,11 +80,27 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
 
     from_clause = f"FROM {table} {left_alias}"
 
-    # 多表时 time_field 需要加左表别名，避免歧义
-    qualified_time = f"{left_alias}.{time_field}" if joins else time_field
-    where_parts = [f"{qualified_time} = {date_expr}"]
-    if filters and filters.strip():
-        where_parts.append(filters.strip())
+    # 逐表 WHERE：根据 table_plans 为每张表生成时间过滤条件
+    table_plans = confirmed_plan.get("table_plans") or []
+    where_parts = []
+    if table_plans:
+        # 按 table_plans 逐表生成 WHERE
+        for tp in table_plans:
+            tp_table = tp.get("table", "")
+            tp_alias = _short_name(tp_table)
+            tp_time = tp.get("time_field", "pt_dt")
+            tp_filters = tp.get("filters", "")
+            # 为每张表的时间字段加别名
+            tp_date_expr = DATE_FORMAT_HIVE_EXPR.get("yyyyMMdd", "date_sub(current_date(), 1)")
+            where_parts.append(f"{tp_alias}.{tp_time} = {tp_date_expr}")
+            if tp_filters and tp_filters.strip():
+                where_parts.append(f"{tp_alias}.{tp_filters.strip()}")
+    else:
+        # 兼容旧格式：只用全局 time_field
+        qualified_time = f"{left_alias}.{time_field}" if joins else time_field
+        where_parts = [f"{qualified_time} = {date_expr}"]
+        if filters and filters.strip():
+            where_parts.append(filters.strip())
     for edge in joins:
         right_table = edge["right_table"]
         right_alias = _short_name(right_table)
@@ -301,6 +317,13 @@ def build_generate_sql_node(runtime):
                 parts.append(
                     "- 注意：部分表之间缺少预配置关联关系，请根据各表字段语义推断合适的 JOIN 键（如 company_id、order_id 等）"
                 )
+            # 每表的时间过滤规则
+            table_plans = confirmed_plan.get("table_plans") or []
+            if table_plans:
+                tp_lines = []
+                for tp in table_plans:
+                    tp_lines.append(f"  {tp.get('table','')}: time={tp.get('time_field','pt_dt')}({tp.get('time_range','')}), filters={tp.get('filters','') or '无'}")
+                parts.append("- 逐表时间过滤（每张表都必须加对应 WHERE）:\n" + "\n".join(tp_lines))
             # 排序规则
             order_by = confirmed_plan.get("order_by") or []
             if order_by:

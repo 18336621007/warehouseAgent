@@ -4,15 +4,15 @@ import os
 
 from openai import OpenAI
 
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_embedding_model_name
+from agentTest.config.settings import get_embedding_api_key, get_embedding_base_url, get_embedding_model_name
 
 
 class BailianEmbeddings:
     # 简要注释：初始化百炼 embeddings 客户端。
     def __init__(self):
         self.client = OpenAI(
-            api_key=get_openai_api_key(),
-            base_url=get_openai_base_url(),
+            api_key=get_embedding_api_key(),
+            base_url=get_embedding_base_url(),
         )
         self.model = get_embedding_model_name()
 

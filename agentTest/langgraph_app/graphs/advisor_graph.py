@@ -370,21 +370,26 @@ def build_advisor_subgraph(runtime):
                 "having": args.get("having") or "",
                 "result_limit": args.get("result_limit", 1000),
                 "complex": args.get("complex", False),
+                "table_plans": list(args.get("table_plans") or []),
             }
 
             try:
                 # tables、fields、状态和时间戳统一由领域服务生成
                 locked_plan = lock_query_plan(proposed_plan)
 
+                table_plans_str = "|".join(
+                    f"{tp.get('table','')}({tp.get('time_field','')}/{tp.get('time_range','')})"
+                    for tp in (locked_plan.get("table_plans") or [])
+                )
                 log_node_event(
                     "advisor_agent",
                     "locked_plan: "
                     f"table={locked_plan.get('table', '')}, "
                     f"measures={locked_plan.get('measures', [])}, "
                     f"dimensions={locked_plan.get('dimensions', [])}, "
-                    f"time={locked_plan.get('time_field', '')}"
-                    f"({locked_plan.get('time_range', '') or '未指定'}), "
-                    f"filters={locked_plan.get('filters', '') or '无'}",
+                    f"order_by={locked_plan.get('order_by', [])}, "
+                    f"result_limit={locked_plan.get('result_limit', 1000)}, "
+                    f"table_plans=[{table_plans_str}]",
                 )
             except ValueError as error:
                 # 方案不完整时禁止伪装成已锁定

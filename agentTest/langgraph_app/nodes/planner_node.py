@@ -39,9 +39,6 @@ def build_planner_node(runtime):
         model=get_model_name(),
         temperature=0,                   # 判定任务不需要随机性
     )
-    # with_structured_output：告诉 LLM 按 PlannerOutput 的格式返回 JSON
-    structured_llm = chat_openai.with_structured_output(PlannerOutput)
-
     # 组装 Prompt：system 定义角色和规则，human 传入用户问题和检索到的元数据
     prompt = ChatPromptTemplate.from_messages([
         ("system", PLANNER_SYSTEM_PROMPT),
@@ -169,7 +166,24 @@ def build_planner_node(runtime):
                 "confirmed_context": confirmed_context,
                 "advisor_last_answer": advisor_last_answer,
             })
-            planner_output = structured_llm.invoke(prompt_value)
+            raw_response = chat_openai.invoke(prompt_value)
+            import json as json_lib
+            import re as re_lib
+            raw_text = raw_response.content if hasattr(raw_response, 'content') else str(raw_response)
+            json_match = re_lib.search(r'\{[\s\S]*\}', raw_text)
+            if json_match:
+                parsed = json_lib.loads(json_match.group())
+            else:
+                parsed = {}
+            planner_output = PlannerOutput(
+                effective_query=parsed.get("effective_query", ""),
+                accept_locked_plan=parsed.get("accept_locked_plan", False),
+                tables=parsed.get("tables", []),
+                fields=parsed.get("fields", []),
+                completeness=parsed.get("completeness", "none"),
+                reason=parsed.get("reason", ""),
+                complex=parsed.get("complex", False),
+            )
 
             effective_query = (
                     planner_output.effective_query.strip()

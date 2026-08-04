@@ -24,3 +24,11 @@ def get_model_name() -> str:
 # 简要注释：获取向量模型名称。
 def get_embedding_model_name() -> str:
     return os.getenv("EMBEDDING_MODEL", "")
+
+def get_embedding_api_key() -> str:
+    """Embedding 专用 API Key（不填则回退到 OPENAI_API_KEY）"""
+    return os.getenv("EMBEDDING_API_KEY", "") or get_openai_api_key()
+
+def get_embedding_base_url() -> str:
+    """Embedding 专用 Base URL（不填则回退到 OPENAI_BASE_URL）"""
+    return os.getenv("EMBEDDING_BASE_URL", "") or get_openai_base_url()

@@ -29,6 +29,9 @@ class QueryPlan(TypedDict, total=False):
     result_limit: int
     # 是否为复杂查询（需要窗口函数/子查询/CTE），默认 False
     complex: bool
+    # 每表独立子方案，包含表名、时间字段、时间范围、过滤条件
+    # 格式: [{"table": "ads.xxx", "time_field": "pt_dt", "time_range": "昨天", "filters": ""}, ...]
+    table_plans: list[dict]
 
     # ── 系统派生的物理执行字段（单表时为空，多表时由 JoinPlanner 填充）──
     joins: list[dict]           # 多表 Join 边，每边包含 left_table/right_table/left_key/right_key/join_type/cardinality

@@ -66,6 +66,25 @@ def lock_query_plan(proposed_plan: dict) -> QueryPlan:
         plan["result_limit"] = 1000
     if "complex" not in plan:
         plan["complex"] = False
+    # table_plans: 自动为所有涉及的表生成独立子方案
+    advisors_table_plans = plan.get("table_plans") or []
+    if not advisors_table_plans:
+        # Advisor 未提供时，自动为 tables 中的每张表生成，共享 time_field/time_range/filters
+        all_tables = plan.get("tables", [])
+        shared_time = plan.get("time_field", "pt_dt")
+        shared_range = plan.get("time_range", "昨天")
+        shared_filters = plan.get("filters", "")
+        plan["table_plans"] = [
+            {
+                "table": t,
+                "time_field": shared_time,
+                "time_range": shared_range,
+                "filters": shared_filters
+            }
+            for t in all_tables
+        ]
+    else:
+        plan["table_plans"] = advisors_table_plans
     plan["status"] = "locked"
     plan["locked_at"] = datetime.now().isoformat()
     plan.pop("confirmed_at", None)
