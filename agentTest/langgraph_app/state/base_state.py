@@ -4,6 +4,7 @@ from typing import Annotated, Literal, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from agentTest.langgraph_app.state.query_plan import QueryPlan
+from agentTest.langgraph_app.state.analysis_spec import AnalysisSpec
 
 # Topic 状态用于描述一次问数任务的生命周期
 TopicStatus = Literal[
@@ -44,6 +45,9 @@ class TopicState(IdentityState, total=False):
 
     # 当前查询方案，后续会统一重命名为 query_plan
     confirmed_plan: QueryPlan
+
+    # 结构化业务分析意图，跨轮保留指标候选与解析证据，供指标歧义门禁使用
+    analysis_spec: AnalysisSpec
 
 
 

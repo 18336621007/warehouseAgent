@@ -38,6 +38,8 @@ class QueryPlan(TypedDict, total=False):
     field_sources: dict         # {字段名: database.table}，标识每个业务字段的物理来源
     target_grain: list[str]     # 查询粒度维度，用于校验 GROUP BY
     metadata_version: str       # 关系元数据版本，用于审计追溯
+    # 已解决指标概念到物理字段的映射，未解决候选不允许进入 QueryPlan
+    concept_resolutions: dict  # {指标概念: {field, table, source}}
 
     # 方案确认状态和时间
     status: PlanStatus
@@ -159,6 +161,11 @@ def validate_query_plan(
 
     if status not in ("locked", "confirmed"):
         errors.append("status 必须是 locked 或 confirmed")
+
+    # 指标解析证据为可选审计字段，存在时必须是字典
+    concept_resolutions = plan.get("concept_resolutions")
+    if concept_resolutions is not None and not isinstance(concept_resolutions, dict):
+        errors.append("concept_resolutions 必须是字典")
 
     if require_confirmed and status != "confirmed":
         errors.append("查询方案尚未经过用户最终确认")

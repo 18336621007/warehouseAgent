@@ -9,6 +9,50 @@ _table_vector_store = None
 _column_vector_store = None
 
 
+def _extract_aliases_from_content(page_content: str) -> list[str]:
+    """从字段检索文本中解析“别名: xxx、yyy”。"""
+    import re
+    match = re.search(r"别名:\s*(.+)", page_content or "")
+    if not match:
+        return []
+    return [
+        alias.strip()
+        for alias in match.group(1).split("、")
+        if alias.strip()
+    ]
+
+
+def search_column_candidates(question: str, table: str = "", k: int = None) -> list[dict]:
+    """返回结构化字段候选，供指标歧义门禁程序化校验，不直接格式化给 LLM。"""
+    top_k = k or SEARCH_COLUMN_K
+    if table:
+        docs_with_scores = _column_vector_store.similarity_search_with_score(
+            question,
+            k=top_k,
+            filter={"table": table},
+            fetch_k=max(top_k * 5, 50),
+        )
+    else:
+        docs_with_scores = _column_vector_store.similarity_search_with_score(
+            question,
+            k=top_k,
+        )
+
+    candidates = []
+    for doc, distance in docs_with_scores:
+        metadata = doc.metadata or {}
+        page_content = doc.page_content or ""
+        candidates.append({
+            "table": metadata.get("table", ""),
+            "field": metadata.get("column", metadata.get("field", "")),
+            "semantic_type": metadata.get("fields_type", ""),
+            "comment": page_content,
+            "aliases": _extract_aliases_from_content(page_content),
+            "score": float(round(1 - float(distance) / 2, 4)),
+        })
+    return candidates
+
+
 def _format_docs(docs) -> str:
     """把 Document 列表格式化为 LLM 可读文本"""
     if not docs:
@@ -49,20 +93,15 @@ def search_tables(question: str, database: str = "") -> str:
 @tool
 def search_columns(question: str, table: str = "") -> str:
     """搜索与用户问题相关的字段，指定 table 时只检索该表字段。"""
-    if table:
-        docs = _column_vector_store.similarity_search(
-            question,
-            k=SEARCH_COLUMN_K,
-            filter={"table": table},
-            fetch_k=max(SEARCH_COLUMN_K * 5, 50),
-        )
-    else:
-        docs = _column_vector_store.similarity_search(
-            question,
-            k=SEARCH_COLUMN_K,
-        )
+    candidates = search_column_candidates(question, table=table)
+    if not candidates:
+        return "未找到匹配结果。"
 
-    return _format_docs(docs)
+    lines = []
+    for i, candidate in enumerate(candidates, 1):
+        lines.append(f"--- 结果 {i} ---")
+        lines.append(candidate["comment"][:600])
+    return "\n".join(lines)
 
 
 def build_advisor_tools(db_vector_store, table_vector_store, column_vector_store):

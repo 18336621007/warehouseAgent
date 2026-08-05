@@ -11,3 +11,10 @@ MAX_DEMO_ADVISOR_TURNS = 10
 
 # 锁定方案前前必须先调用 search_columns  图级拦截最大重试次数（避免死循环）
 MAX_COLUMN_CHECK_RETRIES = 3
+
+# 指标歧义门禁候选收敛：只展示最相关的少量口径候选
+MAX_AMBIGUITY_CANDIDATES = 6   # 澄清候选数量上限
+MIN_CANDIDATE_SCORE = 0.5      # 候选相似度下限，低于该分视为不相关
+
+# 优秀案例命中字段的排序加权：只影响候选展示顺序，不产生解析证据
+EXAMPLE_FIELD_BOOST = 0.1

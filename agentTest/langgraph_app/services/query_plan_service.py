@@ -20,7 +20,7 @@ def _deduplicate(values: list[str]) -> list[str]:
     return result
 
 
-def lock_query_plan(proposed_plan: dict) -> QueryPlan:
+def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> QueryPlan:
     """将 Advisor 生成的完整方案标准化为 locked 方案。table 从 tables[0] 推导。"""
     plan = deepcopy(proposed_plan)
 
@@ -101,6 +101,10 @@ def lock_query_plan(proposed_plan: dict) -> QueryPlan:
             "filters": table_filters,
         })
     plan["table_plans"] = normalized_table_plans
+
+    # 已解决指标写入可审计解析记录，未解决候选不允许进入锁定方案
+    if concept_resolutions:
+        plan["concept_resolutions"] = concept_resolutions
     plan["status"] = "locked"
     plan["locked_at"] = datetime.now().isoformat()
     plan.pop("confirmed_at", None)

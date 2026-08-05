@@ -341,3 +341,13 @@ def log_state_change(
         previous=previous_value,
         current=current_value,
     )
+
+
+def log_metric_event(event, **kwargs):
+    """指标歧义门禁结构化日志，event 为 metric_ambiguity.detected 等稳定事件名。"""
+    _write_log(
+        logging.INFO,
+        event,
+        node_name="metric_ambiguity",
+        **kwargs,
+    )

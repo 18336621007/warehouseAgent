@@ -41,6 +41,21 @@ class PlannerOutput(BaseModel):
         description="是否为复杂查询：需要窗口函数(ROW_NUMBER/RANK)、子查询、CTE 等超出平铺 GROUP BY 的 SQL 结构"
     )
 
+    metric_mentions: list[str] = Field(
+        default_factory=list,
+        description="用户提到的指标业务概念，如“新增订单”“成交金额”，只写业务概念不写物理字段"
+    )
+
+    dimension_mentions: list[str] = Field(
+        default_factory=list,
+        description="用户提到的维度业务概念，如“经销商名称”“业务经理”"
+    )
+
+    analysis_type: str = Field(
+        default="",
+        description="分析类型: detail/aggregate/trend/ranking/comparison"
+    )
+
     reason: str = Field(
         default="",
         description="确认判断和模糊度判断的主要依据"
@@ -58,6 +73,9 @@ PLANNER_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，不要�
 4. fields：已确定字段
 5. completeness：需求映射完整度
 6. complex：是否复杂查询
+7. metric_mentions：用户提到的指标业务概念
+8. dimension_mentions：用户提到的维度业务概念
+9. analysis_type：分析类型
 
 禁止：
 - 生成SQL
@@ -137,6 +155,12 @@ fields：
 - 跨粒度比较分析
 
 普通聚合、过滤、排序不属于复杂查询。
+
+【metric_mentions规则】
+- 提取用户提到的指标业务概念，如“新增订单”“成交金额”，只写业务概念不写物理字段名。
+- 存在多个候选口径时，指标概念保持不变，物理字段由 Advisor 检索和程序门禁统一解析。
+- 历史案例中的字段不能作为当前用户确认口径的证据，也不得写入 metric_mentions。
+- 无法从自然语言中识别指标时返回空列表。
 """
 
 

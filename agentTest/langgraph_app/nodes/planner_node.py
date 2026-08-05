@@ -339,12 +339,54 @@ def build_planner_node(runtime):
             else:
                 next_topic_status = "clarifying"
 
+            # ── 组装 AnalysisSpec：提取业务概念，不替用户选择物理指标 ──
+            existing_spec = state.get("analysis_spec") or {}
+            existing_resolutions = existing_spec.get("metric_resolutions") or []
+            resolution_by_mention = {
+                item.get("mention", ""): item
+                for item in existing_resolutions
+                if isinstance(item, dict) and item.get("mention")
+            }
+            metric_mentions = list(planner_output.metric_mentions or [])
+            if not metric_mentions:
+                metric_mentions = existing_spec.get("metric_mentions") or []
+
+            new_resolutions = []
+            for mention in metric_mentions:
+                if mention in resolution_by_mention:
+                    # 保留 Advisor 已解析记录，避免用户选择被 Planner 重置
+                    new_resolutions.append(resolution_by_mention[mention])
+                else:
+                    new_resolutions.append({
+                        "mention": mention,
+                        "concept_type": "metric",
+                        "status": "ambiguous",
+                        "selected_field": "",
+                        "selected_table": "",
+                        "resolution_source": "",
+                        "candidates": [],
+                    })
+
+            analysis_spec = {
+                "analysis_type": planner_output.analysis_type,
+                "metric_mentions": metric_mentions,
+                "dimension_mentions": list(planner_output.dimension_mentions or []),
+                "time_range": "",
+                "time_grain": "",
+                "filters": [],
+                "order_by": [],
+                "limit": 0,
+                "comparison": {},
+                "metric_resolutions": new_resolutions,
+            }
+
             return_value = {
                 "route": route,
                 "planner_reason": planner_reason,
                 "original_question": original_question,
                 "planner_entities": new_entities,
                 "topic_status": next_topic_status,
+                "analysis_spec": analysis_spec,
             }
             # 用户最终确认后，写回 status=confirmed 的查询方案
             if updated_plan is not None:

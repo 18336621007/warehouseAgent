@@ -16,6 +16,7 @@ def submit_query_plan(
     having: str = "",                  # 聚合后过滤条件，如 "SUM(new_order) > 1000"
     result_limit: int = 1000,          # 返回行数限制
     complex: bool = False,             # Planner 判定的复杂查询标记（窗口函数/子查询/CTE）
+    concept_resolutions: list[dict] = None,  # 指标解析证据（审计用，程序会交叉验证）
 ) -> str:
     """当当前需求已经能够形成完整、唯一的查询方案时调用。
 
@@ -36,9 +37,11 @@ def submit_query_plan(
     - 必须先对所有目标表调用 search_columns 核对字段
     - 存在多个未确定口径时不能调用
     - 字段跨多表时必须传 field_sources 标注每个字段的物理来源
+    - concept_resolutions 为可审计解析证据，程序会基于真实元数据和用户历史重新校验
     """
     return (
         f"方案已提交: 表={tables}, 度量={measures}, "
         f"维度={dimensions}, 时间={time_field}({time_range or '未指定'}), "
-        f"过滤={filters or '无'}, field_sources={len(field_sources or [])}条"
+        f"过滤={filters or '无'}, field_sources={len(field_sources or [])}条, "
+        f"concept_resolutions={len(concept_resolutions or [])}条"
     )

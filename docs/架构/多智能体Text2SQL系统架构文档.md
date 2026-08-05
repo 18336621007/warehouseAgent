@@ -522,3 +522,82 @@ WHERE a.pt_dt = yesterday_expression
 - 建议后续将物理字段从 QueryPlan 拆分为独立 ExecutionPlan。
 - 需要为桥表、复合关系优先级、基数成本和聚合膨胀建立更完整的 Join Optimizer。
 - 需要将进程内 Checkpointer 替换为持久化存储，并增加 request_id 幂等控制。
+
+---
+
+## 十七、2026-08-05 架构同步：AnalysisSpec 与指标口径歧义门禁
+
+### 17.1 背景
+
+真实日志中，用户询问“昨天新增订单最多的经销商的名称、状态、业务经理”时，Planner 已判定 `partial` 且存在 `new_order`、`really_add_order`、`pure_new_order`、`dealership_new_order` 等多个指标候选，但 Advisor 受高相似历史案例影响直接锁定 `new_order`。仅靠 Prompt 约束无法阻止模型替用户确认业务口径，因此在 `submit_query_plan → lock_query_plan` 之间新增程序级指标歧义门禁。
+
+### 17.2 AnalysisSpec 与解析证据
+
+- `AnalysisSpec`（`state/analysis_spec.py`）从自然语言提取 `analysis_type / metric_mentions / dimension_mentions / time_range / time_grain / filters / order_by / limit / comparison`，作为跨轮 Topic 状态保留。
+- 每个指标概念携带 `ConceptResolution`：`mention / status / selected_field / selected_table / resolution_source / candidates`。
+- 可信解析来源只有三种：`explicit_user`（用户明确选择字段/业务词/选项编号）、`unique_metadata`（元数据唯一候选）、`semantic_default`（正式语义默认口径，第13-14课接入）。
+- 历史案例、最高相似度、ADS 优先规则和 LLM 常识选择均不能独立证明用户已确认口径。
+
+### 17.3 指标歧义门禁
+
+`services/metric_ambiguity_validator.py` 在 Advisor 捕获 `submit_query_plan` 后重算解析证据：
+
+```text
+Agent 调用 submit_query_plan
+  ↓ 校验目标表已 search_columns（保留）
+  ↓ MetricAmbiguityValidator 重算证据
+  resolved=true  → lock_query_plan（同轮锁定，携带 concept_resolutions）
+  resolved=false → 丢弃本轮提交：不生成 locked_plan，
+                  程序生成候选选项（字段名+真实中文说明），只追问一个指标
+```
+
+- 候选必须来自真实元数据（向量库检索 + Planner/Advisor 结构化候选），LLM 不能编造字段。
+- 只对 `measure` 类型字段判指标歧义，维度单独处理。
+- 排序分数只决定候选展示顺序，不产生解析证据。
+- LLM 提交的 `concept_resolutions` 仅作审计输入，最终以程序重算结果为准，防止伪造 `explicit_user`。
+- 唯一候选场景仍允许同轮锁定，不采用“所有 partial 一律禁止提交”的简单方案。
+
+### 17.4 历史案例使用边界
+
+- 指标未解析前，Advisor 只注入历史问题摘要，不注入历史 SQL，避免历史案例锚定业务口径。
+- 指标解析完成后，历史 SQL 才允许在后续表选择或 SQL 生成阶段辅助。
+- 示例库与缓存目录不做任何修改或清理。
+
+### 17.5 关键文件
+
+| 文件 | 职责 |
+|---|---|
+| `agentTest/langgraph_app/state/analysis_spec.py` | AnalysisSpec 与 ConceptResolution 定义 |
+| `agentTest/langgraph_app/services/metric_ambiguity_validator.py` | 指标歧义门禁服务 |
+| `agentTest/langgraph_app/graphs/advisor_graph.py` | 门禁集成、澄清选项与历史案例改造 |
+| `agentTest/langgraph_app/tools/advisor_tools.py` | `search_column_candidates` 结构化候选 |
+| `agentTest/langgraph_app/nodes/planner_node.py` | Planner 组装 AnalysisSpec |
+| `agentTest/langgraph_app/state/query_plan.py` | QueryPlan 增加 `concept_resolutions` |
+
+### 17.6 验收场景
+
+- “新增订单”存在多个合理指标时必须追问，不得调用 `lock_query_plan`。
+- 用户回答“全量新增订单/净增订单/B类新增订单”后，本轮直接锁定对应字段。
+- 用户回复选项编号时，结合上一轮候选恢复完整语义。
+- 唯一指标候选不增加额外确认轮次。
+- 确认消息只展示用户已确认的指标字段，候选不进入最终确认。
+- 字段描述使用原始备注（如 `new_order → 新增订单数`），表描述使用表自带备注。
+
+### 17.7 用户可见消息的确定性收敛
+
+Advisor 给用户展示的内容统一由程序模板生成，LLM 原文不作为最终展示，避免候选混入最终确认：
+
+- **锁定方案指标收敛**：门禁通过后，`proposed_plan["measures"]` 用已解析的 `concept_resolutions` 字段收敛，候选指标不进入 `locked_plan`。
+- **确认消息不带候选**：`_build_confirmation_message` 只展示最终锁定的表、指标、维度、时间；即使锁定方案残留候选字段，展示层也会按 `concept_resolutions` 过滤，不出现编号选项或候选列表。
+- **字段中文含义用原始备注**：`_extract_field_meaning` 优先“原始备注”，无原始备注时才取首个别名，避免把整串别名（如“新增订单量、新订单数、当日新增订单…”）展示给用户。
+- **表中文含义用表自带备注**：确认消息中的表描述读取 `original_comment`，不使用增强后的长备注。
+- **澄清选项简洁**：程序生成候选选项时只展示“一句中文含义（字段名）”，多表候选追加来源表短名，不使用 LLM 原文。
+- **候选排序**：相关性降序，优秀案例命中字段仅加权排序（`EXAMPLE_FIELD_BOOST`），不产生解析证据。
+
+### 17.8 指标歧义门禁配置（`config/advisor.py`）
+
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `MAX_AMBIGUITY_CANDIDATES` | 6 | 澄清候选数量上限 |
+| `MIN_CANDIDATE_SCORE` | 0.5 | 候选相似度下限，低于该分视为不相关 |
+| `EXAMPLE_FIELD_BOOST` | 0.1 | 优秀案例命中字段的排序加权，只影响展示顺序，不产生解析证据 |

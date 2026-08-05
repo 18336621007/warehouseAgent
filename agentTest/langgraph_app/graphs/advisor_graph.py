@@ -1,8 +1,10 @@
-﻿# Advisor 子图：ReAct Agent，内部用工具查元数据，对外说业务语言
+# Advisor 子图：ReAct Agent，内部用工具查元数据，对外说业务语言
 # 一问一答模式，不保留内部状态机。Planner 是唯一的调度中心。
 # 企业级三层防护：Prompt 指引 → 图级拦截(硬保障) → 可观测日志
 # Advisor 提交完整方案后，由领域服务统一生成 status=locked 的标准查询方案
 # 图级校验确保提交方案前已检索目标表字段，禁止根据回复文本自动补充字段
+import json
+
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
@@ -14,6 +16,8 @@ from agentTest.langgraph_app.prompts.advisor_prompt import ADVISOR_SYSTEM_PROMPT
 from agentTest.config.advisor import MAX_COLUMN_CHECK_RETRIES
 from langchain_core.messages import HumanMessage, AIMessage
 from agentTest.langgraph_app.services.query_plan_service import lock_query_plan
+from agentTest.langgraph_app.services.metric_ambiguity_validator import MetricAmbiguityValidator
+from agentTest.langgraph_app.services.metric_ambiguity_validator import ResolutionResult
 
 
 
@@ -41,30 +45,58 @@ def _has_column_search_for_tables(messages, tables: list[str]) -> bool:
     }
     return all(t in searched for t in tables)
 
-def _build_confirmation_message(plan: dict) -> str:
-    """用locked_plan构造标准化确认消息，杜绝LLM编造查询结果"""
+def _build_confirmation_message(plan: dict, semantic_labels: dict = None) -> str:
+    """用locked_plan构造简洁确认消息：指标带中文含义与字段名，维度只列中文含义。"""
     tables = plan.get("tables") or []
     measures = plan.get("measures", [])
     dimensions = plan.get("dimensions", [])
     time_field = plan.get("time_field", "pt_dt")
     time_range = plan.get("time_range", "") or "昨天"
     filters = plan.get("filters", "")
-    field_sources = plan.get("field_sources") or {}
+    labels = semantic_labels or {}
 
-    lines = ["已锁定分析方案：", f"- 数据表：{', '.join(tables)}"]
+    # ???????????????????????????????
+    concept_resolutions = plan.get("concept_resolutions") or {}
+    resolved_metric_fields = [
+        info.get("field", "")
+        for info in concept_resolutions.values()
+        if isinstance(info, dict) and info.get("field")
+    ]
+    if resolved_metric_fields:
+        resolved_set = set(resolved_metric_fields)
+        filtered_measures = [m for m in measures if m in resolved_set]
+        if filtered_measures:
+            measures = list(dict.fromkeys(filtered_measures))
+
+    def _table_name(table: str) -> str:
+        """表中文含义优先，其次表短名。"""
+        meaning = labels.get("tables", {}).get(table, "")
+        if meaning:
+            return meaning
+        return table.split(".")[-1] if "." in table else table
+
+    def _field_label(field: str) -> str:
+        """指标：中文含义（字段名）。"""
+        meaning = labels.get("fields", {}).get(field, "")
+        return f"{meaning}（{field}）" if meaning else field
+
+    def _dim_label(field: str) -> str:
+        """维度：只列中文含义，减少文字量；无含义时回退字段名。"""
+        meaning = labels.get("fields", {}).get(field, "")
+        return meaning or field
+
+    lines = ["查询方案确认："]
+    lines.append(f"- 表：{'、'.join(_table_name(t) for t in tables)}")
     if measures:
-        lines.append(f"- 度量：{', '.join(measures)}")
+        lines.append(f"- 指标：{'、'.join(_field_label(m) for m in measures)}")
     if dimensions:
-        lines.append(f"- 维度：{', '.join(dimensions)}")
-    lines.append(f"- 时间：{time_field} = {time_range}")
+        # 确认方案只展示最终锁定的内容，维度完整列出，不出现候选式省略
+        lines.append(f"- 维度：{'、'.join(_dim_label(d) for d in dimensions)}")
+    lines.append(f"- 时间：{time_range}（{time_field}）")
     if filters:
         lines.append(f"- 过滤：{filters}")
-    if len(tables) > 1 and field_sources:
-        lines.append("- 字段来源：")
-        for f, t in field_sources.items():
-            lines.append(f"  {f} \u2190 {t}")
     lines.append("")
-    lines.append('以上信息确认无误？回复"好"开始查询。')
+    lines.append("回复“好”开始查询。")
     return "\n".join(lines)
 
 
@@ -91,6 +123,103 @@ def _normalize_clarification_message(message: str) -> str:
     return "当前方案尚未锁定，以下内容仅用于继续核对：\n" + content
 
 
+def _extract_field_meaning(page_content: str) -> str:
+    """从字段元数据文本提取中文含义：优先原始备注，其次首个别名，避免展示长别名列表。"""
+    for line in (page_content or "").splitlines():
+        if line.startswith("原始备注:"):
+            return line[len("原始备注:"):].strip()[:60]
+    for line in (page_content or "").splitlines():
+        if line.startswith("别名:"):
+            aliases = line[len("别名:"):].strip()
+            if aliases:
+                return aliases.split("、")[0].strip()[:60]
+    return ""
+
+
+def _extract_table_meaning(page_content: str) -> str:
+    """从表元数据文本提取中文含义：优先核心功能，其次所属领域。"""
+    for line in (page_content or "").splitlines():
+        if line.startswith("核心功能:"):
+            return line[len("核心功能:"):].strip()
+    for line in (page_content or "").splitlines():
+        if line.startswith("所属领域:"):
+            return line[len("所属领域:"):].strip()
+    return ""
+
+
+def _lookup_semantic_labels(runtime, plan: dict) -> dict:
+    """按表名/字段名从真实元数据解析中文含义，供确认消息展示。"""
+    labels = {"tables": {}, "fields": {}}
+    column_vs = runtime.get("column_vector_store") if runtime else None
+
+    # 表描述只使用表自带备注（original_comment），不使用增强后的长备注
+    try:
+        from agentTest.metadata.mysql_store import load_enriched_tables
+        enriched_tables = load_enriched_tables()
+    except Exception:
+        enriched_tables = {}
+
+    for table in plan.get("tables") or []:
+        table_comment = str(
+            enriched_tables.get(table, {}).get("original_comment") or ""
+        )
+        if table_comment:
+            labels["tables"][table] = table_comment
+
+    for field in list(plan.get("measures") or []) + list(plan.get("dimensions") or []):
+        if column_vs is None:
+            continue
+        try:
+            docs = column_vs.similarity_search_with_score(field, k=8)
+            for doc, _ in docs:
+                if str(doc.metadata.get("column") or "").lower() == str(field).lower():
+                    labels["fields"][field] = _extract_field_meaning(doc.page_content or "")
+                    break
+        except Exception:
+            continue
+    return labels
+
+
+def _build_ambiguity_clarification(result) -> str:
+    """程序生成的指标口径澄清选项，不展示 LLM 原文，避免伪装成已锁定方案。"""
+    options = result.clarification_options
+    if not options:
+        return "当前仍有查询口径需要确认，请补充最关键的指标、维度或过滤条件。"
+
+    # 候选跨多张表时，每项标注来源表短名，避免跨表口径混淆
+    multi_table = len({
+        str(option.get("table") or "")
+        for option in options
+    }) > 1
+
+    mention = ""
+    for ambiguity in result.ambiguities or []:
+        mention = ambiguity.get("mention", "")
+        break
+    head = (
+        f"“{mention}”存在多个口径，请选择（回复编号即可）："
+        if mention else "存在多个口径，请选择（回复编号即可）："
+    )
+    lines = [head]
+    for option in options:
+        field = option.get("field", "")
+        meaning = option.get("meaning") or ""
+        table_short = option.get("table_short") or ""
+        if multi_table and table_short:
+            label = (
+                f"{meaning}（{field}，{table_short}）"
+                if meaning else f"{field}（{table_short}）"
+            )
+        elif meaning:
+            label = f"{meaning}（{field}）"
+        else:
+            label = field
+        lines.append(f"{option['index']}. {label}")
+    lines.append("")
+    lines.append("请回复编号或直接说出您要的口径。")
+    return "\n".join(lines)
+
+
 def build_advisor_subgraph(runtime):
     """构建 Advisor ReAct Agent 子图 —— 一问一答，含方案提交合规校验。"""
     llm = ChatOpenAI(
@@ -104,6 +233,11 @@ def build_advisor_subgraph(runtime):
         runtime["db_vector_store"],
         runtime["table_vector_store"],
         runtime["column_vector_store"],
+    )
+
+    # 指标歧义门禁：基于真实元数据候选和用户选择证据，拦截未确认口径的方案提交
+    metric_validator = MetricAmbiguityValidator(
+        column_vector_store=runtime["column_vector_store"],
     )
 
     # 方案模式允许提交完整方案
@@ -155,22 +289,26 @@ def build_advisor_subgraph(runtime):
         advisor_turns = state.get("advisor_turns", 0)
         is_first_advisor_turn = advisor_turns == 0
 
-        # ── 新增：检索历史优质示例，加速澄清 ──
+        # ── 检索历史优质示例：指标未解析前只注入问题摘要，不注入SQL，避免历史案例锚定业务口径 ──
         example_vs = runtime.get("example_vector_store")
         example_context = ""
-        if example_vs and question and is_first_advisor_turn:
+        examples = []
+        current_spec = state.get("analysis_spec") or {}
+        has_unresolved_metric = any(
+            resolution.get("status") != "resolved"
+            for resolution in (current_spec.get("metric_resolutions") or [])
+        )
+        if example_vs and question and (is_first_advisor_turn or has_unresolved_metric):
             examples = example_vs.search_similar(question, k=2)
             if examples:
-                lines_ex = ["【历史相似问题（曾成功解决，仅供参考）】"]
+                lines_ex = ["【历史相似问题（仅供参考，不能代替当前用户确认口径）】"]
                 for i, doc in enumerate(examples, 1):
                     q = doc.metadata.get("question", "")
-                    s = doc.metadata.get("sql", "")[:200]
                     lines_ex.append(f"{i}. 问题：{q}")
-                    lines_ex.append(f"   对应SQL：{s}...")
                 example_context = "\n".join(lines_ex)
                 top_q = examples[0].metadata.get("question","")[:50] if examples else ""
                 sim_val = examples[0].metadata.get("_similarity","?") if examples else "?"
-                log_node_event("advisor_agent", f"优秀示例检索: 命中{len(examples)}条, top_sim={sim_val}, q={top_q}")
+                log_node_event("advisor_agent", f"优秀示例检索: 命中{len(examples)}条, top_sim={sim_val}, q={top_q}（指标未解析，不注入历史SQL）")
 
         # 将 Planner 分析结果和当前旧方案作为结构化上下文提供给 Advisor
         planner_tables = planner_entities.get("tables") or []
@@ -392,8 +530,76 @@ def build_advisor_subgraph(runtime):
             "submit_query_plan",
         )
 
+        # 指标歧义门禁结果，None 表示未启用或未触发
+        resolution_result = None
+        ambiguity_result = None
+        resolved_concept_resolutions = {}
+
         if submit_args_list and not submission_blocked:
             args, _ = submit_args_list[-1]
+
+            # ── 程序级指标歧义门禁：重算解析证据，历史案例与最高相似度不能证明用户口径 ──
+            current_spec = state.get("analysis_spec") or {}
+            metric_mentions = current_spec.get("metric_mentions") or []
+            submitted_resolutions = list(args.get("concept_resolutions") or [])
+
+            if metric_mentions:
+                # 目标表优先收敛候选：本轮提交表 + 已确认方案表，缺失时回退 Planner 候选表
+                metric_target_tables = list(dict.fromkeys(
+                    list(args.get("tables") or [])
+                    + list(current_plan.get("tables") or [])
+                ))
+                if not metric_target_tables:
+                    metric_target_tables = list(
+                        planner_entities.get("tables") or []
+                    )
+                # 优秀案例命中字段仅用于候选排序加权，不产生解析证据
+                metric_example_fields = []
+                for doc in examples:
+                    raw_fields = doc.metadata.get("fields", "[]")
+                    try:
+                        metric_example_fields.extend(json.loads(raw_fields) or [])
+                    except Exception:
+                        continue
+                resolution_result = metric_validator.validate(
+                    metric_mentions=metric_mentions,
+                    current_user_input=current_user_input,
+                    messages=history,
+                    planner_candidates=planner_entities.get("column_candidates") or [],
+                    previous_resolutions=current_spec.get("metric_resolutions") or [],
+                    target_tables=metric_target_tables,
+                    example_fields=metric_example_fields,
+                )
+                if not resolution_result.resolved:
+                    # 多候选且用户未选择：阻止锁定，程序生成候选选项并追问
+                    ambiguity_result = resolution_result
+                    log_node_event(
+                        "advisor_agent",
+                        f"指标歧义门禁拦截: {resolution_result.reason}",
+                    )
+                else:
+                    # 交叉验证 LLM 提交的 concept_resolutions，程序重算结果为准
+                    verified, verify_reason = metric_validator.verify_submitted_resolutions(
+                        submitted_resolutions,
+                        resolution_result,
+                    )
+                    if not verified:
+                        # LLM 伪造解析证据时同样拦截
+                        ambiguity_result = ResolutionResult(
+                            resolved=False,
+                            resolutions=resolution_result.resolutions,
+                            ambiguities=resolution_result.ambiguities,
+                            clarification_options=resolution_result.clarification_options,
+                            reason=verify_reason,
+                        )
+                        log_node_event(
+                            "advisor_agent",
+                            f"指标解析证据校验失败: {verify_reason}",
+                        )
+                    else:
+                        resolved_concept_resolutions = metric_validator.to_plan_resolutions(
+                            resolution_result,
+                        )
 
             proposed_plan = {
                 "tables": list(args.get("tables") or []),
@@ -409,32 +615,56 @@ def build_advisor_subgraph(runtime):
                 "complex": args.get("complex", False),
                 "table_plans": list(args.get("table_plans") or []),
             }
+            if resolved_concept_resolutions:
+                # ???????????????????????????????
+                resolved_fields = [
+                    info.get("field", "")
+                    for info in resolved_concept_resolutions.values()
+                    if isinstance(info, dict) and info.get("field")
+                ]
+                if resolved_fields:
+                    resolved_set = set(resolved_fields)
+                    converged_measures = [
+                        m for m in proposed_plan["measures"]
+                        if m in resolved_set
+                    ]
+                    if converged_measures:
+                        proposed_plan["measures"] = list(
+                            dict.fromkeys(converged_measures)
+                        )
 
-            try:
-                # tables、fields、状态和时间戳统一由领域服务生成
-                locked_plan = lock_query_plan(proposed_plan)
+            if ambiguity_result is not None:
+                # 指标歧义未解决或解析证据不合法时，禁止生成 locked_plan
+                locked_plan = None
+            else:
+                try:
+                    # tables、fields、状态和时间戳统一由领域服务生成
+                    locked_plan = lock_query_plan(
+                        proposed_plan,
+                        concept_resolutions=resolved_concept_resolutions,
+                    )
 
-                table_plans_str = "|".join(
-                    f"{tp.get('table','')}({tp.get('time_field','')}/{tp.get('time_range','')})"
-                    for tp in (locked_plan.get("table_plans") or [])
-                )
-                log_node_event(
-                    "advisor_agent",
-                    "locked_plan: "
-                    f"table={locked_plan.get('table', '')}, "
-                    f"measures={locked_plan.get('measures', [])}, "
-                    f"dimensions={locked_plan.get('dimensions', [])}, "
-                    f"order_by={locked_plan.get('order_by', [])}, "
-                    f"result_limit={locked_plan.get('result_limit', 1000)}, "
-                    f"table_plans=[{table_plans_str}]",
-                )
-            except ValueError as error:
-                # 方案不完整时禁止伪装成已锁定
-                plan_validation_error = str(error)
-                log_node_event(
-                    "advisor_agent",
-                    f"方案锁定失败: {plan_validation_error}",
-                )
+                    table_plans_str = "|".join(
+                        f"{tp.get('table','')}({tp.get('time_field','')}/{tp.get('time_range','')})"
+                        for tp in (locked_plan.get("table_plans") or [])
+                    )
+                    log_node_event(
+                        "advisor_agent",
+                        "locked_plan: "
+                        f"table={locked_plan.get('table', '')}, "
+                        f"measures={locked_plan.get('measures', [])}, "
+                        f"dimensions={locked_plan.get('dimensions', [])}, "
+                        f"order_by={locked_plan.get('order_by', [])}, "
+                        f"result_limit={locked_plan.get('result_limit', 1000)}, "
+                        f"table_plans=[{table_plans_str}]",
+                    )
+                except ValueError as error:
+                    # 方案不完整时禁止伪装成已锁定
+                    plan_validation_error = str(error)
+                    log_node_event(
+                        "advisor_agent",
+                        f"方案锁定失败: {plan_validation_error}",
+                    )
 
         elif submission_blocked:
             plan_validation_error = "提交方案前未完成目标表字段检索"
@@ -447,9 +677,16 @@ def build_advisor_subgraph(runtime):
             ms=elapsed_ms(timer),
         )
 
-        if locked_plan:
+        if ambiguity_result is not None:
+            # 程序生成的指标口径澄清选项，不展示 LLM 原文
+            final_answer = _build_ambiguity_clarification(ambiguity_result)
+        elif locked_plan:
             # 只展示经过程序校验的 locked 方案
-            final_answer = _build_confirmation_message(locked_plan)
+            # 确认消息附带真实元数据的中文含义（字段/表），避免只给名称
+            final_answer = _build_confirmation_message(
+                locked_plan,
+                _lookup_semantic_labels(runtime, locked_plan),
+            )
         elif plan_validation_error:
             final_answer = (
                 "当前分析方案还不完整，我需要继续确认指标、"
@@ -506,6 +743,15 @@ def build_advisor_subgraph(runtime):
         if locked_plan:
             # State 字段沿用 confirmed_plan，具体阶段由 plan.status 区分
             return_value["confirmed_plan"] = locked_plan
+
+        # 回写本次指标解析结果与候选，跨轮保留供用户选择或后续门禁使用
+        if resolution_result is not None:
+            updated_spec = dict(state.get("analysis_spec") or {})
+            updated_spec["metric_resolutions"] = (
+                list(resolution_result.resolutions)
+                + list(resolution_result.ambiguities)
+            )
+            return_value["analysis_spec"] = updated_spec
 
 
         return return_value
