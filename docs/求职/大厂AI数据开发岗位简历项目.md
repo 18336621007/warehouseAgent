@@ -30,7 +30,7 @@
 
 ## 三、一句话项目描述
 
-基于 LangGraph、LangChain、FAISS、MySQL 元数据和 Hive 构建多智能体智能问数平台，通过 Planner、Advisor、Seeker、Evaluator 协作，将业务自然语言转换为可审计 QueryPlan 和安全 Hive SQL，支持多轮口径澄清、多表复合 Join、逐表分区过滤、自动修复、执行结果解释与质量评估。
+基于 LangGraph、LangChain、FAISS、MySQL 元数据和 Hive 构建多智能体智能问数平台，通过 Planner、Advisor、Seeker、Evaluator 协作，将业务自然语言转换为可审计 QueryPlan 和安全 Hive SQL，支持状态化指标口径澄清、多表复合 Join、逐表分区过滤、自动修复、执行结果解释与质量评估。
 
 ## 四、简历可直接使用的项目描述
 
@@ -43,12 +43,12 @@
 - 建设库、表、字段三级元数据 RAG 和 confirmed-plan 驱动的精确 Schema 加载机制，使用 FAISS 进行候选召回，并通过字段来源锁定避免执行阶段静默换表，降低元数据误召回对 SQL 正确性的影响。
 - 实现多表字段覆盖分析与 JoinPlanner，支持人工关系元数据、复合 Join 键及 AI Join 推测开关；在关系缺失、Join 键不完整或表不可达时执行安全拒绝或受控推测。
 - 构建 Hive SQL 多层 Guardrails：只读与白名单校验、LIMIT 和分区保护、笛卡尔积检测、Join 键校验、全局逐表必选过滤、LEFT JOIN 过滤语义保护；缺少维表分区条件时根据 confirmed QueryPlan 确定性重建 SQL。
-- 建设 request/conversation/topic/thread 四级身份模型和 JSONL 全链路日志，记录节点耗时、路由决策、State 变化、SQL 重试与执行结果；通过真实日志定位重复确认和维表历史分区膨胀问题，并完成协议与自动修复闭环。
+- 建设 request/conversation/topic/thread 四级身份模型和 JSONL 全链路日志，记录节点耗时、路由决策、State 变化、SQL 重试与执行结果；通过日志定位“模型已理解编号但 State 仍 ambiguous”的循环确认问题，设计 pending clarification 固化候选并在 Planner 前确定性解析。
 
 ### 4.2 偏 AI 工程版本
 
 - 使用 LangGraph 构建 Planner—Advisor—Seeker 多 Agent 工作流，将 LLM 用于意图理解、业务歧义消解和 SQL 生成，将方案确认、字段覆盖、Join 规划和安全校验下沉为确定性代码。
-- 设计 Adaptive Advisor：Planner completeness 仅作为初判，用户解决业务歧义后 Advisor 在同轮调用工具生成 locked QueryPlan，避免 Agent 伪确认和重复交互。
+- 设计 Adaptive Advisor 与指标澄清服务：首次多候选写入 pending，支持数字、中文序号、字段名和中文含义选择；用户选择后由程序收敛 measures，同轮生成 locked QueryPlan。
 - 结合相似高质量问数示例进行 Few-shot 检索，并由 Evaluator 对答案完整度、用户体验、耗时、轮次和自评质量进行打分，沉淀可复用样本。
 - 通过 Prompt 约束、工具协议、Pydantic/TypedDict 契约、图级拦截、SQL Guardrails 和结构化日志形成多层 Agent 安全体系。
 
@@ -68,6 +68,12 @@
 - **Action**：分析 JSONL 日志发现 Advisor 在 `locked=false` 时输出“已确认方案”，而 Planner 只有检测到真实 locked 方案才允许进入 Seeker；将 Advisor 改为 Adaptive 模式，在本轮元数据核验完成后直接调用 `submit_query_plan`，并对未锁定回复统一增加“仅用于继续核对”标识。
 - **Result**：目标流程收敛为“必要澄清—同轮锁定—用户最终确认一次—执行”，消除伪确认状态。
 
+### 5.3 指标编号循环确认
+
+- **Situation**：Advisor 已给出多个指标选项，用户回复“第二个”，Planner 也还原出目标字段，但系统仍不断要求确认。
+- **Task**：在不写死具体业务指标、不依赖 LLM 必须正确填写可选参数的前提下，建立跨轮可审计的选择状态。
+- **Action**：通过 `topic_id` 日志发现首轮候选未写回 State、Planner 重建 AnalysisSpec 时保留旧 ambiguous、Advisor 门禁过度依赖 `concept_resolutions`；新增 `MetricClarificationService`，固化 `clarification_id + options`，在 Planner 调用 LLM 前解析编号/字段名/中文含义，并让程序使用 resolved 字段覆盖 LLM measures。
+- **Result**：候选重排和 LLM 漏传不再导致 resolved 回退，指标确认与多表确认 29 项测试通过；架构为后续延迟选择和连续问答提供 pending 状态基础。
 ### 5.2 多表历史分区膨胀
 
 - **Situation**：多表 SQL 的 Join 键正确，但维表没有 `pt_dt` 条件，历史快照重复参与 Join，指标被放大。
@@ -88,7 +94,7 @@
 
 这个项目重点不只是生成 SQL，而是控制 LLM 的不确定性。我设计了 QueryPlan 契约、字段来源、逐表 table_plan、复合 Join 键、AI Join 推测开关和多层 Guardrails。比如所有参与表必须根据配置独立过滤 `pt_dt`，事实表条件放 WHERE，LEFT JOIN 维表条件放 ON；如果模型遗漏维表分区，系统会优先根据已确认方案自动重建安全 SQL。
 
-我还建立了 conversation、topic、request、graph thread 四级身份和 JSONL 全链路日志。实际通过日志定位过两个问题：一个是 Advisor 没有真正锁定方案却让用户确认，造成重复确认；另一个是维表缺少日期分区造成数据膨胀。项目目前已完成多表问数闭环，下一阶段准备增加 AnalysisSpec，支持 TopN、同比、环比、趋势等分析意图，并补持久化、并发和大规模评测。
+我还建立了 conversation、topic、request、graph thread 四级身份和 JSONL 全链路日志。实际通过日志定位过两个问题：一个是 Advisor 没有真正锁定方案却让用户确认，造成重复确认；另一个是维表缺少日期分区造成数据膨胀。项目目前已完成多表问数、AnalysisSpec 和指标确认闭环。下一阶段先建设连续问答：保存结构化结果快照，让用户基于上一轮结果追问，并把单 pending 升级为可跨数轮恢复的澄清注册表；随后进入最小语义层和 BM25 + RAG 混合检索。
 
 ## 七、30 秒项目介绍
 

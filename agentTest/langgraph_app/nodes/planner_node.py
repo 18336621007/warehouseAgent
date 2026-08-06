@@ -9,10 +9,12 @@
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from agentTest.langgraph_app.services.query_plan_service import confirm_query_plan
+from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
 from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_event
+from agentTest.langgraph_app.runtime.graph_logger import log_example_retrieved
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
@@ -174,7 +176,12 @@ def build_planner_node(runtime):
                     example_context = "\n".join(lines)
                     top_q = examples[0].metadata.get("question", "")[:50]
                     sim_val = examples[0].metadata.get("_similarity","?") if examples else "?"
-                    log_node_event("planner", f"优秀示例检索: 命中{len(examples)}条, top_sim={sim_val}, q={top_q}")
+                    log_example_retrieved(
+                        "planner",
+                        hit_count=len(examples),
+                        top_sim=sim_val,
+                        top_question=top_q,
+                    )
 
 
             # ── 步骤②：LLM 结构化解析（含 current_user_input、confirmed_context、advisor_last_answer）──
@@ -329,9 +336,9 @@ def build_planner_node(runtime):
                 reason=planner_reason,
                 ms=elapsed_ms(timer),
             )
-            log_sub_info(f"有效需求: {effective_query}")
-            log_sub_info(f"表: {table_scores_str}")
-            log_sub_info(f"字段: {column_scores_str}")
+            log_sub_info(f"有效需求: {effective_query}", node_name="planner")
+            log_sub_info(f"表: {table_scores_str}", node_name="planner")
+            log_sub_info(f"字段: {column_scores_str}", node_name="planner")
 
             # Planner 路由结果决定 Topic 下一阶段
             if route == "seeker":
@@ -339,7 +346,7 @@ def build_planner_node(runtime):
             else:
                 next_topic_status = "clarifying"
 
-            # ── 组装 AnalysisSpec：提取业务概念，不替用户选择物理指标 ──
+            # ── 组装 AnalysisSpec：优先消费上一轮固定候选，避免短回答被 LLM 重写 ──
             existing_spec = state.get("analysis_spec") or {}
             existing_resolutions = existing_spec.get("metric_resolutions") or []
             resolution_by_mention = {
@@ -347,9 +354,26 @@ def build_planner_node(runtime):
                 for item in existing_resolutions
                 if isinstance(item, dict) and item.get("mention")
             }
+            pending_clarification = existing_spec.get("pending_metric_clarification") or {}
+            selected_resolution = MetricClarificationService.resolve_pending_selection(
+                current_user_input,
+                pending_clarification,
+            )
             metric_mentions = list(planner_output.metric_mentions or [])
-            if not metric_mentions:
-                metric_mentions = existing_spec.get("metric_mentions") or []
+            if selected_resolution is not None:
+                # 编号命中时沿用上轮业务概念，避免“第二个”产生新的指标名称。
+                selected_mention = selected_resolution.get("mention", "")
+                resolution_by_mention[selected_mention] = selected_resolution
+                metric_mentions = list(existing_spec.get("metric_mentions") or [])
+                if selected_mention and selected_mention not in metric_mentions:
+                    metric_mentions.append(selected_mention)
+            elif not metric_mentions:
+                metric_mentions = list(existing_spec.get("metric_mentions") or [])
+            else:
+                pending_mention = pending_clarification.get("mention", "")
+                if pending_mention and pending_mention in effective_query:
+                    # 仍在补充同一业务概念时保留原始 mention 和候选顺序。
+                    metric_mentions = list(existing_spec.get("metric_mentions") or metric_mentions)
 
             new_resolutions = []
             for mention in metric_mentions:
@@ -367,7 +391,8 @@ def build_planner_node(runtime):
                         "candidates": [],
                     })
 
-            analysis_spec = {
+            analysis_spec = dict(existing_spec)
+            analysis_spec.update({
                 "analysis_type": planner_output.analysis_type,
                 "metric_mentions": metric_mentions,
                 "dimension_mentions": list(planner_output.dimension_mentions or []),
@@ -378,7 +403,13 @@ def build_planner_node(runtime):
                 "limit": 0,
                 "comparison": {},
                 "metric_resolutions": new_resolutions,
-            }
+            })
+            if selected_resolution is not None:
+                analysis_spec.pop("pending_metric_clarification", None)
+            elif pending_clarification and pending_clarification.get("mention") in metric_mentions:
+                analysis_spec["pending_metric_clarification"] = pending_clarification
+            else:
+                analysis_spec.pop("pending_metric_clarification", None)
 
             return_value = {
                 "route": route,

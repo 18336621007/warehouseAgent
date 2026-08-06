@@ -56,8 +56,8 @@ reflow_addition_month_order
     ↓
 Planner LLM 判断 full/partial/none
     ↓
-partial/none → Advisor clarification_agent
-full         → Advisor plan_agent
+partial/none → Advisor 检索并追问用户（门禁拦截未确认口径）
+full/已解决歧义 → Advisor submit_query_plan + lock_query_plan
     ↓
 search_columns 核对真实字段
     ↓
@@ -301,3 +301,14 @@ Planner 能结合上下文还原唯一字段时应返回 `full`。即使日志�
 ### 10.3 当前阈值定位
 
 向量相似度用于候选排序、日志分析和离线调参，不直接覆盖 LLM 与程序契约判断。调优时应优先分析误召回、字段注释质量和业务同义词，而不是通过提高阈值掩盖元数据缺陷。
+## 2026-08-05 pending 选择优先级
+
+Planner 的相似度阈值、候选数量和 `completeness` 不能覆盖已保存的 pending 选择：
+
+1. 本轮输入先尝试匹配 `pending_metric_clarification`。
+2. 命中编号、字段名或中文含义后，直接生成 resolved 记录。
+3. 再运行 LLM 需求还原、候选检索和 completeness 判断。
+4. 后续召回顺序变化只能影响新候选，不能改变已展示 options 的编号语义。
+5. 多个 pending 同时存在时，短编号缺少唯一性，应进入澄清而不是用最高相似度猜测。
+
+第13课增加连续问答后，该原则扩展到所有 `PendingClarification` 类型。

@@ -164,6 +164,10 @@ agentTest/langgraph_app/state/
 | `topic_started_at` | `float` | 后续 Topic 初始化节点 | Evaluator、监控与超时处理 | 预留 | Topic 开始时间，计划使用 Unix 时间戳，用于计算完整 Topic 耗时。 |
 | `advisor_turns` | `int` | Advisor | Evaluator、前端或 CLI | 使用中 | Advisor 完成一次澄清回复后加一，用于评估澄清轮数和对话效率。 |
 | `confirmed_plan` | `QueryPlan` | Advisor、Planner | Planner、Seeker、GenerateSQL、Evaluator | 使用中 | 同一个键同时承载 `locked` 和 `confirmed` 两个阶段。Advisor 写入完整 `locked` 方案，Planner 在用户接受完整方案后写回 `confirmed` 方案；只有 `confirmed` 才允许进入 Seeker。 |
+| `analysis_spec` | `AnalysisSpec` | Planner、Advisor | Planner、Advisor、后续连续问答节点 | 使用中 | 保存指标概念、解析证据和当前 `pending_metric_clarification`。Planner 采用增量更新，不能因短回答重建后丢失已确认字段。 |
+| `last_query_result` | `QueryResultSnapshot` | 第13课 FinalAnswer 节点 | FollowUpAnalyzer、Planner | 规划中 | 保存上一轮结果引用、列、预览行、行数、实体键和 QueryPlan，用于“第一名”“这些”“刚才结果”等追问。 |
+| `pending_clarifications` | `list[PendingClarification]` | 第13课澄清服务 | Planner、Advisor、FollowUpAnalyzer | 规划中 | 将当前单 pending 升级为注册表，支持跨数轮保留、显式解决、取消和多 pending 冲突保护。 |
+| `follow_up_context` | `FollowUpContext` | 第13课连续问答分析 | Planner、Seeker | 规划中 | 标记新查询、结果追问、方案修改或口径解释，并记录引用结果和变化槽位。 |
 
 #### TopicStatus 可选值
 
@@ -460,12 +464,12 @@ sequenceDiagram
     C->>P: AgentState
     alt completeness=partial/none
         P->>A: route=advisor + PlannerHandoffState（目标）
-        A->>A: clarification_agent 分层检索
-        Note over A: 不绑定 submit_query_plan
+        A->>A: 检索目标表字段并追问用户
+        Note over A: 未确认口径由指标歧义门禁拦截
         A-->>U: 解释关键歧义并提出澄清问题
-    else completeness=full 且尚无 locked 方案
+    else completeness=full 或用户本轮解决歧义
         P->>A: route=advisor
-        A->>A: plan_agent 核对目标表字段
+        A->>A: 核对目标表字段
         A->>A: submit_query_plan + lock_query_plan
         A->>M: confirmed_plan(status=locked) + Advisor消息
         A-->>U: 展示完整方案并等待确认或修改
@@ -482,10 +486,10 @@ sequenceDiagram
 
 关键约束：
 
-- Planner 的 `completeness` 同时决定 Advisor 本轮绑定的工具集合。
-- `partial/none` 使用 `clarification_agent`，该 Agent 没有 `submit_query_plan`，因此无法在本轮写入 `locked` 方案。
-- `full` 使用 `plan_agent`，仍必须先检索目标表字段，才能提交完整方案。
-- 目标设计由 `PlannerHandoffState` 将 `planner_reason/planner_entities` 显式传入 Advisor；当前跨子图读取仍待修复。
+- Advisor 统一使用 `plan_agent`；指标选择先由 `MetricClarificationService` 基于 pending options 确定性解析，未命中内容再交给模型理解。
+- `partial/none` 时先检索并追问，未确认口径由 `MetricAmbiguityValidator` 在提交链路拦截，不生成 `locked` 方案。
+- `full` 或用户本轮解决歧义后提交完整方案，仍必须先检索目标表字段。
+- Planner 的有效需求、候选和原因已通过共享 State 交给 Advisor；Planner 组装 AnalysisSpec 时采用增量更新。
 - Advisor 只能形成 `locked` 方案，不能直接授权执行。
 - Planner 负责理解用户对完整方案的确认或修改；确认失败继续返回 Advisor。
 - Resolver 不做语义检索，不允许在方案缺失时猜表或猜字段。
@@ -504,7 +508,7 @@ sequenceDiagram
 - `QueryPlan` 的 `locked → confirmed` 两阶段契约。
 - `QueryPlanSchemaResolver` 按确认方案精确校验并加载单表物理 Schema。
 - Seeker 已退出 `enriched_faiss_index`、通用 `runtime["retriever"]` 和旧 Schema enrich 链路。
-- Advisor 已按 Planner `completeness` 拆分为澄清模式和方案模式，`partial/none` 在工具层无法提交方案。
+- Advisor 使用统一自适应模式；`partial/none` 可以继续工具核验，但 unresolved 指标会在锁定前被程序门禁拦截。
 - `topic_status` 生命周期状态机已进入 Capture、Planner、Advisor、Seeker、Web 和 CLI 主链路。
 
 ### 待完成
@@ -516,7 +520,8 @@ sequenceDiagram
 - 增加同一 Topic 的并发请求控制和完整请求幂等。
 - 删除 `SeekerState.schema_documents/schema_candidate_ids` 以及子 State 中重复声明的 `confirmed_plan`，仅保留继承字段。
 - 将字符串 `filters` 升级为结构化表达后，再按所需字段裁剪 Schema。
-- 下一阶段优先拆分用户确认的 QueryPlan 与系统内部 ExecutionPlan。
+- 下一阶段优先增加连续问答结果快照、pending 澄清注册表和 FollowUpContext。
+- QueryPlan 与系统内部 ExecutionPlan 的拆分继续保留在后续架构演进中。
 - 新增关系元数据、TableCoverageAnalyzer 和确定性多表 Join Planner。
 - 多表与分析查询功能完成后，再进行 Topic 摘要、持久化和并发优化。
 
@@ -529,6 +534,8 @@ sequenceDiagram
 | `agentTest/langgraph_app/state/base_state.py` | 身份、Topic 和公共字段 |
 | `agentTest/langgraph_app/state/query_plan.py` | QueryPlan 结构与 locked/confirmed 校验 |
 | `agentTest/langgraph_app/services/query_plan_service.py` | 方案标准化、锁定和最终确认 |
+| `agentTest/langgraph_app/state/analysis_spec.py` | 指标概念、解析证据与当前 pending 状态 |
+| `agentTest/langgraph_app/services/metric_clarification_service.py` | 固化候选、解析用户选择并回写 AnalysisSpec |
 | `agentTest/langgraph_app/services/query_plan_schema_resolver.py` | 按确认方案精确校验并加载单表 Schema |
 | `agentTest/langgraph_app/nodes/retrieve_schema_node.py` | 调用 Resolver 写入 schema_context |
 | `agentTest/langgraph_app/state/agent_state.py` | GraphInput、GraphOutput、AgentState 聚合 |
@@ -597,3 +604,96 @@ new → clarifying → confirmed → generating_sql
 - `request_id` 用于同轮消息去重和日志关联。
 - `MemorySaver` 仅提供进程内恢复，不等于生产级持久化。
 - 未来持久化时应优先保存 QueryPlan、Topic 状态、关键消息摘要和元数据版本，Schema Context 与大结果集按需重建。
+## 十四、2026-08-05 指标 pending 与连续问答状态设计
+
+### 14.1 当前已经实现的状态闭环
+
+`AnalysisSpec` 当前增加：
+
+```python
+pending_metric_clarification = {
+    "clarification_id": "request-id",
+    "mention": "租赁中订单数量",
+    "options": [
+        {"index": 1, "field": "...", "table": "...", "meaning": "..."},
+        {"index": 2, "field": "...", "table": "...", "meaning": "..."},
+    ],
+}
+```
+
+该结构解决的是“紧接下一轮回复编号”的稳定性：
+
+- 首轮 Advisor 无论是否调用 `submit_query_plan`，候选都会写回 State。
+- Planner 在 LLM 前解析数字、中文序号、字段名和完整中文含义。
+- 编号以创建 pending 时的 options 为准，不受后续候选重排影响。
+- 命中后生成 `resolution_source=explicit_user` 并清理 pending。
+- Advisor 从 AnalysisSpec 读取 resolved 指标，LLM 漏传时仍可继续锁定方案。
+
+### 14.2 为什么下一课不能只依赖 messages
+
+用户可能经历以下对话：
+
+```text
+Advisor：请选择新增订单口径：1... 2...
+User：第二个和第一个有什么区别？
+Advisor：解释差异，但候选仍未选择
+User：时间改成最近 7 天
+Advisor：已记录时间修改，请继续选择指标口径
+User：第二个
+```
+
+如果只看最近一条 Advisor 消息，“第二个”可能已经没有显式候选文本；如果重新检索候选，排序也可能变化。因此延迟选择必须读取结构化 pending，而不是从消息历史恢复编号。
+
+### 14.3 第13课目标状态
+
+```python
+class PendingClarification(TypedDict, total=False):
+    clarification_id: str
+    clarification_type: str
+    mention: str
+    question: str
+    options: list[dict]
+    status: str  # open / resolved / cancelled / expired
+    created_request_id: str
+    last_active_request_id: str
+    resolved_value: dict
+
+class QueryResultSnapshot(TypedDict, total=False):
+    result_id: str
+    source_request_id: str
+    confirmed_plan: dict
+    columns: list[str]
+    preview_rows: list[dict]
+    row_count: int
+    result_summary: str
+    entity_keys: list[str]
+
+class FollowUpContext(TypedDict, total=False):
+    mode: str  # new_query / result_follow_up / plan_refinement / clarification_explanation
+    referenced_result_id: str
+    base_plan: dict
+    changed_slots: list[str]
+    resolved_question: str
+```
+
+### 14.4 生命周期规则
+
+- pending 创建后保持 `open`，普通解释、闲聊或补充过滤条件不能自动删除。
+- 只有明确选择、明确取消、Topic 结束或配置化过期策略才能关闭 pending。
+- 只有一个 open pending 时，隔数轮回复“第二个”仍可直接解析。
+- 多个 open pending 同时存在时，单独编号不具备唯一性，必须要求用户指定概念。
+- `last_query_result` 只在同一 Topic 内可见，新 Topic 不得继承。
+- 大结果只保存引用和有限预览；全量结果由结果存储或重新查询获取，不能无限写入 checkpoint。
+- Topic 摘要未来可以压缩 messages，但不能替代 pending、QueryPlan 和结果快照等结构化事实。
+
+### 14.5 连续问答优先级
+
+本轮输入进入 LLM 前按以下顺序处理：
+
+1. 尝试匹配 open pending 的明确选择。
+2. 判断是否在询问 pending 选项差异；如果是，只解释并保持 pending。
+3. 判断是否引用 `last_query_result`。
+4. 判断是否修改上一轮 QueryPlan 的部分槽位。
+5. 以上都不满足时，按新查询处理。
+
+该顺序保证确定性状态优先于模型推测，同时避免把“第二个和第一个有什么区别”误判为已经选择第二个。

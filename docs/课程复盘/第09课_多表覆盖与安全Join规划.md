@@ -11,9 +11,9 @@
 
 ## 二、根因
 
-- QueryPlan 已预留 joins/ield_sources/	arget_grain 等字段，但从未被填充
+- QueryPlan 已预留 joins/field_sources/target_grain 等字段，但从未被填充
 - semantic_metadata.json 已配置表关系元数据，但没有代码使用它来规划Join路径
-- etrieve_schema_node 直接交给 QueryPlanSchemaResolver，不做任何覆盖分析
+- retrieve_schema_node 直接交给 QueryPlanSchemaResolver，不做任何覆盖分析
 
 ## 三、方案取舍
 
@@ -34,8 +34,7 @@
 
 ### 修改文件
 
-- 
-odes/retrieve_schema_node.py：集成覆盖分析 → Join规划 → 单表解析的完整流程
+- nodes/retrieve_schema_node.py：集成覆盖分析 → Join规划 → 单表解析的完整流程
 
 ### 核心逻辑
 

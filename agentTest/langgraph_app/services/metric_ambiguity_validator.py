@@ -1,6 +1,7 @@
 # 指标歧义门禁服务：submit_query_plan → lock_query_plan 之间的程序级业务口径校验。
 # 只对 measure 类型字段做指标歧义判断，维度候选单独处理。
 # 候选必须来自真实元数据；历史案例和最高相似度不能产生解析证据。
+# 用户回复由澄清服务优先按上一轮候选解析；Validator 只校验字段合法性。
 import re
 from dataclasses import dataclass, field
 
@@ -42,16 +43,6 @@ def _mention_matches_candidate(mention: str, candidate: dict) -> bool:
     return text in field or text in comment or text in aliases
 
 
-def _parse_selection_number(text: str):
-    """解析纯编号选择（1/2/B），非纯编号返回 None。"""
-    value = (text or "").strip().upper()
-    if re.fullmatch(r"\d{1,2}", value):
-        return int(value)
-    if re.fullmatch(r"[A-Z]", value):
-        return ord(value) - ord("A") + 1
-    return None
-
-
 class MetricAmbiguityValidator:
     """基于真实元数据候选和用户选择证据的指标歧义校验器。"""
 
@@ -66,15 +57,14 @@ class MetricAmbiguityValidator:
     def validate(
         self,
         metric_mentions: list[str],
-        current_user_input: str = "",
-        messages: list = None,
         planner_candidates: list = None,
         advisor_candidates: list = None,
         previous_resolutions: list = None,
         target_tables: list = None,
         example_fields: list = None,
+        llm_resolutions: list = None,
     ) -> ResolutionResult:
-        """对每个指标概念重算解析证据，返回是否全部 resolved。"""
+        """对每个指标概念计算解析结果：信任 LLM 提交的解析字段，程序只校验字段合法性。"""
         mentions = [m for m in (metric_mentions or []) if m and m.strip()]
         if not mentions:
             return ResolutionResult(resolved=True, reason="无指标概念需要解析")
@@ -83,6 +73,12 @@ class MetricAmbiguityValidator:
             resolution.get("mention", ""): resolution
             for resolution in (previous_resolutions or [])
             if isinstance(resolution, dict) and resolution.get("mention")
+        }
+        # LLM 提交的 concept_resolutions：对用户回复的解读完全信任，程序只校验字段合法性
+        llm_map = {
+            item.get("mention", ""): item
+            for item in (llm_resolutions or [])
+            if isinstance(item, dict) and item.get("mention")
         }
 
         resolutions: list[dict] = []
@@ -98,28 +94,32 @@ class MetricAmbiguityValidator:
                 example_fields=example_fields,
             )
             previous = previous_map.get(mention)
+            llm_resolution = llm_map.get(mention)
 
-            # 已解析记录且用户本轮未改选时保持 resolved
-            if self._keep_previous_resolution(previous, current_user_input, candidates):
+            # 信任 LLM 对用户回复的解读：字段必须落在真实候选或上轮已确认字段内
+            llm_field = (llm_resolution or {}).get("field", "")
+            if llm_field:
+                resolution = self._resolve_from_llm(
+                    mention, llm_field, previous, candidates,
+                )
+                if resolution is not None:
+                    resolutions.append(resolution)
+                    log_metric_event(
+                        "metric_resolution.completed",
+                        mention=mention,
+                        field=resolution.get("selected_field", ""),
+                        source=resolution.get("resolution_source", ""),
+                    )
+                    continue
+
+            # 上轮已解决且字段仍有效时保持，避免重复确认
+            if self._keep_previous_resolution(previous, candidates):
                 resolutions.append(previous)
                 log_metric_event(
                     "metric_resolution.completed",
                     mention=mention,
                     field=previous.get("selected_field", ""),
                     source=previous.get("resolution_source", ""),
-                )
-                continue
-
-            matched = self._match_user_selection(current_user_input, candidates)
-            if matched:
-                resolutions.append(self._build_resolution(
-                    mention, matched, "explicit_user",
-                ))
-                log_metric_event(
-                    "metric_resolution.completed",
-                    mention=mention,
-                    field=matched.get("field", ""),
-                    source="explicit_user",
                 )
                 continue
 
@@ -191,32 +191,6 @@ class MetricAmbiguityValidator:
                 for item in resolutions
             ),
         )
-
-    def verify_submitted_resolutions(
-        self,
-        submitted: list[dict],
-        result: ResolutionResult,
-    ) -> tuple[bool, str]:
-        """交叉验证 LLM 提交的 concept_resolutions，程序重算结果为准。"""
-        recomputed = {
-            item.get("mention", ""): item
-            for item in list(result.resolutions) + list(result.ambiguities)
-        }
-        for item in (submitted or []):
-            mention = item.get("mention", "")
-            entry = recomputed.get(mention)
-            if not entry:
-                continue
-            if entry.get("status") != "resolved":
-                return False, (
-                    f"指标 [{mention}] 程序判定为未解决，"
-                    "LLM 声称的解析证据被拒绝"
-                )
-            if item.get("field") != entry.get("selected_field"):
-                return False, (
-                    f"指标 [{mention}] 提交字段与程序重算不一致"
-                )
-        return True, ""
 
     def to_plan_resolutions(self, result: ResolutionResult) -> dict:
         """将已解决指标转换为 QueryPlan.concept_resolutions 可审计结构。"""
@@ -416,69 +390,56 @@ class MetricAmbiguityValidator:
     def _keep_previous_resolution(
         self,
         previous: dict,
-        current_user_input: str,
         candidates: list[dict],
     ) -> bool:
-        """已解析记录在用户本轮未改选时继续有效。"""
+        """已解析记录在用户本轮未改选时继续有效（改选由 LLM 提交的解析字段体现）。"""
         if not previous or previous.get("status") != "resolved":
             return False
         selected_field = previous.get("selected_field", "")
         if not selected_field:
             return False
-        if selected_field not in {
+        # 同时认可上轮真实候选，避免重新召回或候选重排使已确认字段失效。
+        valid_fields = {
             candidate.get("field", "") for candidate in candidates
-        }:
-            return False
-        matched = self._match_user_selection(current_user_input, candidates)
-        if matched and matched.get("field") != selected_field:
+        }
+        valid_fields.update(
+            candidate.get("field", "")
+            for candidate in (previous.get("candidates") or [])
+            if isinstance(candidate, dict)
+        )
+        if selected_field not in valid_fields:
             return False
         return True
 
-    @staticmethod
-    def _match_user_selection(
-        user_input: str,
+    def _resolve_from_llm(
+        self,
+        mention: str,
+        llm_field: str,
+        previous: dict,
         candidates: list[dict],
     ) -> dict:
-        """判断用户是否明确选择了某个候选，返回该候选或 None。
-
-        优先级：字段名精确匹配 → 选项编号 → 唯一业务词/别名匹配。
-        多个候选同时命中业务词时视为仍未选择，不产生 explicit_user 证据。
-        """
-        text = (user_input or "").strip()
-        if not text or not candidates:
+        """按 LLM 提交的字段构造解析记录；字段非法时返回 None 交由后续判定。"""
+        valid_fields = {
+            candidate.get("field", "") for candidate in candidates
+        }
+        previous_field = (previous or {}).get("selected_field", "")
+        if previous_field:
+            # 上轮已确认字段作为兜底，避免跨轮候选重排导致合法选择被误判
+            valid_fields.add(previous_field)
+        if llm_field not in valid_fields:
             return None
-
-        for candidate in candidates:
-            if text.lower() == str(candidate.get("field") or "").lower():
-                return candidate
-
-        sequence = _parse_selection_number(text)
-        if sequence is not None and 1 <= sequence <= len(candidates):
-            return candidates[sequence - 1]
-
-        text_lower = text.lower()
-        strong_matches = []
-        weak_matches = []
-        for candidate in candidates:
-            field = str(candidate.get("field") or "").lower()
-            comment = str(candidate.get("comment") or "").lower()
-            aliases = [
-                str(alias).lower()
-                for alias in (candidate.get("aliases") or [])
-            ]
-            # 强匹配：用户整个输入词出现在候选字段名或注释中
-            if text_lower in field or text_lower in comment:
-                strong_matches.append(candidate)
-            # 弱匹配：用户输入包含别名，如“B类新增订单”包含“新增订单”
-            elif any(alias and alias in text_lower for alias in aliases):
-                weak_matches.append(candidate)
-
-        # 唯一强匹配才构成 explicit_user；强匹配为空时才允许唯一弱匹配兜底
-        if len(strong_matches) == 1:
-            return strong_matches[0]
-        if not strong_matches and len(weak_matches) == 1:
-            return weak_matches[0]
-        return None
+        if previous and previous_field == llm_field:
+            # 与上轮一致时保留上轮解析证据，避免解析链断裂
+            return previous
+        matched = next(
+            (candidate for candidate in candidates
+             if candidate.get("field") == llm_field),
+            None,
+        )
+        if matched is None:
+            # 仅出现在上轮记录时按上轮结果处理
+            return previous
+        return self._build_resolution(mention, matched, "llm_submitted")
 
     # ── 结果构造 ────────────────────────────────────────────
 
@@ -512,20 +473,24 @@ class MetricAmbiguityValidator:
 
     @staticmethod
     def _build_meaning(candidate: dict) -> str:
-        """从候选提取一句简洁中文含义：短说明 > 原始备注 > 首个别名 > 注释截断。"""
+        """从候选提取一句简洁中文含义：原始备注 > 首个别名 > 短说明 > 注释截断。"""
         comment = str(candidate.get("comment") or "")
-        # 简短纯说明（非元数据全文）直接使用，如“净增订单数”
-        if comment and "字段:" not in comment and len(comment) <= 60:
-            return comment
+        # 原始备注优先，确保展示口径与报表自带备注一致
         for line in comment.splitlines():
             if line.startswith("原始备注:"):
-                return line[len("原始备注:"):].strip()[:60]
+                raw = line[len("原始备注:"):].strip()[:60]
+                if raw:
+                    return raw
+        # 无原始备注时使用首个别名
         aliases = [
             str(alias) for alias in (candidate.get("aliases") or [])
             if str(alias).strip()
         ]
         if aliases:
             return aliases[0][:60]
+        # 简短纯说明（非元数据全文）直接使用，如“净增订单数”
+        if comment and "字段:" not in comment and len(comment) <= 60:
+            return comment
         return comment[:60]
 
     @staticmethod

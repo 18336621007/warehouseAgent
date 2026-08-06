@@ -1,6 +1,6 @@
-﻿# 多智能体 Text2SQL 系统架构文档
+# 多智能体 Text2SQL 系统架构文档
 
-> 最后更新：2026-08-04 | 多表 SQL 生成、校验与执行链路已完成（第11课）
+> 最后更新：2026-08-05 | 指标跨轮确认闭环已完成，下一课进入连续问答与延迟澄清恢复
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -25,9 +25,9 @@
 flowchart TD
     UI["Web/CLI：身份字段 + current_user_input"] --> Capture["capture_user_message"]
     Capture --> Planner
-    Planner -->|partial/none| Clarify["Advisor clarification_agent"]
-    Clarify -->|仅检索与追问| Capture
-    Planner -->|full且尚无locked方案| Plan["Advisor plan_agent"]
+    Planner -->|partial/none| Ask["Advisor 检索并追问用户"]
+    Ask -->|未确认口径由程序门禁拦截| Capture
+    Planner -->|full或用户已解决歧义| Plan["Advisor 提交完整方案"]
     Plan -->|submit_query_plan| Locked["QueryPlan status=locked"]
     Locked -->|下一轮请求| Capture
     Planner -->|用户接受完整方案| Confirmed["QueryPlan status=confirmed"]
@@ -41,8 +41,8 @@ flowchart TD
 ### 图结构
 
 - **父图**（Supervisor）：记录用户消息 → Planner 路由决策 → Advisor/Seeker。
-- **Advisor 澄清模式**：`clarification_agent` 只绑定库、表、字段检索工具，不绑定 `submit_query_plan`。
-- **Advisor 方案模式**：`plan_agent` 在 `completeness=full` 时核对元数据并提交完整方案。
+- **Advisor 统一模式**：只使用 `plan_agent`（绑定全部工具）；指标编号、字段名和中文含义优先由 pending 状态确定性解析，其余语义再交给模型。
+- **同轮锁定**：`partial/none` 时先检索并追问，未确认口径由指标歧义门禁在 `submit_query_plan → lock_query_plan` 之间拦截；用户本轮解决歧义后直接提交完整方案生成 `locked`。
 - **查询方案领域服务**：`lock_query_plan()` 将 Advisor 提案标准化为 `locked`；`confirm_query_plan()` 只允许 Planner 将合法 `locked` 方案升级为 `confirmed`。
 - **Seeker 子图**：`retrieve_schema → generate_sql → validate_sql → execute_sql → build_final_answer → evaluator`。
 - **状态隔离**：MemorySaver 以 `conversation_id:topic_id` 为 checkpoint `thread_id`，同一 Topic 多轮共享状态。
@@ -51,7 +51,7 @@ flowchart TD
 ### 关键设计原则
 
 1. **执行契约唯一**：`confirmed_plan` 是共享 State 中的唯一查询契约，具体阶段由 `status=locked/confirmed` 区分。
-2. **模糊度硬门禁**：Planner 的 `completeness` 决定 Advisor 工具集合，`partial/none` 在工具层无法提交方案。
+2. **模糊度硬门禁**：Planner 的 `completeness` 只是初判；Advisor 可以核验后提交方案，但任何 unresolved 指标都会在 `lock_query_plan` 前被程序拦截。
 3. **职责分离**：Advisor 负责澄清或形成 `locked` 方案；Planner 负责理解用户是否接受完整方案；Seeker 只执行 `confirmed` 方案。
 4. **不允许执行层猜测**：Seeker 不再通过向量检索重新选表选字段，方案缺失或物理 Schema 不一致时直接失败。
 5. **检索证据不直接决定路由**：高相似候选数量保留为日志和调优指标，但不再作为把 `full` 强制降为 `partial` 的硬门禁；业务完整度由对话语义、元数据映射、QueryPlan 校验和用户确认共同决定。
@@ -96,7 +96,7 @@ state/
 1. 用“原始问题 + 本轮输入 + Advisor 最近回复 + 当前方案”组成检索问题，避免用户只回复“1”“A”时丢失语义。
 2. 从表层和字段层 FAISS 召回候选元数据，并由 LLM 输出 `effective_query / tables / fields / completeness / accept_locked_plan`。
 3. 目标设计使用 LLM 还原后的 `effective_query` 统计高相似候选数量，仅作为可观测指标记录到日志；当前代码仍存在覆盖 `completeness` 的硬分支，尚待删除。
-4. `none/partial` 时路由 Advisor 的澄清模式，本轮不能提交方案；`full` 时进入方案模式，由工具和领域服务继续校验。
+4. `none/partial` 时进入 Advisor 自适应核验；若本轮解决全部歧义可以提交，否则由程序门禁生成候选并保持 clarifying。
 5. 需求明确但尚无最终确认时路由 Advisor 的方案模式，由 Advisor 生成完整 `locked` 方案。
 6. 只有 `accept_locked_plan=true` 且 `confirm_query_plan()` 校验通过时，才写回 `status=confirmed` 并路由 Seeker。
 
@@ -120,14 +120,14 @@ state/
 
 **职责**：根据 Planner 模糊度选择澄清模式或方案模式，避免模型在业务口径不唯一时自行选字段。
 
-**双 Agent 模式**：
+**单 Agent + 程序门禁**：
 
 | 模式 | 触发条件 | 可用工具 | 允许结果 |
 |---|---|---|---|
-| `clarification_agent` | `completeness=partial/none` | `search_databases/search_tables/search_columns` | 解释歧义并向用户追问 |
-| `plan_agent` | `completeness=full` | 检索工具 + `submit_query_plan` | 提交完整 `locked` 方案 |
+| `plan_agent` 检索追问 | `completeness=partial/none` | `search_databases/search_tables/search_columns` | 解释歧义并向用户追问，未确认口径被门禁拦截 |
+| `plan_agent` 提交方案 | `completeness=full` 或用户本轮解决歧义 | 检索工具 + `submit_query_plan` | 提交完整 `locked` 方案 |
 
-两个 Agent 使用同一套系统 Prompt，但绑定不同工具。澄清模式不是依靠 Prompt 要求模型“不要提交”，而是在工具层完全移除 `submit_query_plan`。
+Advisor 统一使用 `plan_agent`；用户回复的编号、第几个、候选名称或业务口径完全由模型结合候选列表和历史判断，程序不再机械解析用户文本。
 
 **上下文输入**：
 
@@ -230,22 +230,15 @@ comprehensive_score = W_TIME * time_score + W_TURN * turn_score
 - 使用 `ContextVar` 自动附加 `conversation_id/topic_id/request_id/graph_thread_id`。
 - 日志格式为 JSON Lines，文件为 `agentTest/logs/langgraph_app.jsonl`。
 - 使用 `TimedRotatingFileHandler` 按天滚动，默认保留 14 天。
-- 事件覆盖 `request.* / node.* / route.decided / state.changed`。
+- 事件覆盖 `request.* / node.* / route.decided / state.changed / metric_* / plan.locked`。
+- 每条事件携带 `seq / trace_id / span_id / parent_span_id`，可还原请求级树形调用链。
 - 核心异常在 Web 请求边界生成 `error_id` 并记录完整堆栈，前端只展示安全提示。
 - Intent Classifier、Evaluator 等可降级能力使用 `node.degraded`，不影响主查询结果。
+- 树形查看工具：`python agentTest/scripts/trace_view.py show <request_id前缀>`。
 
 具体查询命令和排障流程见 [日志使用与问题排查指南](../指南/日志使用与问题排查指南.md)。
 
-### 3.6 状态可观测性与日志（`runtime/graph_logger.py`）
 
-- 使用 `ContextVar` 自动附加 `conversation_id/topic_id/request_id/graph_thread_id`。
-- 日志格式为 JSON Lines，文件为 `agentTest/logs/langgraph_app.jsonl`。
-- 使用 `TimedRotatingFileHandler` 按天滚动，默认保留 14 天。
-- 事件覆盖 `request.* / node.* / route.decided / state.changed`。
-- 核心异常在 Web 请求边界生成 `error_id` 并记录完整堆栈，前端只展示安全提示。
-- Intent Classifier、Evaluator 等可降级能力使用 `node.degraded`，不影响主查询结果。
-
-具体查询命令和排障流程见 [日志使用与问题排查指南](../指南/日志使用与问题排查指南.md)。
 
 ---
 
@@ -258,8 +251,8 @@ MySQL（enriched_databases / enriched_tables / enriched_columns）
   ↓ Document Builder + build_indexes
 FAISS（db / table / column）
   ↓ Planner 语义识别与 completeness 判断
-partial/none → Advisor clarification_agent → 追问用户
-full → Advisor plan_agent → submit_query_plan
+partial/none → Advisor 检索并追问用户（未确认口径由门禁拦截）
+full/用户已解决歧义 → Advisor submit_query_plan → lock_query_plan
   ↓ lock_query_plan
 QueryPlan(status=locked)
   ↓ 用户下一轮确认 + Planner confirm_query_plan
@@ -535,17 +528,17 @@ WHERE a.pt_dt = yesterday_expression
 
 - `AnalysisSpec`（`state/analysis_spec.py`）从自然语言提取 `analysis_type / metric_mentions / dimension_mentions / time_range / time_grain / filters / order_by / limit / comparison`，作为跨轮 Topic 状态保留。
 - 每个指标概念携带 `ConceptResolution`：`mention / status / selected_field / selected_table / resolution_source / candidates`。
-- 可信解析来源只有三种：`explicit_user`（用户明确选择字段/业务词/选项编号）、`unique_metadata`（元数据唯一候选）、`semantic_default`（正式语义默认口径，第13-14课接入）。
+- 可信解析来源只有三种：`explicit_user`（用户明确选择字段/业务词/选项编号）、`unique_metadata`（元数据唯一候选）、`semantic_default`（正式语义默认口径，第14-15课接入）。
 - 历史案例、最高相似度、ADS 优先规则和 LLM 常识选择均不能独立证明用户已确认口径。
 
 ### 17.3 指标歧义门禁
 
-`services/metric_ambiguity_validator.py` 在 Advisor 捕获 `submit_query_plan` 后重算解析证据：
+`services/metric_ambiguity_validator.py` 在 Advisor 捕获 `submit_query_plan` 后校验 LLM 提交的解析字段（必须落在真实候选或上轮已确认字段内）：
 
 ```text
 Agent 调用 submit_query_plan
   ↓ 校验目标表已 search_columns（保留）
-  ↓ MetricAmbiguityValidator 重算证据
+  ↓ MetricAmbiguityValidator 校验 LLM 提交字段合法性
   resolved=true  → lock_query_plan（同轮锁定，携带 concept_resolutions）
   resolved=false → 丢弃本轮提交：不生成 locked_plan，
                   程序生成候选选项（字段名+真实中文说明），只追问一个指标
@@ -554,7 +547,7 @@ Agent 调用 submit_query_plan
 - 候选必须来自真实元数据（向量库检索 + Planner/Advisor 结构化候选），LLM 不能编造字段。
 - 只对 `measure` 类型字段判指标歧义，维度单独处理。
 - 排序分数只决定候选展示顺序，不产生解析证据。
-- LLM 提交的 `concept_resolutions` 仅作审计输入，最终以程序重算结果为准，防止伪造 `explicit_user`。
+- LLM 提交的 `concept_resolutions` 必须落在真实候选或上轮已确认字段内；State 中的 `explicit_user` 选择优先，LLM 漏传不能使 resolved 状态退回 ambiguous。
 - 唯一候选场景仍允许同轮锁定，不采用“所有 partial 一律禁止提交”的简单方案。
 
 ### 17.4 历史案例使用边界
@@ -568,7 +561,8 @@ Agent 调用 submit_query_plan
 | 文件 | 职责 |
 |---|---|
 | `agentTest/langgraph_app/state/analysis_spec.py` | AnalysisSpec 与 ConceptResolution 定义 |
-| `agentTest/langgraph_app/services/metric_ambiguity_validator.py` | 指标歧义门禁服务 |
+| `agentTest/langgraph_app/services/metric_ambiguity_validator.py` | 指标候选合法性与门禁校验 |
+| `agentTest/langgraph_app/services/metric_clarification_service.py` | 候选固化、编号解析、状态回写和澄清文本 |
 | `agentTest/langgraph_app/graphs/advisor_graph.py` | 门禁集成、澄清选项与历史案例改造 |
 | `agentTest/langgraph_app/tools/advisor_tools.py` | `search_column_candidates` 结构化候选 |
 | `agentTest/langgraph_app/nodes/planner_node.py` | Planner 组装 AnalysisSpec |
@@ -601,3 +595,127 @@ Advisor 给用户展示的内容统一由程序模板生成，LLM 原文不作�
 | `MAX_AMBIGUITY_CANDIDATES` | 6 | 澄清候选数量上限 |
 | `MIN_CANDIDATE_SCORE` | 0.5 | 候选相似度下限，低于该分视为不相关 |
 | `EXAMPLE_FIELD_BOOST` | 0.1 | 优秀案例命中字段的排序加权，只影响展示顺序，不产生解析证据 |
+## 十八、2026-08-05 架构同步：指标跨轮确认闭环
+
+### 18.1 原循环路径
+
+```text
+Advisor 展示候选
+  ↓ 用户回复“第二个”
+Planner 的 effective_query 已理解目标字段
+  ↓ 但 AnalysisSpec 仍保留 ambiguous
+Advisor 的 concept_resolutions 又是可选参数
+  ↓
+MetricAmbiguityValidator 再次拦截
+  ↓
+用户被要求重复确认
+```
+
+根因不是模型完全没有理解，而是模型理解、程序 State 和门禁证据没有形成同一条状态转换。
+
+### 18.2 当前闭环
+
+```text
+MetricAmbiguityValidator 生成候选
+  ↓
+MetricClarificationService 固化 clarification_id + options
+  ↓ 写入 AnalysisSpec.pending_metric_clarification
+下一轮 Planner 先确定性解析用户输入
+  ↓
+ConceptResolution(status=resolved, source=explicit_user)
+  ↓ 清理 pending
+Advisor 接收已确认指标上下文
+  ↓
+程序按 resolved field 收敛 measures
+  ↓
+lock_query_plan
+```
+
+关键变化：
+
+- 候选不仅展示给用户，也进入 State。
+- 编号语义由创建 pending 时的 options 决定，不依赖重新召回。
+- Planner 基于已有 AnalysisSpec 增量更新，不再重新创建后丢失 pending。
+- Validator 保留上轮真实候选中的 resolved field，候选重排不使选择失效。
+- Advisor 未调用提交工具时的预校验结果也会写回 State。
+- Advisor Graph 只保留编排，澄清领域逻辑迁入 `MetricClarificationService`。
+- 日志 `answer_summary` 记录最终用户可见文本，而非被程序覆盖的 LLM 原始回复。
+
+### 18.3 当前限制
+
+当前 `pending_metric_clarification` 仍是单活动项，能够可靠处理紧接下一轮的编号，但还不能完整表达：
+
+- 用户先询问候选差异，数轮后才选择。
+- 同一 Topic 同时存在多个未解决澄清。
+- 查询成功后引用“第一名”“这些经销商”“刚才结果”。
+- 基于上一轮 QueryPlan 只修改时间、过滤或维度。
+
+这些能力进入第13课。
+
+## 十九、第13课目标架构：连续问答与延迟澄清恢复
+
+### 19.1 不新增 Agent
+
+连续问答是在现有状态契约上的增强，不新增 FollowUp Agent。建议使用轻量服务或节点完成：
+
+```text
+Capture
+  ↓
+PendingClarificationResolver
+  ↓
+FollowUpAnalyzer
+  ↓
+Planner → Advisor / Seeker
+```
+
+- `PendingClarificationResolver` 先处理可确定的编号、字段名和中文含义。
+- `FollowUpAnalyzer` 判断本轮是结果追问、方案增量修改、候选解释还是新查询。
+- Planner 继续负责形成完整有效需求和 AnalysisSpec。
+- Advisor 继续负责元数据核验与业务澄清。
+- Seeker 继续只执行 confirmed QueryPlan。
+
+### 19.2 结果追问
+
+查询完成后生成 `QueryResultSnapshot`，至少保存：
+
+- `result_id / source_request_id`。
+- `confirmed_plan` 和字段来源。
+- 返回列、有限预览行、总行数和结果摘要。
+- 可继续查询的实体键，例如 `company_id`。
+
+用户问“第一名的业务经理电话”时，系统先从快照定位第一名实体，再基于实体键补充查询；不能只把上一轮自然语言答案拼接给模型猜测。
+
+### 19.3 延迟澄清
+
+单 pending 升级为 `pending_clarifications` 注册表：
+
+- 每条记录有稳定 `clarification_id`、创建请求、候选快照和状态。
+- 用户询问选项差异时保持 `open`，不能误判为选择。
+- 只有一个 open pending 时，隔数轮回复“第二个”仍可直接命中。
+- 多个 open pending 时，单独编号必须安全拒绝，并要求指定业务概念。
+- 新 Topic 与旧 Topic 状态严格隔离。
+- 过期策略必须配置化，不写死固定轮数。
+
+### 19.4 方案增量修改
+
+对“换成近 7 天”“再加城市”“改成净增订单”等表达，生成 `FollowUpContext`：
+
+```json
+{
+  "mode": "plan_refinement",
+  "referenced_result_id": "...",
+  "base_plan": {},
+  "changed_slots": ["time_range"],
+  "resolved_question": "查询近7天……"
+}
+```
+
+程序只继承未修改槽位；任何新指标仍要经过指标歧义门禁，不能因为来自上一轮计划就绕过。
+
+### 19.5 安全边界
+
+- 结果引用只在同一 Topic 内生效。
+- 无快照、快照过期或引用不唯一时必须追问。
+- 全量大结果不写入 State，只保存引用和预览。
+- 消息摘要可以压缩自然语言历史，但不能替代 QueryPlan、pending 和结果快照。
+- 连续问答仍需经过字段来源、Join、逐表过滤和 SQL Guardrails。
