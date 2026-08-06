@@ -6,6 +6,7 @@
 #   ② LLM 解析：将召回元数据 + 用户问题 + 用户实际输入 + 已确认方案 + Advisor 上轮回复传给 LLM
 #   ③ 阈值判定：模糊需求进入 Advisor；明确需求先由 Advisor 锁定方案；
 #       只有用户最终确认 locked 方案后才能进入 Seeker
+from langchain.agents.middleware.todo import Todo
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from agentTest.langgraph_app.services.query_plan_service import confirm_query_plan
@@ -58,7 +59,7 @@ def build_planner_node(runtime):
         original_question = state.get("original_question") or current_user_input
 
 
-        # ── 读取独立的 confirmed_plan（Advisor 写入，Planner 只读不改）──
+        # ── 读取独立的 confirmed_plan（Advisor 写入，Planner 只读不改，首轮为空）──
         confirmed_plan = state.get("confirmed_plan") or {}
         has_plan = bool(
             confirmed_plan.get("table")
@@ -346,7 +347,14 @@ def build_planner_node(runtime):
             else:
                 next_topic_status = "clarifying"
 
+
+            """
+            以下这段代码让 AnalysisSpec 从“每轮被 LLM 覆盖重建”变成“增量更新”：先确定性消费 pending，再保留上轮 resolved 证据，只补新概念的 ambiguous 记录，
+            并按概念是否存活正确清理/保留 pending——从状态层面消除“模型理解了、State 却还停在 ambiguous”导致的重复确认循环。
+            """
             # ── 组装 AnalysisSpec：优先消费上一轮固定候选，避免短回答被 LLM 重写 ──
+
+            # 1. 读取上轮状态，建立索引
             existing_spec = state.get("analysis_spec") or {}
             existing_resolutions = existing_spec.get("metric_resolutions") or []
             resolution_by_mention = {
@@ -355,10 +363,13 @@ def build_planner_node(runtime):
                 if isinstance(item, dict) and item.get("mention")
             }
             pending_clarification = existing_spec.get("pending_metric_clarification") or {}
+
+            # 2. LLM 之前先确定性消费用户短回答
             selected_resolution = MetricClarificationService.resolve_pending_selection(
                 current_user_input,
                 pending_clarification,
             )
+            # 3. 决定本轮的 metric_mentions
             metric_mentions = list(planner_output.metric_mentions or [])
             if selected_resolution is not None:
                 # 编号命中时沿用上轮业务概念，避免“第二个”产生新的指标名称。
@@ -375,6 +386,7 @@ def build_planner_node(runtime):
                     # 仍在补充同一业务概念时保留原始 mention 和候选顺序。
                     metric_mentions = list(existing_spec.get("metric_mentions") or metric_mentions)
 
+            # 4. 重建 metric_resolutions（保留已解析，新概念初始为 ambiguous）
             new_resolutions = []
             for mention in metric_mentions:
                 if mention in resolution_by_mention:
@@ -391,6 +403,7 @@ def build_planner_node(runtime):
                         "candidates": [],
                     })
 
+            # 5. 组装新 AnalysisSpec + 管理 pending 生命周期
             analysis_spec = dict(existing_spec)
             analysis_spec.update({
                 "analysis_type": planner_output.analysis_type,
@@ -411,6 +424,7 @@ def build_planner_node(runtime):
             else:
                 analysis_spec.pop("pending_metric_clarification", None)
 
+            # 6. 写回 State
             return_value = {
                 "route": route,
                 "planner_reason": planner_reason,

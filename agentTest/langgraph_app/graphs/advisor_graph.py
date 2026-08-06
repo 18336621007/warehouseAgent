@@ -23,12 +23,14 @@ from agentTest.langgraph_app.services.metric_clarification_service import Metric
 
 
 def _get_tool_call_args(messages, tool_name):
-    """获取指定工具调用的参数，返回列表 [(args_dict, tool_call_id), ...]"""
+    """ 从一批消息里找出所有“指定名称的工具调用”，返回它们的 (参数, 调用id) 列表。
+        把“Agent 是否调用、调用了什么”从消息中结构化提取出来，程序才能做校验和锁定，而不是只依赖 LLM 的自由文本。
+    """
     results = []
-    for msg in messages:
-        for tc in (getattr(msg, "tool_calls", None) or []):
-            if tc.get("name") == tool_name:
-                results.append((tc.get("args", {}), tc.get("id", "")))
+    for msg in messages: # 遍历每条消息
+        for tc in (getattr(msg, "tool_calls", None) or []): # 取消息的 tool_calls（AI消息才有）
+            if tc.get("name") == tool_name: # 只留指定工具
+                results.append((tc.get("args", {}), tc.get("id", ""))) # (参数, 调用id)
     return results
 
 def _has_column_search_for_tables(messages, tables: list[str]) -> bool:
@@ -349,6 +351,7 @@ def build_advisor_subgraph(runtime):
             ),
         ])
 
+        #有方案则填入当前方案
         if current_plan:
             context_lines.extend([
                 "",
@@ -378,8 +381,7 @@ def build_advisor_subgraph(runtime):
 
 
 
-        # 临时增强本轮用户消息，但不把检索上下文写入Checkpoint
-                # 构建 Planner 候选池摘要，注入消息上下文
+        # 从检索结果中提取出表/字段原始备注，防止使用增强后的别名，若没有备注再使用别名
         from langchain_core.messages import SystemMessage
         table_candidates = planner_entities.get("table_candidates") or []
         column_candidates = planner_entities.get("column_candidates") or []
@@ -401,17 +403,21 @@ def build_advisor_subgraph(runtime):
                 candidate_lines.append(f"  {cc['table']}.{cc['field']} (相似度={cc['score']}) - {field_desc}")
         candidate_text = "\n".join(candidate_lines) if candidate_lines else ""
 
+        
+        #构造传给Agent的完整消息列表，把Planner还原的上下文装进用户信息，让Agent看到完整需求而不是用户原始短句
         agent_history = list(history)
+        # candidate_text 是 Planner 检索到的候选表/候选字段摘要（含相似度和原始备注）。追加到最后面，作为 Agent 的固定参考上下文。
         if candidate_text:
             agent_history.insert(0, SystemMessage(content=candidate_text))
+        # 多轮场景：就地替换最后一条用户消息
         if agent_history and isinstance(agent_history[-1], HumanMessage):
             current_user_message = agent_history[-1]
             agent_history[-1] = HumanMessage(
-                content=msg_content,
-                name=current_user_message.name,
-                id=current_user_message.id,
+                content=msg_content, # 替换内容
+                name=current_user_message.name, # 保留 name="user"
+                id=current_user_message.id, # 保留原 id
             )
-        else:
+        else: # 首轮/历史末尾不是用户消息：追加新 HumanMessage
             agent_history.append(HumanMessage(
                 content=msg_content,
                 name="user",
@@ -425,6 +431,8 @@ def build_advisor_subgraph(runtime):
         retries = 0
         submission_blocked = False
 
+
+        # 校验字段是不是真实的
         while retries <= MAX_COLUMN_CHECK_RETRIES:
             result = agent.invoke({
                 "messages": agent_history,
@@ -437,7 +445,7 @@ def build_advisor_subgraph(runtime):
                 current_round_messages,
                 "submit_query_plan",
             )
-
+            #检查所有目标表是否调用过search_columns，方式Advisor凭模型记忆、历史案例或猜来提交字段，确保每个字段都来源于真实的元数据检索结果
             if submit_args_list and not submission_blocked:
                 submit_args, _ = submit_args_list[-1]
                 proposed_tables = submit_args.get("tables") or []
@@ -480,6 +488,7 @@ def build_advisor_subgraph(runtime):
                     continue
             break
 
+        #如果模型没有返回结果
         if new_history is None:
             log_node_event("advisor_agent", "Agent 未返回有效结果")
             error_answer = "系统处理异常，请重试"
@@ -493,6 +502,24 @@ def build_advisor_subgraph(runtime):
                     )
                 ],
             }
+        """
+        Agent 的工作方式是：
+            读上下文，判断：我信息够不够？不够 → 输出 tool_calls（带工具名和参数），这不是最终回答；
+            框架执行工具，把结果以 ToolMessage 追加进消息；
+            Agent 再读（历史 + 工具结果），继续判断：还要不要再调工具？
+            直到某次输出不带 tool_calls 的 AIMessage，循环才结束，invoke 返回。
+            所以新增消息数取决于工具调用次数：
+            调了 N 次工具 → 大约 2N + 1 条（每个工具调用一对 AIMessage+ToolMessage，再加最终回复）；
+            一次工具都没调（比如直接追问用户）→ 只新增 1 条 AIMessage。
+        例如：
+            AIMessage(tool_call=search_columns)      ← 第1步：决定检索
+            ToolMessage(search_columns 返回结果)      ← 第1步的工具结果
+            AIMessage(tool_call=submit_query_plan)   ← 第2步：决定提交方案
+            ToolMessage(submit_query_plan 返回结果)   ← 第2步的工具结果
+            AIMessage(最终回复文本)                   ← 第3步：输出最终回答，循环结束
+
+        所以下面的last_msg指的是最终回答，current_round_messages是这一轮新增的所有消息
+        """
 
         last_msg = new_history[-1]
         current_round_messages = new_history[persist_start_index:]
@@ -524,7 +551,7 @@ def build_advisor_subgraph(runtime):
         metric_mentions = current_spec.get("metric_mentions") or []
 
         def _metric_gate_inputs(submit_tables: list = None) -> tuple:
-            """构造指标门禁输入：目标表（提交表优先）与优秀案例命中字段。"""
+            """收集“候选应该优先看哪些表”和“历史案例偏爱哪些字段”两类信息，供指标门禁收敛候选顺序用——目标表决定候选范围，优秀案例只影响展示排序，二者都不产生用户口径证据。"""
             target_tables = list(dict.fromkeys(
                 list(submit_tables or [])
                 + list(current_plan.get("tables") or [])
@@ -541,6 +568,7 @@ def build_advisor_subgraph(runtime):
                     continue
             return target_tables, example_fields
 
+        """指标未解决或多候选未选择时，丢弃本次提交并让用户选口径；指标已解决且字段合法时，把解析证据转成可审计的 concept_resolutions 放行锁定——从机制上杜绝“历史案例替用户确认口径”的问题。"""
         if submit_args_list and not submission_blocked:
             args, _ = submit_args_list[-1]
 

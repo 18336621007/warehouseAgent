@@ -11,8 +11,8 @@ BASE = os.path.join(os.path.dirname(__file__), "..", "langgraph_app", "cache")
 INDEXES = {
     # "db":     os.path.join(BASE, "db_faiss_index"),
     # "table":  os.path.join(BASE, "table_faiss_index"),
-    # "column": os.path.join(BASE, "column_faiss_index"),
-    "example": os.path.join(BASE, "example_faiss_index"),
+    "column": os.path.join(BASE, "column_faiss_index"),
+    # "example": os.path.join(BASE, "example_faiss_index"),
     # "enriched": os.path.join(BASE, "enriched_faiss_index"),
     # "schema": os.path.join(BASE, "schema_faiss_index"),
 }
