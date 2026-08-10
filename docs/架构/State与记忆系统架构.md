@@ -158,7 +158,7 @@ agentTest/langgraph_app/state/
 |---|---|---|---|---|---|
 | `messages` | `Annotated[list[AnyMessage], add_messages]` | Capture、Advisor、Seeker | Planner、Advisor、GenerateSQL、Evaluator | 使用中 | 当前 Topic 的标准消息历史。节点只返回新增消息，由 `add_messages` 按消息 ID 合并。 |
 | `original_question` | `str` | Planner 首轮初始化 | Planner、Advisor、Seeker、Evaluator | 使用中 | 当前 Topic 的首轮原始问题，同一 Topic 后续澄清轮次保持不变。 |
-| `effective_query` | `str` | Planner | Planner、Advisor、GenerateSQL、Evaluator | 使用中 | Planner 每轮改写后的有效需求（需求基线），`original_question` 保留原文、本字段滚动更新。 |
+| `effective_query` | `str` | Planner | Planner、Advisor、GenerateSQL、Evaluator、build_final_answer | 使用中 | Planner 每轮改写后的有效需求（需求基线），`original_question` 保留原文、本字段滚动更新；`build_final_answer` 以它作为回答基准。 |
 | `current_user_input` | `str` | Web/CLI | Capture、Planner、Advisor | 使用中 | 用户本轮真实输入，每个 Request 都会更新，例如候选序号、确认词或修改意见。 |
 | `topic_status` | `TopicStatus` | Capture、Planner、Advisor、Seeker 各阶段节点 | Web、CLI、恢复与监控流程 | 使用中 | 描述 Topic 当前生命周期阶段。现有节点在完成后写入下一业务阶段，Web/CLI 使用终态判断是否创建新 Topic。 |
 | `topic_summary` | `str` | 后续摘要节点 | Planner、Advisor、问题改写节点 | 预留 | 对较早对话的压缩摘要，用于控制多轮消息 Token，不替代 `confirmed_plan`。 |
@@ -374,6 +374,8 @@ Advisor 的处理原则：
 Planner 使用 `get_last_ai_content(messages, "advisor")` 理解“1”“第二个”“好的”等短回答。
 
 ### 4.4 Seeker 消息写入
+
+最终回答以 `effective_query`（当前有效需求）为基准生成，已确认口径覆盖只保留 `confirmed_plan.measures` 中的指标，避免多轮追问后按话题首轮原文误判结果不完整。
 
 `build_final_answer_node` 将最终回答同时写入：
 

@@ -86,7 +86,8 @@ def build_build_final_answer_node(runtime):
     def build_final_answer_node(state: AgentState):
 
         sql_valid = state.get("sql_valid", False)
-        question = state.get("original_question", "")
+        # 回答基准使用当前有效需求，避免多轮追问后仍按话题首轮原文判断完整性
+        question = state.get("effective_query") or state.get("original_question", "")
         timer = start_timer()
 
         # 记录节点开始日志
@@ -145,14 +146,20 @@ def build_build_final_answer_node(runtime):
                 ("human", FINAL_ANSWER_HUMAN_TEMPLATE),
             ])
 
-            # 补充已确认指标口径，确保回答覆盖 SQL 返回的全部字段
+            # 补充已确认指标口径，只覆盖当前方案实际包含的指标，
+            # 避免历史口径（如退租/净增）被误认为本轮必须回答的字段
             answer_question = question
+            plan_measures = set((state.get("confirmed_plan") or {}).get("measures") or [])
             resolved_lines = []
             for resolution in ((state.get("analysis_spec") or {}).get("metric_resolutions") or []):
                 if (
                     resolution.get("status") == "resolved"
                     and resolution.get("mention")
                     and resolution.get("selected_field")
+                    and (
+                        not plan_measures
+                        or resolution.get("selected_field") in plan_measures
+                    )
                 ):
                     resolved_lines.append(
                         f"- {resolution.get('mention')}（字段：{resolution.get('selected_field')}）"
