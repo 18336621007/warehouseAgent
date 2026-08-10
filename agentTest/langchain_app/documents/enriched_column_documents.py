@@ -31,6 +31,7 @@ class EnrichedColumnDocumentsBuilder:
                 "table": f"{col.get('database_name', '')}.{col.get('table_name', '')}",
                 "column": col.get("column_name", ""),
                 "fields_type": fields_type,
+                "meta_source": col.get("meta_source", ""),
             }
         )
 

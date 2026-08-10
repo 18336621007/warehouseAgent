@@ -30,7 +30,7 @@ COMMON_KEYS = {
 
 # 每种事件优先展示的字段顺序
 KEY_BY_EVENT = {
-    "request.started": [],
+    "request.started": ["input"],
     "request.completed": ["result_type", "route", "topic_status", "node_count", "ms"],
     "request.failed": ["error_code", "error_message", "ms"],
     "node.started": ["question", "retry", "sql_valid", "sql"],

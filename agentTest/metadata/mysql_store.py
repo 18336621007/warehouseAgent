@@ -16,6 +16,18 @@ def _get_connection():
         database=cfg["database"],
         charset=cfg["charset"],
     )
+
+
+def _column_exists_in_table(cursor, table_name: str, column_name: str) -> bool:
+    """检查表是否存在某列，用于幂等升级表结构（兼容历史库）"""
+    cursor.execute(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+        (table_name, column_name)
+    )
+    return cursor.fetchone()[0] > 0
+
+
 def list_enriched_table_names():
     """返回 MySQL 中已有的表名集合，用于增量比对"""
     conn = _get_connection()
@@ -97,10 +109,22 @@ def init_metadata_tables():
                     field_aliases JSON,
                     sample_values JSON,
                     original_comment VARCHAR(500) DEFAULT '',
+                    meta_source VARCHAR(20) DEFAULT 'llm_enhanced',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+
+            # 兼容历史库：enriched_columns 补充 meta_source 列并回填来源标记
+            if not _column_exists_in_table(cursor, "enriched_columns", "meta_source"):
+                cursor.execute(
+                    "ALTER TABLE enriched_columns "
+                    "ADD COLUMN meta_source VARCHAR(20) DEFAULT 'llm_enhanced'"
+                )
+            cursor.execute(
+                "UPDATE enriched_columns SET meta_source = 'ddl_comment' "
+                "WHERE original_comment IS NOT NULL AND original_comment != ''"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -146,15 +170,16 @@ def save_column(full_key: str, database_name: str, table_name: str,
                 INSERT INTO enriched_columns
                     (full_key, database_name, table_name, column_name,
                      domain, fields_type, relations, field_aliases,
-                     sample_values, original_comment)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     sample_values, original_comment, meta_source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     domain = VALUES(domain),
                     fields_type = VALUES(fields_type),
                     relations = VALUES(relations),
                     field_aliases = VALUES(field_aliases),
                     sample_values = VALUES(sample_values),
-                    original_comment = VALUES(original_comment)
+                    original_comment = VALUES(original_comment),
+                    meta_source = VALUES(meta_source)
             """, (
                 full_key,
                 database_name,
@@ -166,6 +191,7 @@ def save_column(full_key: str, database_name: str, table_name: str,
                 json.dumps(data.get("field_aliases", []), ensure_ascii=False),
                 json.dumps(samples, ensure_ascii=False),
                 data.get("_original_comment", ""),
+                data.get("meta_source", ""),
             ))
         conn.commit()
     finally:
@@ -269,20 +295,34 @@ def load_enriched_databases():
         conn.close()
 
 
-# 简要注释：从 MySQL 加载字段级增强元数据，返回 [{full_key, database_name, table_name, column_name, fields_type, field_aliases, sample_values, relations, original_comment}]
+# 简要注释：从 MySQL 加载字段级增强元数据，返回 [{full_key, database_name, table_name, column_name, fields_type, field_aliases, sample_values, relations, original_comment, meta_source}]
 def load_enriched_columns():
     conn = _get_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT full_key, database_name, table_name, column_name, "
-                "fields_type, field_aliases, sample_values, relations, original_comment "
-                "FROM enriched_columns"
-            )
+            try:
+                cursor.execute(
+                    "SELECT full_key, database_name, table_name, column_name, "
+                    "fields_type, field_aliases, sample_values, relations, original_comment, meta_source "
+                    "FROM enriched_columns"
+                )
+                has_meta_source = True
+            except Exception:
+                # 兼容旧库未执行 ALTER 补列：回退旧查询，meta_source 由 original_comment 推导
+                conn.rollback()
+                cursor.execute(
+                    "SELECT full_key, database_name, table_name, column_name, "
+                    "fields_type, field_aliases, sample_values, relations, original_comment "
+                    "FROM enriched_columns"
+                )
+                has_meta_source = False
             rows = cursor.fetchall()
 
         result = []
         for row in rows:
+            meta_source = (row[9] or "") if has_meta_source else ""
+            if not meta_source:
+                meta_source = "ddl_comment" if (row[8] or "") else "llm_enhanced"
             result.append({
                 "full_key": row[0],
                 "database_name": row[1] or "",
@@ -293,6 +333,7 @@ def load_enriched_columns():
                 "sample_values": json.loads(row[6]) if row[6] else [],
                 "relations": json.loads(row[7]) if row[7] else [],
                 "original_comment": row[8] or "",
+                "meta_source": meta_source,
             })
         return result
     finally:
@@ -330,6 +371,7 @@ def init_evaluator_table():
             # 兼容旧表：补充缺失字段
             for col, col_def in [
                 ("resolved_question", "TEXT AFTER question"),
+                ("effective_query", "TEXT AFTER question"),
                 ("user_score", "FLOAT DEFAULT 75 AFTER llm_self_score"),
                 ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
                 ("example_hash", "VARCHAR(32) DEFAULT '' AFTER is_high_quality"),
@@ -363,6 +405,7 @@ def save_evaluated_dialogue(
     domain_tag: str = "",
     user_score: float = 75,
     example_hash: str = "",
+    effective_query: str = "",
 ):
     """保存一条评估后的对话记录，始终入库并返回 ID"""
     is_high_quality = 1 if comprehensive_score >= 80 else 0
@@ -371,12 +414,12 @@ def save_evaluated_dialogue(
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO evaluated_dialogues
-                    (question, resolved_question, final_sql, final_answer, tables_used, fields_used,
+                    (question, effective_query, resolved_question, final_sql, final_answer, tables_used, fields_used,
                      domain_tag, advisor_turns, total_time_ms, time_score, turn_score,
                      llm_self_score, user_score, comprehensive_score, is_high_quality, example_hash)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                question, resolved_question, sql, answer,
+                question, effective_query, resolved_question, sql, answer,
                 ",".join(tables_used) if tables_used else "",
                 ",".join(fields_used) if fields_used else "",
                 domain_tag, advisor_turns, total_time_ms, time_score, turn_score,
@@ -404,7 +447,7 @@ def update_user_score(dialogue_id: int, user_score: float):
             # 读取现有分数及 FAISS 同步所需字段
             cursor.execute(
                 """SELECT time_score, turn_score, llm_self_score, is_high_quality,
-                          example_hash, resolved_question, final_sql, final_answer,
+                          example_hash, effective_query, resolved_question, final_sql, final_answer,
                           tables_used, fields_used, domain_tag, comprehensive_score
                    FROM evaluated_dialogues WHERE id = %s""",
                 (dialogue_id,)
@@ -414,12 +457,13 @@ def update_user_score(dialogue_id: int, user_score: float):
                 return {}
             time_s, turn_s, llm_s, old_high = row[0], row[1], row[2], row[3]
             old_hash = row[4] or ''
-            old_q = row[5] or ''
-            old_sql = row[6] or ''
-            old_answer = row[7] or ''
-            old_tables = row[8] or ''
-            old_fields = row[9] or ''
-            old_domain = row[10] or ''
+            old_effective = row[5] or ''
+            old_q = row[6] or ''
+            old_sql = row[7] or ''
+            old_answer = row[8] or ''
+            old_tables = row[9] or ''
+            old_fields = row[10] or ''
+            old_domain = row[11] or ''
 
             # 用真实用户分重算综合分
             comprehensive = round(
@@ -448,6 +492,7 @@ def update_user_score(dialogue_id: int, user_score: float):
             "tables": [t.strip() for t in old_tables.split(",") if t.strip()] if old_tables else [],
             "fields": [f.strip() for f in old_fields.split(",") if f.strip()] if old_fields else [],
             "domain_tag": old_domain,
+            "effective_query": old_effective,
             "score": comprehensive,
         }
     finally:

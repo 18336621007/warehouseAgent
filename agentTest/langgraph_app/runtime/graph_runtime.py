@@ -6,7 +6,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.llm import LLM
 from agentTest.metadata.mysql_store import load_enriched_columns  # 加载字段类型映射
 from agentTest.metadata.mysql_store import init_evaluator_table  # 初始化 Evaluator 评估表
-from agentTest.langgraph_app.prompts.sql_generation_prompt import build_sql_generation_prompt  # 新增
+from agentTest.langgraph_app.prompts.sql_prompts import build_sql_generation_prompt
 from agentTest.langchain_app.app_builder import build_column_rag
 from agentTest.langchain_app.app_builder import build_db_rag
 from agentTest.langchain_app.app_builder import build_langchain_tools
@@ -36,24 +36,39 @@ def build_graph_runtime():
     tools = build_langchain_tools(
         meta_provider=metadata_provider,
     )
-    query_plan_schema_resolver = (
-        QueryPlanSchemaResolver(
-            metadata_provider=metadata_provider,
-        )
-    )
-
     llm = LLM()
 
-    # 从 MySQL 加载字段类型映射（度量/维度），供 generate_sql 生成聚合 SQL
+    # 从 MySQL 加载字段类型映射（度量/维度）与字段枚举值映射，供 generate_sql/Resolver 使用
+    import re as _re
+    _date_like = _re.compile(r"^\d{6,14}$|^\d{4}-\d{2}-\d{2}$|^\d{4}/\d{1,2}/\d{1,2}$")
     columns = load_enriched_columns()
     field_type_map = {}
+    sample_values_map = {}
+    sample_values_map_simple = {}
     for col in columns:
         key = f"{col['database_name']}.{col['table_name']}.{col['column_name']}"
         field_type_map[key] = col.get("fields_type", "dimension")
+        # 排除日期分区类采样值，只保留业务枚举
+        samples = [
+            str(v) for v in (col.get("sample_values") or [])
+            if str(v).strip() and not _date_like.match(str(v))
+        ]
+        if samples:
+            sample_values_map[key] = samples
+            for sample in samples:
+                if sample not in sample_values_map_simple.setdefault(col["column_name"], []):
+                    sample_values_map_simple[col["column_name"]].append(sample)
     # 同时建一个仅用 column_name 的兜底映射
     field_type_map_simple = {}
     for col in columns:
         field_type_map_simple[col["column_name"]] = col.get("fields_type", "dimension")
+
+    query_plan_schema_resolver = (
+        QueryPlanSchemaResolver(
+            metadata_provider=metadata_provider,
+            sample_values_map=sample_values_map,
+        )
+    )
 
     # 记录 runtime 初始化完成日志
     log_node_event("runtime", f"初始化完成, 日志: {get_log_file_path()}")
@@ -74,6 +89,8 @@ def build_graph_runtime():
         "tools": tools,
         "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}
         "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}
+        "sample_values_map": sample_values_map,  # 字段枚举值 {db.table.col: [values]}
+        "sample_values_map_simple": sample_values_map_simple,  # 兜底 {col: [values]}
         "semantic_metadata_provider": SemanticMetadataProvider(),  # join关系
     }
 

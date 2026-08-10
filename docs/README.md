@@ -156,7 +156,7 @@ Project/
 - LangGraph checkpoint 使用 `conversation_id:topic_id` 隔离 Topic。
 - Web/CLI 每轮只传身份字段和 `current_user_input`，业务状态由 `AgentState` 管理。
 - `messages + add_messages` 统一保存用户、Advisor、工具和 Seeker 消息。
-- `AnalysisSpec.pending_metric_clarification` 固化上一轮指标候选，Planner 在 LLM 前解析编号、字段名和中文含义。
+- `AnalysisSpec.pending_clarifications` 固化上一轮指标候选（clarification_id + options），Planner LLM 结合历史对话判断 `user_selection`，程序白名单校验后生成 `explicit_user`。
 - `topic_status` 已覆盖 new/clarifying/confirmed/generating_sql/validating_sql/executing/completed/failed，Web/CLI 使用终态创建新 Topic。
 - Planner 返回 `partial/none` 时，Advisor 先检索元数据并向用户追问；未确认口径由程序级指标歧义门禁在 `submit_query_plan → lock_query_plan` 之间拦截。
 - 需求完整或用户本轮解决歧义后，Advisor 直接调用 `submit_query_plan` 生成 `status=locked` 的完整方案。
@@ -243,8 +243,8 @@ FAISS（db / table / column / enriched / schema / example 六层索引）
 locked 方案 → 用户确认 → confirmed_plan
   ↓ QueryPlanSchemaResolver 精确校验库表字段并加载 Hive Schema
 用户查询 → SQL 生成 → 执行 → Evaluator 评分
-  ↓ >= 80 分 + 去重（hash + 余弦相似度）
-FAISS（example_faiss_index）→ 后续查询的 RAG Few-shot 示例
+  ↓ >= 80 分 + 按问题去重（原文 hash / 语义 ≥0.9 且表字段一致，高分优先）
+FAISS（example_faiss_index，原文召回）→ 后续查询的 RAG Few-shot 示例（effective_query 注入）
   ↓ 用户打分（1-5 星）
 MySQL 重算综合分 → is_high_quality 变化时 → FAISS 自动增删
 ```

@@ -3,6 +3,28 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+class UserSelection(BaseModel):
+    """Planner 对用户本轮选择的判断：判断归模型，程序只做白名单校验。"""
+
+    selected: bool = Field(
+        default=False,
+        description="用户是否在本轮完成了明确选择（仅当存在待澄清候选时）"
+    )
+
+    clarification_id: str = Field(
+        default="",
+        description="命中的待澄清候选 ID，必须来自【待澄清候选】段"
+    )
+
+    field: str = Field(
+        default="",
+        description="用户选中的物理字段名，必须逐字等于待澄清候选 options 中的 field"
+    )
+
+    reasoning: str = Field(
+        default="",
+        description="判断依据，引用用户原话，用于审计"
+    )
 
 class PlannerOutput(BaseModel):
     """Planner 对当前有效需求的模糊度分析结果。"""
@@ -61,6 +83,21 @@ class PlannerOutput(BaseModel):
         description="确认判断和模糊度判断的主要依据"
     )
 
+    user_selection: UserSelection = Field(
+        default_factory=UserSelection,
+        description="用户对上一轮候选的选择判断（无候选时不选）"
+    )
+
+    follow_up_mode: Literal[
+        "new_query",
+        "result_follow_up",
+        "plan_refinement",
+        "clarification_explanation",
+    ] = Field(
+        default="new_query",
+        description="连续问答类型：new_query=新查询/换话题，result_follow_up=引用上一轮结果追问，plan_refinement=沿用方案只改部分槽位，clarification_explanation=只询问口径区别"
+    )
+
 
 PLANNER_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，不要输出解释文字。
 
@@ -90,7 +127,10 @@ effective_query 必须表达用户当前真实查询需求。
 - 补充条件：合并到原需求
 - 局部修改：保留未修改部分，仅替换明确修改内容
 - 推翻方案：使用新目标，不继承旧错误需求
-- 用户回复序号、字母、简称时，必须结合 advisor_last_answer 还原完整含义
+- 用户回复序号、字母、简称时，必须结合【对话历史】和【待澄清候选】还原完整含义
+- 用户从候选口径中选定一个时，视为该指标口径已确认，effective_query 保留当前完整需求（含已确认的其他指标，如“新增订单数（全量）(分区维度) + 退租订单数 + 净增订单数”）
+- 用户明确表示“只要某指标”“不要某指标”时，才按用户要求增删对应指标口径
+- 用户明确表示“全部”“都要”时，明确保留全部指标口径
 
 例如：
 Advisor：
@@ -160,22 +200,43 @@ fields：
 - 提取用户提到的指标业务概念，如“新增订单”“成交金额”，只写业务概念不写物理字段名。
 - 存在多个候选口径时，指标概念保持不变，物理字段由 Advisor 检索和程序门禁统一解析。
 - 历史案例中的字段不能作为当前用户确认口径的证据，也不得写入 metric_mentions。
+- 用户本轮选定单一候选口径时，保留当前完整需求中的全部业务概念（已确认与未确认概念都保留）；只有用户明确放弃某概念时才删除。
 - 无法从自然语言中识别指标时返回空列表。
+
+【user_selection规则】
+只有存在【待澄清候选】时才需要判断用户是否选择了某个候选：
+- 用户回复编号、中文序号、字段名、中文含义或口语指代（如"净增那个"）时，判断其指向哪个候选，输出对应 field 和 clarification_id。
+- 用户在询问候选区别、解释含义、补充其他条件或闲聊时，selected 必须为 false。
+- 同时提到多个候选、指代不明或无法确定时，selected 必须为 false，宁可不选也不猜测。
+- field 必须逐字等于候选 options 中的物理字段名，找不到匹配必须 selected=false。
+- selected=true 时 reasoning 必须引用用户原话说明判断依据。
+
+【follow_up_mode规则】
+- new_query：全新需求或明显换话题（与当前需求无关）。
+- result_follow_up：用户引用上一轮查询结果（"第一名""这些经销商""刚才的结果"）。
+- plan_refinement：沿用当前方案只修改时间、过滤、维度、排序或指标中的部分内容。
+- clarification_explanation：用户只询问候选区别或解释，尚未做出选择。
 """
 
 
 PLANNER_USER_TEMPLATE = """
-【Topic 最初问题】
+【当前需求基线】
 {question}
-
-【用户本轮输入】
-{current_user_input}
 
 【当前查询方案】
 {confirmed_context}
 
-【Advisor 上一轮回复】
-{advisor_last_answer}
+【对话历史（最近 N 轮）】
+{history_context}
+
+【本轮用户输入】
+{current_user_input}
+
+【待澄清候选】
+{pending_options}
+
+【已确认口径】
+{resolution_context}
 
 【分层元数据检索结果】
 {metadata_context}
@@ -183,5 +244,3 @@ PLANNER_USER_TEMPLATE = """
 【历史相似问题】
 {example_context}
 """
-
-

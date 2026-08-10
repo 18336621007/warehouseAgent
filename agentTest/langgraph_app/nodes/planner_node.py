@@ -9,6 +9,7 @@
 from langchain.agents.middleware.todo import Todo
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
 from agentTest.langgraph_app.services.query_plan_service import confirm_query_plan
 from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
@@ -20,6 +21,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
+from agentTest.config.advisor import PER_TABLE_COLUMN_QUOTA
 from agentTest.config.planner import (
     TABLE_SEARCH_K,
     COLUMN_SEARCH_K,
@@ -28,6 +30,95 @@ from agentTest.config.planner import (
 )
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 
+
+def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
+    """把最近几轮 Human/AI 消息组装成对话历史文本，排除工具消息。"""
+    lines = []
+    for msg in (messages or [])[-max_turns * 2:]:
+        name = getattr(msg, "name", "") or ""
+        if isinstance(msg, HumanMessage):
+            role = "用户"
+        else:
+            role = f"助手({name})" if name else "助手"
+        content = str(msg.content or "")
+        if len(content) > max_chars_per_msg:
+            content = content[:max_chars_per_msg] + "..."
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _build_pending_options_text(pendings):
+    """把待澄清候选组装成精简文本，供 Planner 判断用户选择。"""
+    lines = []
+    for pending in pendings or []:
+        lines.append(f"[{pending.get('mention', '')} id={pending.get('clarification_id', '')}]")
+        for option in pending.get("options") or []:
+            lines.append(
+                f"{option.get('index')}. {option.get('meaning', '')}（字段：{option.get('field', '')}）"
+            )
+    return "\n".join(lines)
+
+
+def _build_table_scope(table_docs_with_scores, top_k: int = TABLE_SEARCH_K) -> list[str]:
+    """从表级召回结果提取表作用域（小写表名，按召回顺序），供字段级召回限定范围。"""
+    scope = []
+    for doc, _score in (table_docs_with_scores or [])[:top_k]:
+        name = str(doc.metadata.get("table", "")).strip().lower()
+        if name and name not in scope:
+            scope.append(name)
+    return scope
+
+
+def _recall_columns(column_vector_store, question: str, table_scope: list[str]) -> list:
+    """两段式字段召回：先在表作用域内逐表检索（每表按配额收敛），再全局检索兜底。
+
+    返回 (doc, distance) 列表：表作用域内字段在前，全局兜底字段在后；
+    兜底只补充不在表作用域内的字段，避免表级召回漏召导致真实字段丢失。
+    """
+    docs: list = []
+    seen = set()
+
+    def _key(doc) -> tuple:
+        metadata = doc.metadata or {}
+        field = metadata.get("column") or metadata.get("field") or ""
+        return (str(metadata.get("table", "")), str(field))
+
+    for table_name in table_scope:
+        try:
+            hits = column_vector_store.similarity_search_with_score(
+                question,
+                k=COLUMN_SEARCH_K,
+                filter={"table": table_name},
+                fetch_k=max(COLUMN_SEARCH_K * 5, 50),
+            )
+        except Exception:
+            # 单表检索异常不阻断整体召回
+            continue
+        for doc, distance in hits[:PER_TABLE_COLUMN_QUOTA]:
+            key = _key(doc)
+            if key in seen:
+                continue
+            seen.add(key)
+            docs.append((doc, distance))
+
+    try:
+        fallback = column_vector_store.similarity_search_with_score(
+            question,
+            k=COLUMN_SEARCH_K,
+        )
+    except Exception:
+        fallback = []
+    scope_set = set(table_scope)
+    for doc, distance in fallback:
+        table_name = str(doc.metadata.get("table", "")).strip().lower()
+        if table_name in scope_set:
+            continue
+        key = _key(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        docs.append((doc, distance))
+    return docs
 
 
 def build_planner_node(runtime):
@@ -132,9 +223,10 @@ def build_planner_node(runtime):
 
             retrieval_question = "\n".join(retrieval_parts)
 
-            # ── 步骤①：FAISS 检索增强元数据 ──
+            # ── 步骤①：FAISS 检索增强元数据（先召回表，再在召回表内召回字段）──
             table_docs_with_scores = table_vector_store.similarity_search_with_score(retrieval_question, k=TABLE_SEARCH_K)
-            column_docs_with_scores = column_vector_store.similarity_search_with_score(retrieval_question, k=COLUMN_SEARCH_K)
+            table_scope = _build_table_scope(table_docs_with_scores)
+            column_docs_with_scores = _recall_columns(column_vector_store, retrieval_question, table_scope)
 
             # 拼接元数据上下文：表层在前，字段层在后
             metadata_lines = []
@@ -192,7 +284,13 @@ def build_planner_node(runtime):
                 "metadata_context": metadata_context,
                 "example_context": example_context,
                 "confirmed_context": confirmed_context,
-                "advisor_last_answer": advisor_last_answer,
+                "history_context": _build_history_context(state.get("messages") or []),
+                "pending_options": _build_pending_options_text(
+                    (state.get("analysis_spec") or {}).get("pending_clarifications") or []
+                ),
+                "resolution_context": MetricClarificationService.build_resolution_context(
+                    state.get("analysis_spec") or {}
+                ),
             })
             planner_output = structured_llm.invoke(prompt_value)
 
@@ -214,12 +312,11 @@ def build_planner_node(runtime):
                     k=TABLE_SEARCH_K,
                 )
             )
-
-            ambiguity_column_docs_with_scores = (
-                column_vector_store.similarity_search_with_score(
-                    effective_query,
-                    k=COLUMN_SEARCH_K,
-                )
+            ambiguity_table_scope = _build_table_scope(ambiguity_table_docs_with_scores)
+            ambiguity_column_docs_with_scores = _recall_columns(
+                column_vector_store,
+                effective_query,
+                ambiguity_table_scope,
             )
 
 
@@ -323,6 +420,7 @@ def build_planner_node(runtime):
                                 "completeness": completeness,
                 "table_candidates": table_candidates,
                 "column_candidates": column_candidates,
+                "follow_up_mode": planner_output.follow_up_mode,
             }
 
             log_node_end(
@@ -348,11 +446,11 @@ def build_planner_node(runtime):
                 next_topic_status = "clarifying"
 
 
-            """
-            以下这段代码让 AnalysisSpec 从“每轮被 LLM 覆盖重建”变成“增量更新”：先确定性消费 pending，再保留上轮 resolved 证据，只补新概念的 ambiguous 记录，
-            并按概念是否存活正确清理/保留 pending——从状态层面消除“模型理解了、State 却还停在 ambiguous”导致的重复确认循环。
-            """
-            # ── 组装 AnalysisSpec：优先消费上一轮固定候选，避免短回答被 LLM 重写 ──
+            # 以下这段代码让 AnalysisSpec 从“每轮被 LLM 覆盖重建”变成“增量更新”：
+            # 模型判断用户选择（PlannerOutput.user_selection），程序只做白名单校验（validate_user_selection），
+            # 再保留上轮 resolved 证据，只补新概念的 ambiguous 记录，并按概念是否存活正确清理/保留 pending，
+            # 从状态层面消除“模型理解了、State 却还停在 ambiguous”导致的重复确认循环。
+            # ── 组装 AnalysisSpec：模型判断 + 程序白名单校验 + pending 生命周期 ──
 
             # 1. 读取上轮状态，建立索引
             existing_spec = state.get("analysis_spec") or {}
@@ -362,29 +460,48 @@ def build_planner_node(runtime):
                 for item in existing_resolutions
                 if isinstance(item, dict) and item.get("mention")
             }
-            pending_clarification = existing_spec.get("pending_metric_clarification") or {}
-
-            # 2. LLM 之前先确定性消费用户短回答
-            selected_resolution = MetricClarificationService.resolve_pending_selection(
-                current_user_input,
-                pending_clarification,
+            pending_clarifications = list(existing_spec.get("pending_clarifications") or [])
+            open_pending = next(
+                (p for p in pending_clarifications if p.get("status") == "open"),
+                None,
             )
+
+            # 2. 模型判断用户选择，程序白名单校验（判断归模型，校验归程序）
+            selected_resolution = None
+            if open_pending:
+                user_selection = (
+                    planner_output.user_selection.model_dump()
+                    if planner_output.user_selection
+                    else {}
+                )
+                selected_resolution = MetricClarificationService.validate_user_selection(
+                    user_selection,
+                    open_pending,
+                )
+
             # 3. 决定本轮的 metric_mentions
+            # 以 LLM 输出为基础；非换话题时保留上轮已确认(resolved)概念，
+            # 防止“选定单一候选口径”误删其他指标；换话题时完全信任 LLM 输出。
             metric_mentions = list(planner_output.metric_mentions or [])
+            if not metric_mentions:
+                metric_mentions = list(existing_spec.get("metric_mentions") or [])
+            elif planner_output.follow_up_mode != "new_query":
+                for existing_resolution in (existing_spec.get("metric_resolutions") or []):
+                    existing_mention = existing_resolution.get("mention", "")
+                    if (
+                        existing_mention
+                        and existing_resolution.get("status") == "resolved"
+                        and existing_mention not in metric_mentions
+                    ):
+                        metric_mentions.append(existing_mention)
             if selected_resolution is not None:
-                # 编号命中时沿用上轮业务概念，避免“第二个”产生新的指标名称。
+                # 白名单校验通过：模型聚焦结果优先，用户选定单一口径时可缩小概念集，
+                # 模型未输出新概念时沿用上轮业务概念，避免“第二个”产生新的指标名称。
                 selected_mention = selected_resolution.get("mention", "")
                 resolution_by_mention[selected_mention] = selected_resolution
-                metric_mentions = list(existing_spec.get("metric_mentions") or [])
                 if selected_mention and selected_mention not in metric_mentions:
                     metric_mentions.append(selected_mention)
-            elif not metric_mentions:
-                metric_mentions = list(existing_spec.get("metric_mentions") or [])
-            else:
-                pending_mention = pending_clarification.get("mention", "")
-                if pending_mention and pending_mention in effective_query:
-                    # 仍在补充同一业务概念时保留原始 mention 和候选顺序。
-                    metric_mentions = list(existing_spec.get("metric_mentions") or metric_mentions)
+
 
             # 4. 重建 metric_resolutions（保留已解析，新概念初始为 ambiguous）
             new_resolutions = []
@@ -418,24 +535,46 @@ def build_planner_node(runtime):
                 "metric_resolutions": new_resolutions,
             })
             if selected_resolution is not None:
-                analysis_spec.pop("pending_metric_clarification", None)
-            elif pending_clarification and pending_clarification.get("mention") in metric_mentions:
-                analysis_spec["pending_metric_clarification"] = pending_clarification
+                # 选择已通过白名单校验：pending 关闭并移出活动列表，解析证据保留在 metric_resolutions
+                analysis_spec["pending_clarifications"] = [
+                    p for p in pending_clarifications
+                    if p.get("clarification_id") != open_pending.get("clarification_id")
+                ]
+            elif open_pending and open_pending.get("mention") in metric_mentions:
+                # 概念仍存活且用户未选择：保留 open pending（延迟澄清恢复）
+                analysis_spec["pending_clarifications"] = pending_clarifications
             else:
-                analysis_spec.pop("pending_metric_clarification", None)
+                # 概念已不在需求中（换话题/推翻）：清理 pending
+                analysis_spec["pending_clarifications"] = []
 
-            # 6. 写回 State
+            # 6. 写回 State（首轮记录话题原文；每轮更新改写后的有效需求）
             return_value = {
                 "route": route,
                 "planner_reason": planner_reason,
-                "original_question": original_question,
+                "effective_query": effective_query,
                 "planner_entities": new_entities,
                 "topic_status": next_topic_status,
                 "analysis_spec": analysis_spec,
+                "follow_up_mode": planner_output.follow_up_mode,  # 供 web 层决定是否切 Topic
             }
+            # 首轮写入话题原始问题（后续轮保留原文，不覆盖）
+            if not state.get("original_question"):
+                return_value["original_question"] = current_user_input
             # 用户最终确认后，写回 status=confirmed 的查询方案
             if updated_plan is not None:
                 return_value["confirmed_plan"] = updated_plan
+
+            if open_pending:
+                log_sub_info(
+                    "用户选择校验: "
+                    + (
+                        f"命中 {selected_resolution.get('selected_field', '')}"
+                        if selected_resolution
+                        else "未选择/未命中（pending 保留或清理）"
+                    ),
+                    node_name="planner",
+                )
+            log_sub_info(f"follow_up_mode: {planner_output.follow_up_mode}", node_name="planner")
 
             return return_value
 

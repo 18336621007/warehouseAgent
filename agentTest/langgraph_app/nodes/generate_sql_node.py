@@ -14,7 +14,16 @@ from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
-from agentTest.langgraph_app.prompts.sql_audit_prompt import SQL_AUDIT_SYSTEM_PROMPT, SQL_AUDIT_HUMAN_TEMPLATE
+from agentTest.langgraph_app.prompts.sql_prompts import (
+    SQL_AUDIT_HUMAN_TEMPLATE,
+    SQL_AUDIT_SYSTEM_PROMPT,
+    SQL_COMPLEX_HUMAN_TEMPLATE,
+    SQL_COMPLEX_SYSTEM_PROMPT,
+    SQL_CONSISTENCY_FIX_HUMAN_TEMPLATE,
+    SQL_CONSISTENCY_FIX_SYSTEM_PROMPT,
+    SQL_FIX_HUMAN_TEMPLATE,
+    SQL_FIX_SYSTEM_PROMPT,
+)
 
 MAX_CONSISTENCY_RETRIES = 2  # 方案一致性校验最多重试次数
 
@@ -24,7 +33,7 @@ def _format_examples(docs: list) -> str:
         return ""
     lines = ["【历史相似查询示例 —— 请重点关注 SQL 中的聚合方式、GROUP BY 维度、日期处理】"]
     for i, doc in enumerate(docs, 1):
-        q = doc.metadata.get("question", "")
+        q = doc.metadata.get("effective_query") or doc.metadata.get("question", "")
         s = doc.metadata.get("sql", "")
         tables = doc.metadata.get("tables", "[]")
         lines.append(f"\n示例{i}：")
@@ -313,7 +322,27 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     return issues
 
 
-def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer: str, llm) -> str:
+def _check_filter_enum_values(sql: str, enum_lookup_simple: dict) -> list:
+    """校验 SQL 过滤条件中的字符串字面量是否命中字段枚举值，防止模型猜测。"""
+    if not enum_lookup_simple:
+        return []
+    import re as _re
+    issues = []
+    pattern = _re.compile(
+        r"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'([^']+)'"
+    )
+    for match in pattern.finditer(sql or ""):
+        field = match.group(1)
+        value = match.group(2)
+        candidates = enum_lookup_simple.get(field, [])
+        if candidates and value not in candidates:
+            issues.append(
+                f"过滤条件 {field} = '{value}' 不在枚举值 {candidates} 中，请改为枚举内值"
+            )
+    return issues
+
+
+def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer: str, llm, enum_lookup_simple: dict = None) -> str:
     tables = confirmed_plan.get("tables", [])
     fields = confirmed_plan.get("fields", [])
     measures = confirmed_plan.get("measures", []) or confirmed_plan.get("fields", [])
@@ -327,6 +356,11 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
     programmatic_issues = _validate_sql_against_plan(sql, confirmed_plan)
     if programmatic_issues:
         return "; ".join(programmatic_issues)
+
+    # ── 过滤条件枚举值校验：字面量必须命中字段枚举，避免模型猜测 ──
+    enum_issues = _check_filter_enum_values(sql, enum_lookup_simple)
+    if enum_issues:
+        return "; ".join(enum_issues)
 
     # ── 构造逐表过滤描述 ──
     table_plans_desc = "\n".join(
@@ -467,8 +501,8 @@ def build_generate_sql_node(runtime):
             confirmed_section = "【已确认的分析方案 —— 以下规则必须严格遵守】\n" + "\n".join(parts)
 
 
-        # SQL 生成使用完整原始问题，避免使用“好的”等确认文本
-        question = state["original_question"]
+        # SQL 生成使用 Planner 改写后的完整有效需求，避免使用“好的”等确认文本
+        question = state.get("effective_query") or state.get("original_question", "")
         schema_context = state["schema_context"]
         # 从统一消息中获取最近一次Advisor确认描述
         advisor_last_answer = get_last_ai_content(
@@ -507,8 +541,8 @@ def build_generate_sql_node(runtime):
             complex_flag = confirmed_plan.get("complex", False)
             if complex_flag:
                 prompt = ChatPromptTemplate.from_messages([
-                    ("system", "你是面向 Hive 数仓的 SQL 专家。当前为复杂查询模式，多表时使用简短别名（a、b、t1、t2）。，可以使用窗口函数(ROW_NUMBER/RANK/DENSE_RANK)、子查询、CTE(WITH)等高级 SQL 特性。请根据已确认的方案信息和 schema 生成正确的 SQL。返回纯 SQL，不含解释和结尾分号。"),
-                    ("human", "用户问题：\n{question}\n\n{confirmed_section}\n\n相关 schema：\n{schema_context}\n\n{example_section}")
+                    ("system", SQL_COMPLEX_SYSTEM_PROMPT),
+                    ("human", SQL_COMPLEX_HUMAN_TEMPLATE),
                 ])
 
             if retry_count > 0 or sql_fix_reason:
@@ -517,8 +551,8 @@ def build_generate_sql_node(runtime):
 
                 previous_sql = state.get("generated_sql", "")
                 prompt = ChatPromptTemplate.from_messages([
-                    ("system", "你是一个面向 Hive 数仓场景的 SQL 助手。请根据用户问题、schema 信息和上一次 SQL 的错误原因，重新生成更符合 Hive 语法和约束的 SQL。返回纯 SQL，不要包含解释，也不要带结尾分号。"),
-                    ("human", "用户问题：\n{question}\n\n相关 schema 信息：\n{schema_context}\n\n上一次生成的 SQL：\n{previous_sql}\n\n所有已指出的错误原因：\n{sql_fix_reason}")
+                    ("system", SQL_FIX_SYSTEM_PROMPT),
+                    ("human", SQL_FIX_HUMAN_TEMPLATE),
                 ])
                 prompt_input["previous_sql"] = previous_sql
                 prompt_input["sql_fix_reason"] = sql_fix_reason
@@ -541,10 +575,12 @@ def build_generate_sql_node(runtime):
 
             # ── 方案一致性校验 ──
             consistency_retry = 0
+            enum_lookup_simple = runtime.get("sample_values_map_simple") or {}
             if confirmed_plan.get("table") or confirmed_plan.get("tables"):
                 while consistency_retry < MAX_CONSISTENCY_RETRIES:
                     inconsistency = _check_plan_consistency(
-                        generated_sql, confirmed_plan, advisor_last_answer, llm
+                        generated_sql, confirmed_plan, advisor_last_answer, llm,
+                        enum_lookup_simple=enum_lookup_simple,
                     )
                     if not inconsistency:
                         break
@@ -555,8 +591,8 @@ def build_generate_sql_node(runtime):
                                    consistency_fix=inconsistency[:80])
 
                     fix_prompt = ChatPromptTemplate.from_messages([
-                        ("system", "你是一个面向 Hive 数仓场景的 SQL 助手。请根据用户问题、schema 信息和方案不一致的原因，重新生成 SQL。返回纯 SQL，不要包含解释，也不要带结尾分号。"),
-                        ("human", "用户问题：\n{question}\n\n已确认的方案信息：\n{confirmed_section}\n\n相关 schema 信息：\n{schema_context}\n\n方案不一致的原因：\n{inconsistency}\n\n上次生成的 SQL：\n{previous_sql}\n\n提示：多表 JOIN 时所有字段必须加表别名前缀（如 dim_company_snapshot_day.company_name），参考字段来源表确认每个字段属于哪张表。")
+                        ("system", SQL_CONSISTENCY_FIX_SYSTEM_PROMPT),
+                        ("human", SQL_CONSISTENCY_FIX_HUMAN_TEMPLATE),
                     ])
                     fix_input = {
                         "question": question,

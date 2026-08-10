@@ -14,11 +14,18 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_tim
 from agentTest.langgraph_app.runtime.graph_logger import log_tools_called, log_example_retrieved, log_plan_locked, log_advisor_mode
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
 from agentTest.langgraph_app.prompts.advisor_prompt import ADVISOR_SYSTEM_PROMPT
-from agentTest.config.advisor import MAX_COLUMN_CHECK_RETRIES
+from agentTest.config.advisor import (
+    MAX_AMBIGUITY_CANDIDATES,
+    MAX_COLUMN_CHECK_RETRIES,
+)
 from langchain_core.messages import HumanMessage, AIMessage
 from agentTest.langgraph_app.services.query_plan_service import lock_query_plan
 from agentTest.langgraph_app.services.metric_ambiguity_validator import MetricAmbiguityValidator
 from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
+from agentTest.langgraph_app.services.candidate_reranker import (
+    build_candidate_reranker,
+    complete_selection,
+)
 
 
 
@@ -47,6 +54,65 @@ def _has_column_search_for_tables(messages, tables: list[str]) -> bool:
         if args.get("table")
     }
     return all(t in searched for t in tables)
+
+def _build_rerank_history(messages, max_turns=6) -> str:
+    """组装精选模型可见的对话历史（最近几轮 Human/AI 消息，排除工具消息）。"""
+    lines = []
+    for msg in (messages or [])[-max_turns * 2:]:
+        name = getattr(msg, "name", "") or ""
+        if isinstance(msg, HumanMessage):
+            role = "用户"
+        else:
+            role = f"助手({name})" if name else "助手"
+        content = str(msg.content or "")
+        if len(content) > 300:
+            content = content[:300] + "..."
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _freeze_reranked_options(result, reranker, history_text, effective_query, user_input) -> dict:
+    """对第一个未解析指标做模型受限精选并冻结编号；返回 {mention: options}。
+
+    精选/冻结失败时回退程序排序候选（complete_selection 保证下限），
+    澄清流程不中断且候选完整展示。
+    """
+    if result.resolved:
+        return {}
+    ambiguity = result.ambiguities[0] if (result.ambiguities or []) else None
+    if ambiguity is None:
+        return {}
+    mention = ambiguity.get("mention", "")
+    candidates = ambiguity.get("candidates") or []
+    if not candidates:
+        return {}
+    selected_fields, _reasoning = reranker(
+        mention, effective_query, history_text, user_input, candidates
+    )
+    if not selected_fields:
+        # 模型精选失败：回退程序排序前 RERANK_MIN_CANDIDATES 个
+        selected_fields = complete_selection(candidates, [])
+    options = MetricClarificationService.freeze_reranked_options(
+        ambiguity, selected_fields, candidates
+    )
+    if options:
+        result.clarification_options = options
+    return {mention: options}
+
+
+def _reuse_frozen_options(result, frozen_options_by_mention) -> None:
+    """把本轮预校验冻结的候选选项应用到门禁结果，保证编号与展示一致。"""
+    ambiguity = result.ambiguities[0] if (result.ambiguities or []) else None
+    if ambiguity is None:
+        return
+    mention = ambiguity.get("mention", "")
+    frozen = (frozen_options_by_mention or {}).get(mention)
+    if frozen:
+        result.clarification_options = list(frozen)
+    elif len(result.clarification_options) > MAX_AMBIGUITY_CANDIDATES:
+        # 冻结缺失（如预校验与提交门禁候选不一致）时兜底截断到展示上限
+        result.clarification_options = result.clarification_options[:MAX_AMBIGUITY_CANDIDATES]
+
 
 def _build_confirmation_message(plan: dict, semantic_labels: dict = None) -> str:
     """用locked_plan构造简洁确认消息：指标带中文含义与字段名，维度只列中文含义。"""
@@ -126,8 +192,9 @@ def _normalize_clarification_message(message: str) -> str:
     return "当前方案尚未锁定，以下内容仅用于继续核对：\n" + content
 
 
-def _extract_field_meaning(page_content: str) -> str:
-    """从字段元数据文本提取中文含义：优先原始备注，其次首个别名，避免展示长别名列表。"""
+def _extract_field_meaning(page_content: str, mark_alias: bool = False) -> str:
+    """从字段元数据文本提取中文含义：优先原始备注，其次首个别名，避免展示长别名列表。
+    mark_alias 为 True 时（面向用户展示）别名需标注为系统推断来源。"""
     for line in (page_content or "").splitlines():
         if line.startswith("原始备注:"):
             return line[len("原始备注:"):].strip()[:60]
@@ -135,7 +202,8 @@ def _extract_field_meaning(page_content: str) -> str:
         if line.startswith("别名:"):
             aliases = line[len("别名:"):].strip()
             if aliases:
-                return aliases.split("、")[0].strip()[:60]
+                first = aliases.split("、")[0].strip()[:60]
+                return f"系统推断别名：{first}" if mark_alias else first
     return ""
 
 
@@ -189,7 +257,9 @@ def _lookup_semantic_labels(runtime, plan: dict) -> dict:
             docs = column_vs.similarity_search_with_score(field, k=8)
             for doc, _ in docs:
                 if str(doc.metadata.get("column") or "").lower() == str(field).lower():
-                    labels["fields"][field] = _extract_field_meaning(doc.page_content or "")
+                    labels["fields"][field] = _extract_field_meaning(
+                        doc.page_content or "", mark_alias=True
+                    )
                     break
         except Exception:
             continue
@@ -217,6 +287,9 @@ def build_advisor_subgraph(runtime):
         column_vector_store=runtime["column_vector_store"],
     )
 
+    # 模型受限精选：程序召回真实候选后，由模型按用户意图挑选展示候选（程序白名单兜底）
+    reranker = build_candidate_reranker(llm)
+
     # 方案模式允许提交完整方案
     plan_agent = create_agent(
         llm,
@@ -242,7 +315,8 @@ def build_advisor_subgraph(runtime):
         # Planner 已将“1”“A”等短回答还原为完整有效需求
         planner_entities = state.get("planner_entities") or {}
         effective_query = (
-                planner_entities.get("effective_query")
+                state.get("effective_query")
+                or planner_entities.get("effective_query")
                 or state.get("original_question")
                 or state.get("current_user_input", "")
         )
@@ -253,6 +327,7 @@ def build_advisor_subgraph(runtime):
 
         # messages是当前Topic唯一的标准消息历史
         history = list(state.get("messages") or [])
+        history_text = _build_rerank_history(history)
         advisor_turns = state.get("advisor_turns", 0)
         is_first_advisor_turn = advisor_turns == 0
 
@@ -373,6 +448,77 @@ def build_advisor_subgraph(runtime):
         if metric_resolution_context:
             # 将程序已解析口径注入本轮上下文，避免 Advisor 再次依赖自然语言猜测。
             context_lines.extend(["", metric_resolution_context])
+
+        # 指标歧义门禁预校验：多候选未解决时先由模型受限精选候选并冻结编号，
+        # 再把候选事实注入上下文；LLM 决定怎么回答（问区别解释区别、闲聊简短回应），
+        # 程序只做字段白名单兜底与编号冻结
+        metric_mentions = current_spec.get("metric_mentions") or []
+        # 本轮冻结的候选选项（mention -> options），预校验与提交门禁共用，防止编号漂移
+        frozen_options_by_mention: dict[str, list[dict]] = {}
+        # 跨轮固化的 open pending：候选编号已在上一轮展示给用户，本轮必须复用同一份事实
+        open_pending = next(
+            (p for p in (current_spec.get("pending_clarifications") or [])
+             if p.get("status") == "open" and p.get("options")),
+            None,
+        )
+        if metric_mentions:
+            target_tables = list(dict.fromkeys(
+                list(current_plan.get("tables") or [])
+                + list(planner_entities.get("tables") or [])
+            ))
+            example_fields = []
+            for doc in examples:
+                raw_fields = doc.metadata.get("fields", "[]")
+                try:
+                    example_fields.extend(json.loads(raw_fields) or [])
+                except Exception:
+                    continue
+            pre_clarification_result = metric_validator.validate(
+                metric_mentions=metric_mentions,
+                planner_candidates=planner_entities.get("column_candidates") or [],
+                table_candidates=planner_entities.get("table_candidates") or [],
+                previous_resolutions=current_spec.get("metric_resolutions") or [],
+                target_tables=target_tables,
+                example_fields=example_fields,
+                truncate=False,
+            )
+            if not pre_clarification_result.resolved:
+                # 优先复用跨轮固化的 open pending 候选：用户上一轮看到的编号必须保持不变，
+                # 避免重新召回/精选导致编号漂移；无可用固化候选时才重新精选。
+                reused_pending = False
+                if open_pending:
+                    pending_mention = open_pending.get("mention", "")
+                    mention_matches = pending_mention and any(
+                        ambiguity.get("mention", "") == pending_mention
+                        for ambiguity in (pre_clarification_result.ambiguities or [])
+                    )
+                    frozen_options = [
+                        dict(option) for option in (open_pending.get("options") or [])
+                    ]
+                    if mention_matches and frozen_options:
+                        pre_clarification_result.clarification_options = frozen_options
+                        frozen_options_by_mention[pending_mention] = frozen_options
+                        reused_pending = True
+                if not reused_pending:
+                    # 无可用固化候选：模型受限精选 + 程序冻结编号（精选只影响展示，不产生解析证据）
+                    frozen_options_by_mention.update(_freeze_reranked_options(
+                        pre_clarification_result,
+                        reranker,
+                        history_text,
+                        effective_query,
+                        current_user_input,
+                    ))
+            if (
+                not pre_clarification_result.resolved
+                and pre_clarification_result.clarification_options
+            ):
+                context_lines.extend([
+                    "",
+                    "【候选口径（只读事实，禁止引用以下之外的字段）】",
+                    MetricClarificationService.build_candidate_facts(pre_clarification_result),
+                    "请根据用户本轮输入和对话历史决定如何回答：询问区别就解释区别，"
+                    "闲聊就简短回应，选择口径就继续确认；只能引用上述候选字段。",
+                ])
 
         msg_content = "\n".join(context_lines)
 
@@ -547,8 +693,7 @@ def build_advisor_subgraph(runtime):
         resolved_concept_resolutions = {}
 
         # 指标歧义门禁公共输入：AnalysisSpec 指标概念，供提交校验与澄清候选共用
-        current_spec = state.get("analysis_spec") or {}
-        metric_mentions = current_spec.get("metric_mentions") or []
+        # current_spec 在节点入口定义，metric_mentions 在预校验处定义，此处复用闭包变量
 
         def _metric_gate_inputs(submit_tables: list = None) -> tuple:
             """收集“候选应该优先看哪些表”和“历史案例偏爱哪些字段”两类信息，供指标门禁收敛候选顺序用——目标表决定候选范围，优秀案例只影响展示排序，二者都不产生用户口径证据。"""
@@ -583,22 +728,21 @@ def build_advisor_subgraph(runtime):
                 resolution_result = metric_validator.validate(
                     metric_mentions=metric_mentions,
                     planner_candidates=planner_entities.get("column_candidates") or [],
+                    table_candidates=planner_entities.get("table_candidates") or [],
                     previous_resolutions=current_spec.get("metric_resolutions") or [],
                     target_tables=metric_target_tables,
                     example_fields=metric_example_fields,
                     llm_resolutions=submitted_resolutions,
+                    truncate=False,
                 )
                 if not resolution_result.resolved:
-                    # 多候选且用户未选择：阻止锁定，程序生成候选选项并追问
+                    # 多候选且用户未选择：阻止锁定，程序生成候选选项并追问；
+                    # 复用本轮预校验冻结的编号，避免展示列表与用户看到的选项错位
                     ambiguity_result = resolution_result
+                    _reuse_frozen_options(ambiguity_result, frozen_options_by_mention)
                     log_node_event(
                         "advisor_agent",
                         f"指标歧义门禁拦截: {resolution_result.reason}",
-                    )
-                else:
-                    # 信任 LLM 提交的解析证据，转换为可审计 concept_resolutions
-                    resolved_concept_resolutions = metric_validator.to_plan_resolutions(
-                        resolution_result,
                     )
 
             proposed_plan = {
@@ -667,22 +811,41 @@ def build_advisor_subgraph(runtime):
             pre_result = metric_validator.validate(
                 metric_mentions=metric_mentions,
                 planner_candidates=planner_entities.get("column_candidates") or [],
+                table_candidates=planner_entities.get("table_candidates") or [],
                 previous_resolutions=current_spec.get("metric_resolutions") or [],
                 target_tables=metric_target_tables,
                 example_fields=metric_example_fields,
+                truncate=False,
             )
             if not pre_result.resolved:
-                # 程序生成澄清候选并覆盖 LLM 自由追问文本，避免口径名称被改写
+                # 复用本轮预校验冻结编号，避免展示列表与用户看到的选项错位
+                _reuse_frozen_options(pre_result, frozen_options_by_mention)
                 ambiguity_result = pre_result
 
-        elif submission_blocked:
-            plan_validation_error = "提交方案前未完成目标表字段检索"
-
         if ambiguity_result is not None:
-            # 程序生成的指标口径澄清选项，不展示 LLM 原文
-            final_answer = MetricClarificationService.build_clarification_message(
-                ambiguity_result
-            )
+            # 本轮提交过方案但门禁未通过 → 回退模板列候选；
+            # 否则优先使用 LLM 基于候选事实的回复，程序只做字段白名单兜底
+            if submit_args_list:
+                final_answer = MetricClarificationService.build_clarification_message(
+                    ambiguity_result
+                )
+            else:
+                llm_reply = str(getattr(last_msg, "content", "") or "").strip()
+                if llm_reply and MetricClarificationService.validate_field_references(
+                    llm_reply,
+                    ambiguity_result,
+                ):
+                    final_answer = llm_reply
+                else:
+                    # 引用候选外字段或空回复：回退模板，保证口径信息来自真实备注
+                    if planner_entities.get("follow_up_mode") == "clarification_explanation":
+                        final_answer = MetricClarificationService.build_clarification_explanation(
+                            ambiguity_result
+                        )
+                    else:
+                        final_answer = MetricClarificationService.build_clarification_message(
+                            ambiguity_result
+                        )
         elif locked_plan:
             # 只展示经过程序校验的 locked 方案
             # 确认消息附带真实元数据的中文含义（字段/表），避免只给名称

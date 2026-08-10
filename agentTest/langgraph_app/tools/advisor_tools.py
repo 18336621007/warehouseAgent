@@ -8,6 +8,65 @@ _db_vector_store = None
 _table_vector_store = None
 _column_vector_store = None
 
+# 增强元数据枚举缓存：{table_name: {column_name: [枚举值]}} 与 {column_name: [跨表枚举参考]}
+_ENRICHED_ENUM_INDEX = None
+_ENRICHED_ENUM_INDEX_SIMPLE = None
+# 日期分区类值（yyyyMMdd / yyyyMM / yyyy-MM-dd 等）不属于业务枚举，过滤避免误导
+_DATE_LIKE_PATTERN = None
+
+
+def _is_enum_candidate_value(value: str) -> bool:
+    """判断采样值是否可能是业务枚举值（排除日期分区/纯数字流水）。"""
+    global _DATE_LIKE_PATTERN
+    if _DATE_LIKE_PATTERN is None:
+        import re
+        _DATE_LIKE_PATTERN = re.compile(
+            r"^\d{6,14}$|^\d{4}-\d{2}-\d{2}$|^\d{4}/\d{1,2}/\d{1,2}$"
+        )
+    if not value or _DATE_LIKE_PATTERN.match(value):
+        return False
+    return True
+
+
+def _ensure_enum_index():
+    """惰性加载 enriched_columns 的枚举值索引（运行时只加载一次）。"""
+    global _ENRICHED_ENUM_INDEX, _ENRICHED_ENUM_INDEX_SIMPLE
+    if _ENRICHED_ENUM_INDEX is not None:
+        return
+    from agentTest.metadata.mysql_store import load_enriched_columns
+    index = {}
+    index_simple = {}
+    for col in load_enriched_columns():
+        table_name = col.get("table_name", "")
+        column_name = col.get("column_name", "")
+        samples = [
+            str(v) for v in (col.get("sample_values") or [])
+            if str(v).strip() and _is_enum_candidate_value(str(v))
+        ]
+        if table_name and column_name and samples:
+            index.setdefault(table_name, {})[column_name] = samples
+        if column_name:
+            for sample in samples:
+                if sample not in index_simple.setdefault(column_name, []):
+                    index_simple[column_name].append(sample)
+    _ENRICHED_ENUM_INDEX = index
+    _ENRICHED_ENUM_INDEX_SIMPLE = index_simple
+
+
+def _build_enum_hint(field: str, table: str = "") -> str:
+    """构造字段枚举提示：优先本表采样值，缺失时回退同名列其他表作为参考。"""
+    _ensure_enum_index()
+    field = str(field or "")
+    table_name = table.split(".")[-1] if "." in table else table
+    samples = (_ENRICHED_ENUM_INDEX or {}).get(table_name, {}).get(field, [])
+    if samples:
+        return "枚举值: " + "、".join(samples)
+    ref = (_ENRICHED_ENUM_INDEX_SIMPLE or {}).get(field, [])
+    # 参考值过多说明不是稳定业务枚举，避免刷屏误导
+    if ref and len(ref) <= 20:
+        return "枚举参考（来自其他表，需以本表实际数据为准）: " + "、".join(ref)
+    return ""
+
 
 def _extract_aliases_from_content(page_content: str) -> list[str]:
     """从字段检索文本中解析“别名: xxx、yyy”。"""
@@ -42,12 +101,14 @@ def search_column_candidates(question: str, table: str = "", k: int = None) -> l
     for doc, distance in docs_with_scores:
         metadata = doc.metadata or {}
         page_content = doc.page_content or ""
+        field = metadata.get("column", metadata.get("field", ""))
         candidates.append({
             "table": metadata.get("table", ""),
-            "field": metadata.get("column", metadata.get("field", "")),
+            "field": field,
             "semantic_type": metadata.get("fields_type", ""),
             "comment": page_content,
             "aliases": _extract_aliases_from_content(page_content),
+            "enum_hint": _build_enum_hint(field, metadata.get("table", "")),
             "score": float(round(1 - float(distance) / 2, 4)),
         })
     return candidates
@@ -100,7 +161,12 @@ def search_columns(question: str, table: str = "") -> str:
     lines = []
     for i, candidate in enumerate(candidates, 1):
         lines.append(f"--- 结果 {i} ---")
-        lines.append(candidate["comment"][:600])
+        comment = candidate["comment"][:600]
+        lines.append(comment)
+        # 字段无采样值时附加枚举提示，让模型从枚举值中选择而不是猜测
+        enum_hint = candidate.get("enum_hint", "")
+        if enum_hint and "采样值:" not in comment:
+            lines.append(enum_hint)
     return "\n".join(lines)
 
 

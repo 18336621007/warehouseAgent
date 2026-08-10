@@ -16,7 +16,7 @@ from agentTest.langgraph_app.message_utils import build_advisor_dialogue_context
 from agentTest.langgraph_app.runtime.graph_logger import (
     log_node_start, log_node_end, log_node_degraded, elapsed_ms, start_timer,
 )
-import hashlib
+from agentTest.langchain_app.vectorstores.example_vector_store import example_hash_id
 from agentTest.metadata.mysql_store import save_evaluated_dialogue, load_enriched_tables
 
 
@@ -38,6 +38,7 @@ def build_evaluator_node(runtime):
 
     def evaluator_node(state: AgentState):
         question = state.get("original_question", "")
+        effective_query = state.get("effective_query", "") or question
         route = state.get("route", "seeker")
         planner_reason = state.get("planner_reason", "")
         advisor_turns = state.get("advisor_turns", 0)
@@ -88,11 +89,11 @@ def build_evaluator_node(runtime):
             tables_used = confirmed_plan.get("tables", [])
             fields_used = confirmed_plan.get("fields", [])
 
-            resolved_question = str(question)
+            resolved_question = str(effective_query)
             if confirmed_plan.get("tables"):
                 tables_str = ", ".join(tables_used)
                 fields_str = ", ".join(fields_used)
-                resolved_question = f"{question}（确认方案: 表={tables_str}, 字段={fields_str}）"
+                resolved_question = f"{effective_query}（确认方案: 表={tables_str}, 字段={fields_str}）"
 
             enriched = load_enriched_tables()
             domain_tag = ""
@@ -104,9 +105,10 @@ def build_evaluator_node(runtime):
             # ── 步骤5：MySQL 始终入库，返回 ID 供用户后续打分 ──
             dialogue_id = None
             try:
-                example_hash = hashlib.md5((str(question) + str(generated_sql)).encode()).hexdigest()[:16]
+                example_hash = example_hash_id(question)
                 dialogue_id = save_evaluated_dialogue(
                     question=str(question),
+                    effective_query=effective_query,
                     resolved_question=resolved_question,
                     sql=str(generated_sql),
                     answer=str(final_answer),
@@ -135,7 +137,8 @@ def build_evaluator_node(runtime):
                 try:
                     # hash_id already computed above, reuse
                     example_vector_store.add_example(
-                        question=resolved_question,
+                        question=question,
+                        effective_query=effective_query,
                         sql=str(generated_sql),
                         answer=str(final_answer),
                         tables=tables_used,

@@ -226,13 +226,14 @@ def chat():
             "evaluator": {"score": ev_score, "self_score": ev_self} if ev_score else None,
         })
 
-        # ── 根据 Topic 终态管理下一次查数任务 ──
-        if topic_status in (
-                "completed",
-                "failed",
-                "cancelled",
+        # ── 根据本轮语义决定下一次查数任务 ──
+        # 追问类（plan_refinement / result_follow_up / clarification_explanation）沿用同一 Topic，
+        # 保留 confirmed_plan 与历史供下一轮识别；只有真正换话题(new_query)或异常终态才切 Topic。
+        follow_up_mode = result.get("follow_up_mode", "")
+        if topic_status in ("failed", "cancelled") or (
+                topic_status == "completed" and follow_up_mode == "new_query"
         ):
-            # 当前Topic已经结束，下一条消息创建独立Topic
+            # 当前Topic已结束或用户已换话题，下一条消息创建独立Topic
             session["_new_topic"] = True
 
         log_request_end(
@@ -270,6 +271,7 @@ def chat():
         try:
             log_request_start(
                 input_length=len(message),
+                input=message,
             )
 
             # Checkpoint读取也属于统一请求异常边界
@@ -389,6 +391,7 @@ def submit_score():
                             tables=result.get("tables", []),
                             fields=result.get("fields", []),
                             domain_tag=result.get("domain_tag", ""),
+                            effective_query=result.get("effective_query", ""),
                             score=result.get("score", 0),
                             is_high=result.get("is_high", False),
                         )

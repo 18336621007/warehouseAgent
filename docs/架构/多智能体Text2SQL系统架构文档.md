@@ -209,10 +209,10 @@ comprehensive_score = W_TIME * time_score + W_TURN * turn_score
 
 **优质对话存储**：
 - `comprehensive_score >= 80` → 标记 `is_high_quality = 1`
-- 生成 `example_hash`（MD5 of question + SQL），用于去重
-- **MySQL**：`evaluated_dialogues` 表存储完整记录
-- **FAISS**：`example_faiss_index` 存储向量化后的对话示例（`resolved_question` + `generated_sql`）
-- **去重机制**：hash 相同 或 余弦相似度 > 0.95 → 跳过写入
+- 生成 `example_hash`（MD5 of 规范化问题原文），用于按问题去重
+- **MySQL**：`evaluated_dialogues` 表存储完整记录（`question` 原文 + `effective_query` 改写需求 + `resolved_question` 确认方案）
+- **FAISS**：`example_faiss_index` 存储向量化后的对话示例（`question` 原文召回 + `effective_query` 注入）
+- **去重机制**：问题原文 hash 相同，或 余弦相似度 ≥ 0.9 且表/字段一致 → 合并（高分优先，低分不降级内容）
 - **用户评分联动**：用户打分变化 → 重算综合分 → `is_high_quality` 状态变化 → FAISS 自动增删
 - **非阻断边界**：Evaluator 位于 FinalAnswer 之后，LLM 自评、MySQL 或 FAISS 异常记录为 `node.degraded`，返回默认评估值，不得把已经完成的查询改成失败。
 
@@ -583,7 +583,7 @@ Advisor 给用户展示的内容统一由程序模板生成，LLM 原文不作�
 
 - **锁定方案指标收敛**：门禁通过后，`proposed_plan["measures"]` 用已解析的 `concept_resolutions` 字段收敛，候选指标不进入 `locked_plan`。
 - **确认消息不带候选**：`_build_confirmation_message` 只展示最终锁定的表、指标、维度、时间；即使锁定方案残留候选字段，展示层也会按 `concept_resolutions` 过滤，不出现编号选项或候选列表。
-- **字段中文含义用原始备注**：`_extract_field_meaning` 优先“原始备注”，无原始备注时才取首个别名，避免把整串别名（如“新增订单量、新订单数、当日新增订单…”）展示给用户。
+- **字段中文含义用原始备注**：`_extract_field_meaning` 优先“原始备注”，无原始备注时才取首个别名；面向用户展示（方案确认）时别名必须标注“系统推断别名”（`mark_alias=True`），避免把可能出错的增强元数据当作可信口径。
 - **表中文含义用表自带备注**：确认消息中的表描述读取 `original_comment`，不使用增强后的长备注。
 - **澄清选项简洁**：程序生成候选选项时只展示“一句中文含义（字段名）”，多表候选追加来源表短名，不使用 LLM 原文。
 - **候选排序**：相关性降序，优秀案例命中字段仅加权排序（`EXAMPLE_FIELD_BOOST`），不产生解析证据。
@@ -619,11 +619,11 @@ MetricAmbiguityValidator 再次拦截
 MetricAmbiguityValidator 生成候选
   ↓
 MetricClarificationService 固化 clarification_id + options
-  ↓ 写入 AnalysisSpec.pending_metric_clarification
-下一轮 Planner 先确定性解析用户输入
-  ↓
+  ↓ 写入 AnalysisSpec.pending_clarifications
+下一轮 Planner LLM 判断 user_selection（结合历史对话与待澄清候选）
+  ↓ 程序 validate_user_selection 白名单校验（field 命中 options、id 对齐）
 ConceptResolution(status=resolved, source=explicit_user)
-  ↓ 清理 pending
+  ↓ 清理 pending、effective_query 基线滚动更新（original_question 保留原文）
 Advisor 接收已确认指标上下文
   ↓
 程序按 resolved field 收敛 measures
@@ -643,7 +643,7 @@ lock_query_plan
 
 ### 18.3 当前限制
 
-当前 `pending_metric_clarification` 仍是单活动项，能够可靠处理紧接下一轮的编号，但还不能完整表达：
+当前 `pending_clarifications` 已支持单 open pending 的延迟澄清恢复，但还不能完整表达：
 
 - 用户先询问候选差异，数轮后才选择。
 - 同一 Topic 同时存在多个未解决澄清。

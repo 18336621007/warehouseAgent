@@ -1,4 +1,6 @@
-﻿from langchain_core.prompts import ChatPromptTemplate
+﻿import datetime
+
+from langchain_core.prompts import ChatPromptTemplate
 
 from langchain_core.messages import AIMessage
 
@@ -7,12 +9,62 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
+from agentTest.langgraph_app.prompts.final_answer_prompt import (
+    FINAL_ANSWER_HUMAN_TEMPLATE,
+    FINAL_ANSWER_SYSTEM_PROMPT,
+)
 from agentTest.langgraph_app.state.agent_state import AgentState
 
 
-def _build_answer_update(state, final_answer, topic_status):
-    # 将Seeker最终回答同时写入标准Topic消息记忆
+# 结果快照只保存预览与引用，避免把全量结果写入 checkpoint
+RESULT_PREVIEW_MAX_ROWS = 20
+RESULT_ENTITY_KEYS_MAX = 50
+
+
+def _build_result_snapshot(state, sql_result):
+    """查询成功后生成结构化结果快照（QueryResultSnapshot）：引用+预览+实体键。"""
+    columns = list((sql_result or {}).get("columns") or [])
+    rows = list((sql_result or {}).get("rows") or [])
+    row_count = (sql_result or {}).get("row_count", len(rows))
+
+    preview_rows = []
+    for row in rows[:RESULT_PREVIEW_MAX_ROWS]:
+        if isinstance(row, dict):
+            preview_rows.append(row)
+        else:
+            preview_rows.append(dict(zip(columns, row)))
+
+    confirmed_plan = state.get("confirmed_plan") or {}
+    dimensions = confirmed_plan.get("dimensions") or []
+    entity_field = dimensions[0] if dimensions else (columns[0] if columns else "")
+    entity_keys = []
+    if entity_field:
+        seen = set()
+        for row in preview_rows:
+            key = row.get(entity_field)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            entity_keys.append(str(key))
+            if len(entity_keys) >= RESULT_ENTITY_KEYS_MAX:
+                break
+
     return {
+        "result_id": f"{state.get('request_id', '')}:result",
+        "source_request_id": state.get("request_id", ""),
+        "confirmed_plan": confirmed_plan,
+        "columns": columns,
+        "preview_rows": preview_rows,
+        "row_count": row_count,
+        "result_summary": f"共 {row_count} 行，列：{', '.join(columns[:10]) or '无'}",
+        "entity_keys": entity_keys,
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _build_answer_update(state, final_answer, topic_status, extra_update=None):
+    # 将Seeker最终回答同时写入标准Topic消息记忆
+    update = {
         "final_answer": final_answer,
         "topic_status": topic_status,
         "messages": [
@@ -23,6 +75,9 @@ def _build_answer_update(state, final_answer, topic_status):
             )
         ],
     }
+    if extra_update:
+        update.update(extra_update)
+    return update
 
 
 def build_build_final_answer_node(runtime):
@@ -60,6 +115,14 @@ def build_build_final_answer_node(runtime):
             sql_result = state.get("sql_result", {})
             row_count = sql_result.get("row_count", 0) if isinstance(sql_result, dict) else 0
 
+            # 空结果与成功分支都刷新结果快照，避免旧结果被后续追问错误复用
+            snapshot = _build_result_snapshot(state, sql_result)
+            result_update = {
+                "last_query_result": snapshot,
+                "result_id": snapshot["result_id"],
+                "result_preview": snapshot["preview_rows"],
+            }
+
             if row_count == 0:
 
                 # 记录空结果分支日志
@@ -74,21 +137,33 @@ def build_build_final_answer_node(runtime):
                     state,
                     "SQL 已成功执行，但没有查询到符合条件的数据。",
                     "completed",
+                    extra_update=result_update,
                 )
 
             prompt = ChatPromptTemplate.from_messages([
-                (
-                    "system",
-                    "你是一个数据分析助手。请严格基于提供的 SQL 查询结果回答用户问题，不要编造信息。"
-                ),
-                (
-                    "human",
-                    "用户问题：\n{question}\n\nSQL 执行结果：\n{sql_result}"
-                )
+                ("system", FINAL_ANSWER_SYSTEM_PROMPT),
+                ("human", FINAL_ANSWER_HUMAN_TEMPLATE),
             ])
 
+            # 补充已确认指标口径，确保回答覆盖 SQL 返回的全部字段
+            answer_question = question
+            resolved_lines = []
+            for resolution in ((state.get("analysis_spec") or {}).get("metric_resolutions") or []):
+                if (
+                    resolution.get("status") == "resolved"
+                    and resolution.get("mention")
+                    and resolution.get("selected_field")
+                ):
+                    resolved_lines.append(
+                        f"- {resolution.get('mention')}（字段：{resolution.get('selected_field')}）"
+                    )
+            if resolved_lines:
+                answer_question = (
+                    f"{question}\n\n【已确认指标口径，回答时必须全部覆盖】\n"
+                    + "\n".join(resolved_lines)
+                )
             prompt_value = prompt.invoke({
-                "question": question,
+                "question": answer_question,
                 "sql_result": sql_result,
             })
 
@@ -106,6 +181,7 @@ def build_build_final_answer_node(runtime):
                 state,
                 final_answer,
                 "completed",
+                extra_update=result_update,
             )
         except Exception as error:
             # 记录节点异常日志

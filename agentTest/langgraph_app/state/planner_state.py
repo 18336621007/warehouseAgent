@@ -13,3 +13,6 @@ class PlannerState(BaseState, PlannerHandoffState, total=False):
 
     # Planner 负责检查方案并处理最终确认
     confirmed_plan: QueryPlan
+
+    # 连续问答类型：new_query / plan_refinement / result_follow_up / clarification_explanation
+    follow_up_mode: str

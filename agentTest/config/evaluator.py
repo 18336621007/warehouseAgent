@@ -1,10 +1,10 @@
 ﻿# Evaluator 评估模块配置 —— 评分权重、阈值、时间映射
 
 # 综合评分权重（总和 = 1.0）
-WEIGHT_TIME = 0.2       # 话题总耗时
-WEIGHT_TURNS = 0.2      # Advisor 追问轮次
-WEIGHT_LLM_SELF = 0.4   # LLM 自评（语义连贯性 + 需求满足度）
-WEIGHT_USER = 0.2       # 用户显式评分
+WEIGHT_TIME = 0.1       # 话题总耗时
+WEIGHT_TURNS = 0.1      # Advisor 追问轮次
+WEIGHT_LLM_SELF = 0.3   # LLM 自评（语义连贯性 + 需求满足度）
+WEIGHT_USER = 0.5       # 用户显式评分
 
 # 高质量对话阈值：≥ 此分数的对话入库作为示例
 HIGH_QUALITY_THRESHOLD = 80
@@ -44,3 +44,6 @@ def map_value_to_score(value, score_map):
         if value <= threshold:
             return score
     return score_map[-1][1]  # 兜底：取最后一档分数
+
+# 优秀案例语义去重阈值：余弦相似度 ≥ 此值且表/字段一致视为同一问题
+EXAMPLE_DEDUP_SIMILARITY = 0.9

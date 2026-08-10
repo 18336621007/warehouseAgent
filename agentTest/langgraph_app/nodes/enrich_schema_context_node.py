@@ -43,8 +43,8 @@ def build_enrich_schema_context_node(runtime):
                 # "columns": columns,
 
         # 匹配语义条目，拼接到上下文开头，让LLM优先参考
-        # 语义增强使用当前 Topic 的完整原始问题
-        question = state["original_question"]
+        # 语义增强使用 Planner 改写后的完整有效需求（原文可能是短指代）
+        question = state.get("effective_query") or state.get("original_question", "")
         matched_entries = match_semantic_entries(question)
         if matched_entries:
             semantic_context = format_semantic_context(matched_entries)

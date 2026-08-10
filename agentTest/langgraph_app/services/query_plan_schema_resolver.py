@@ -35,8 +35,9 @@ def _parse_table_identifier(
 
 def _format_table_schema(
     table_schema: dict,
+    sample_values_map: dict = None,
 ) -> str:
-    """将物理 Schema 格式化为 SQL 生成上下文。"""
+    """将物理 Schema 格式化为 SQL 生成上下文，含字段枚举值提示。"""
     database_name = table_schema.get(
         "database_name",
         "",
@@ -57,11 +58,17 @@ def _format_table_schema(
         data_type = column.get("type", "")
         comment = column.get("comment", "")
 
-        lines.append(
+        field_line = (
             f"- {column_name} | "
             f"{data_type} | "
             f"{comment}"
         )
+        samples = (sample_values_map or {}).get(
+            f"{database_name}.{table_name}.{column_name}", []
+        )
+        if samples:
+            field_line += f" | 枚举值: {'、'.join(str(v) for v in samples)}"
+        lines.append(field_line)
 
     return "\n".join(lines)
 
@@ -84,8 +91,10 @@ def _format_joins(joins: list[dict]) -> str:
 class QueryPlanSchemaResolver:
     """根据 confirmed_plan 解析当前单表物理 Schema。"""
 
-    def __init__(self, metadata_provider):
+    def __init__(self, metadata_provider, sample_values_map: dict = None):
         self.metadata_provider = metadata_provider
+        # {db.table.col: [枚举值]}，用于在 schema 上下文中提示枚举，避免模型猜测过滤值
+        self.sample_values_map = sample_values_map or {}
 
     def resolve(self, confirmed_plan: dict) -> dict:
         # Seeker 入口必须再次执行完整方案校验
@@ -201,7 +210,8 @@ class QueryPlanSchemaResolver:
             )
 
         schema_context = _format_table_schema(
-            table_schema
+            table_schema,
+            sample_values_map=self.sample_values_map,
         )
 
         return {
@@ -249,7 +259,10 @@ class QueryPlanSchemaResolver:
                 )
 
             schema_parts.append(
-                _format_table_schema(table_schema)
+                _format_table_schema(
+                    table_schema,
+                    sample_values_map=self.sample_values_map,
+                )
             )
 
             available_fields = {

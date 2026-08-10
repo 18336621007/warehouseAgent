@@ -120,6 +120,8 @@ def _enrich_columns(meta_provider, datasource, llm):
                 "relations": parsed.get("relations", []),
                 "field_aliases": parsed.get("field_aliases", []),
                 "_original_comment": col_comment,
+                # 备注来源标记：有 DDL 原始备注为 ddl_comment，否则为 LLM 增强
+                "meta_source": "ddl_comment" if col_comment else "llm_enhanced",
             }
 
             # 标记该表有新增字段，后续表级增强需要重跑

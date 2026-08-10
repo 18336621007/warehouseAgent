@@ -9,6 +9,12 @@ from agentTest.config.advisor import (
     EXAMPLE_FIELD_BOOST,
     MAX_AMBIGUITY_CANDIDATES,
     MIN_CANDIDATE_SCORE,
+    PER_TABLE_COLUMN_QUOTA,
+    RERANK_MIN_CANDIDATES,
+)
+from agentTest.config.planner import (
+    COLUMN_SEARCH_K,
+    TABLE_SEARCH_K,
 )
 from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 
@@ -63,6 +69,8 @@ class MetricAmbiguityValidator:
         target_tables: list = None,
         example_fields: list = None,
         llm_resolutions: list = None,
+        table_candidates: list = None,
+        truncate: bool = True,
     ) -> ResolutionResult:
         """对每个指标概念计算解析结果：信任 LLM 提交的解析字段，程序只校验字段合法性。"""
         mentions = [m for m in (metric_mentions or []) if m and m.strip()]
@@ -92,6 +100,8 @@ class MetricAmbiguityValidator:
                 advisor_candidates=advisor_candidates,
                 target_tables=target_tables,
                 example_fields=example_fields,
+                table_candidates=table_candidates,
+                truncate=truncate,
             )
             previous = previous_map.get(mention)
             llm_resolution = llm_map.get(mention)
@@ -213,33 +223,72 @@ class MetricAmbiguityValidator:
         advisor_candidates: list = None,
         target_tables: list = None,
         example_fields: list = None,
+        table_candidates: list = None,
+        truncate: bool = True,
     ) -> list[dict]:
-        """收集真实元数据候选：向量库检索 + Planner/Advisor 候选，去重、收敛并排序。"""
+        """两段式召回真实元数据候选：先按目标表/表级候选确定表作用域（先召回表），
+        再在作用域表内逐表检索字段，最后全局字段检索兜底（再召回字段）；
+        再合并 Planner/Advisor 显式候选，去重、收敛并排序。"""
         raw_candidates: list[dict] = []
 
+        # 表作用域 = 目标表 + 表级召回 top-K（“先召回表”）
+        scoped_tables = list(dict.fromkeys(
+            str(item).strip().lower()
+            for item in (target_tables or [])
+            if str(item).strip()
+        ))
+        if table_candidates:
+            ordered_tables = sorted(
+                (
+                    item for item in table_candidates
+                    if isinstance(item, dict) and item.get("table")
+                ),
+                key=lambda item: float(item.get("score", 0) or 0),
+                reverse=True,
+            )
+            for item in ordered_tables:
+                table_name = str(item.get("table") or "").strip().lower()
+                if table_name and table_name not in scoped_tables:
+                    scoped_tables.append(table_name)
+        scoped_tables = scoped_tables[:TABLE_SEARCH_K]
+        scoped_set = set(scoped_tables)
+
         if self._column_vector_store is not None:
+            # 第二段①：表作用域内逐表检索字段，每表按配额收敛
+            for table_name in scoped_tables:
+                try:
+                    docs_with_scores = (
+                        self._column_vector_store.similarity_search_with_score(
+                            mention,
+                            k=COLUMN_SEARCH_K,
+                            filter={"table": table_name},
+                            fetch_k=max(COLUMN_SEARCH_K * 5, 50),
+                        )
+                    )
+                except Exception:
+                    # 单表检索异常不阻断门禁
+                    continue
+                for doc, distance in docs_with_scores[:PER_TABLE_COLUMN_QUOTA]:
+                    raw_candidates.append(self._doc_to_candidate(
+                        doc, distance, table_hit=True,
+                    ))
+
+            # 第二段②：全局字段检索兜底，避免表级召回漏召导致真实字段丢失
             try:
                 docs_with_scores = (
                     self._column_vector_store.similarity_search_with_score(
                         mention,
-                        k=8,
+                        k=COLUMN_SEARCH_K,
                     )
                 )
-                for doc, distance in docs_with_scores:
-                    metadata = doc.metadata or {}
-                    raw_candidates.append({
-                        "table": metadata.get("table", ""),
-                        "field": metadata.get(
-                            "column", metadata.get("field", "")
-                        ),
-                        "semantic_type": metadata.get("fields_type", ""),
-                        "comment": (doc.page_content or ""),
-                        "aliases": self._extract_aliases(doc.page_content or ""),
-                        "score": float(round(1 - float(distance) / 2, 4)),
-                    })
             except Exception:
-                # 向量库异常不阻断门禁，继续使用显式候选
-                pass
+                docs_with_scores = []
+            for doc, distance in docs_with_scores:
+                raw_candidates.append(self._doc_to_candidate(
+                    doc,
+                    distance,
+                    table_hit=str(doc.metadata.get("table", "")).strip().lower() in scoped_set,
+                ))
 
         # Planner 全局候选按指标概念词过滤，避免无关字段混入
         for candidate in planner_candidates or []:
@@ -257,6 +306,7 @@ class MetricAmbiguityValidator:
                 "comment": candidate.get("comment", ""),
                 "aliases": list(candidate.get("aliases") or []),
                 "score": float(candidate.get("score", 0) or 0),
+                "table_hit": str(candidate.get("table") or "").strip().lower() in scoped_set,
             })
 
         # Advisor 字段检索候选为按问题语义召回的候选，同样视为该概念候选
@@ -273,6 +323,7 @@ class MetricAmbiguityValidator:
                 "comment": candidate.get("comment", ""),
                 "aliases": list(candidate.get("aliases") or []),
                 "score": float(candidate.get("score", 0) or 0),
+                "table_hit": str(candidate.get("table") or "").strip().lower() in scoped_set,
             })
 
         # 度量优先；若全部被过滤则保留全部（兼容旧元数据缺少 fields_type）
@@ -285,12 +336,35 @@ class MetricAmbiguityValidator:
         else:
             matched = raw_candidates
 
-        # 目标表优先 + 优秀案例加权 + 分数下限 + 数量上限收敛，只展示最相关的少量候选
-        return self._rank_candidates(
+        # 表作用域优先 + 优秀案例加权 + 分数下限 + 每表配额 + 数量上限收敛
+        ranked = self._rank_candidates(
             self._deduplicate_candidates(matched),
             target_tables=target_tables,
             example_fields=example_fields,
+            truncate=truncate,
         )
+        log_metric_event(
+            "candidate_recall",
+            mention=mention,
+            table_scope_count=len(scoped_tables),
+            raw_candidates=len(raw_candidates),
+            ranked_candidates=len(ranked),
+        )
+        return ranked
+
+    def _doc_to_candidate(self, doc, distance: float, table_hit: bool) -> dict:
+        """把向量检索文档转成候选字典；距离转相似度分数，并标记是否命中表作用域。"""
+        metadata = doc.metadata or {}
+        page_content = doc.page_content or ""
+        return {
+            "table": metadata.get("table", ""),
+            "field": metadata.get("column", metadata.get("field", "")),
+            "semantic_type": metadata.get("fields_type", ""),
+            "comment": page_content,
+            "aliases": self._extract_aliases(page_content),
+            "score": float(round(1 - float(distance) / 2, 4)),
+            "table_hit": table_hit,
+        }
 
     @staticmethod
     def _extract_aliases(page_content: str) -> list[str]:
@@ -323,6 +397,10 @@ class MetricAmbiguityValidator:
             existing_aliases = set(existing.get("aliases") or [])
             existing_aliases.update(candidate.get("aliases") or [])
             existing["aliases"] = list(existing_aliases)
+            existing["table_hit"] = (
+                bool(existing.get("table_hit"))
+                or bool(candidate.get("table_hit"))
+            )
         result = list(merged.values())
         # 排序分数只用于候选排序，不产生任何解析证据
         result.sort(
@@ -336,34 +414,34 @@ class MetricAmbiguityValidator:
         candidates: list[dict],
         target_tables: list = None,
         example_fields: list = None,
+        truncate: bool = True,
     ) -> list[dict]:
-        """候选收敛：目标表优先、相似度下限过滤、数量上限截断。
+        """候选收敛：表作用域/目标表优先、相似度下限过滤、每表配额、数量上限截断。
 
         收敛不改变“多候选必须追问”语义：过滤后只剩 1 个但原始候选多于 1 个时，
         保留前 2 个继续追问，避免截断把歧义误判为唯一口径。
+        truncate=False 时返回精选前全量，供模型受限重排挑选展示候选。
         """
         target_set = {
             str(item).strip().lower()
             for item in (target_tables or [])
             if str(item).strip()
         }
-        if target_set:
-            # 目标表候选视为最相关；非目标表候选仅在目标表无候选时兜底
-            target_candidates = [
-                candidate for candidate in candidates
-                if str(candidate.get("table") or "").strip().lower() in target_set
-            ]
-            ranked = target_candidates if target_candidates else candidates
-        else:
-            ranked = list(candidates)
+
+        def _primary(item: dict) -> int:
+            """表作用域/目标表命中优先：命中=1，兜底=0。"""
+            if item.get("table_hit"):
+                return 1
+            table_name = str(item.get("table") or "").strip().lower()
+            return 1 if target_set and table_name in target_set else 0
 
         # 相似度下限：低于阈值视为不相关；过滤为空时回退全量，兼容无分数旧元数据
         filtered = [
-            candidate for candidate in ranked
+            candidate for candidate in candidates
             if float(candidate.get("score") or 0) >= MIN_CANDIDATE_SCORE
         ]
         if not filtered:
-            filtered = ranked
+            filtered = list(candidates)
 
         # 优秀案例命中字段排序加权：仅影响展示顺序，不产生解析证据
         example_set = {
@@ -371,17 +449,34 @@ class MetricAmbiguityValidator:
             for field in (example_fields or [])
             if str(field).strip()
         }
-        if example_set:
-            def _effective_score(item: dict) -> float:
-                # 优秀案例命中字段加排序权重，原始 score 保持不变
-                base = float(item.get("score") or 0)
-                if str(item.get("field") or "").lower() in example_set:
-                    return base + EXAMPLE_FIELD_BOOST
-                return base
 
-            filtered = sorted(filtered, key=_effective_score, reverse=True)
+        def _effective_score(item: dict) -> float:
+            base = float(item.get("score") or 0)
+            if example_set and str(item.get("field") or "").lower() in example_set:
+                return base + EXAMPLE_FIELD_BOOST
+            return base
 
-        truncated = filtered[:MAX_AMBIGUITY_CANDIDATES]
+        filtered.sort(
+            key=lambda item: (_primary(item), _effective_score(item)),
+            reverse=True,
+        )
+
+        # 每表配额：表作用域/目标表内字段每表最多保留 PER_TABLE_COLUMN_QUOTA 个，
+        # 防止单表字段占满候选名额；全局兜底字段不额外限配额
+        quota_counts: dict[str, int] = {}
+        ranked: list[dict] = []
+        for item in filtered:
+            if _primary(item) == 1:
+                table_name = str(item.get("table") or "").strip().lower()
+                if quota_counts.get(table_name, 0) >= PER_TABLE_COLUMN_QUOTA:
+                    continue
+                quota_counts[table_name] = quota_counts.get(table_name, 0) + 1
+            ranked.append(item)
+
+        if not truncate:
+            return ranked
+
+        truncated = ranked[:MAX_AMBIGUITY_CANDIDATES]
         # 多候选不允许被收敛成单候选，避免绕过用户确认
         if len(ranked) >= 2 and len(truncated) < 2:
             truncated = ranked[:2]

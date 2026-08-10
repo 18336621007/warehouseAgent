@@ -158,15 +158,16 @@ agentTest/langgraph_app/state/
 |---|---|---|---|---|---|
 | `messages` | `Annotated[list[AnyMessage], add_messages]` | Capture、Advisor、Seeker | Planner、Advisor、GenerateSQL、Evaluator | 使用中 | 当前 Topic 的标准消息历史。节点只返回新增消息，由 `add_messages` 按消息 ID 合并。 |
 | `original_question` | `str` | Planner 首轮初始化 | Planner、Advisor、Seeker、Evaluator | 使用中 | 当前 Topic 的首轮原始问题，同一 Topic 后续澄清轮次保持不变。 |
+| `effective_query` | `str` | Planner | Planner、Advisor、GenerateSQL、Evaluator | 使用中 | Planner 每轮改写后的有效需求（需求基线），`original_question` 保留原文、本字段滚动更新。 |
 | `current_user_input` | `str` | Web/CLI | Capture、Planner、Advisor | 使用中 | 用户本轮真实输入，每个 Request 都会更新，例如候选序号、确认词或修改意见。 |
 | `topic_status` | `TopicStatus` | Capture、Planner、Advisor、Seeker 各阶段节点 | Web、CLI、恢复与监控流程 | 使用中 | 描述 Topic 当前生命周期阶段。现有节点在完成后写入下一业务阶段，Web/CLI 使用终态判断是否创建新 Topic。 |
 | `topic_summary` | `str` | 后续摘要节点 | Planner、Advisor、问题改写节点 | 预留 | 对较早对话的压缩摘要，用于控制多轮消息 Token，不替代 `confirmed_plan`。 |
 | `topic_started_at` | `float` | 后续 Topic 初始化节点 | Evaluator、监控与超时处理 | 预留 | Topic 开始时间，计划使用 Unix 时间戳，用于计算完整 Topic 耗时。 |
 | `advisor_turns` | `int` | Advisor | Evaluator、前端或 CLI | 使用中 | Advisor 完成一次澄清回复后加一，用于评估澄清轮数和对话效率。 |
 | `confirmed_plan` | `QueryPlan` | Advisor、Planner | Planner、Seeker、GenerateSQL、Evaluator | 使用中 | 同一个键同时承载 `locked` 和 `confirmed` 两个阶段。Advisor 写入完整 `locked` 方案，Planner 在用户接受完整方案后写回 `confirmed` 方案；只有 `confirmed` 才允许进入 Seeker。 |
-| `analysis_spec` | `AnalysisSpec` | Planner、Advisor | Planner、Advisor、后续连续问答节点 | 使用中 | 保存指标概念、解析证据和当前 `pending_metric_clarification`。Planner 采用增量更新，不能因短回答重建后丢失已确认字段。 |
-| `last_query_result` | `QueryResultSnapshot` | 第13课 FinalAnswer 节点 | FollowUpAnalyzer、Planner | 规划中 | 保存上一轮结果引用、列、预览行、行数、实体键和 QueryPlan，用于“第一名”“这些”“刚才结果”等追问。 |
-| `pending_clarifications` | `list[PendingClarification]` | 第13课澄清服务 | Planner、Advisor、FollowUpAnalyzer | 规划中 | 将当前单 pending 升级为注册表，支持跨数轮保留、显式解决、取消和多 pending 冲突保护。 |
+| `analysis_spec` | `AnalysisSpec` | Planner、Advisor | Planner、Advisor、后续连续问答节点 | 使用中 | 保存指标概念、解析证据和 `pending_clarifications`。Planner 采用增量更新：模型判断 `user_selection` + 程序白名单校验，不能因短回答重建后丢失已确认字段。 |
+| `last_query_result` | `QueryResultSnapshot` | `build_final_answer` 节点 | FollowUpAnalyzer、Planner | 使用中 | 保存上一轮结果引用、列、预览行、行数、实体键和 QueryPlan，用于“第一名”“这些”“刚才结果”等追问。 |
+| `pending_clarifications` | `list[PendingClarification]` | Advisor、Planner、澄清服务 | Planner、Advisor、FollowUpAnalyzer | 使用中 | 候选创建时固化 `clarification_id` 与 options；用户未选择同一概念时复用 open pending，选择通过白名单校验后清空。多 pending 冲突保护第二阶段接入。 |
 | `follow_up_context` | `FollowUpContext` | 第13课连续问答分析 | Planner、Seeker | 规划中 | 标记新查询、结果追问、方案修改或口径解释，并记录引用结果和变化槽位。 |
 
 #### TopicStatus 可选值
@@ -432,7 +433,7 @@ flowchart TD
 
 ### 5.3 长期经验记忆
 
-Evaluator 将对话及评分写入 MySQL；达到高质量阈值的记录同步到 `example_faiss_index`。
+Evaluator 将对话及评分写入 MySQL；达到高质量阈值的记录同步到 `example_faiss_index`。示例按“问题”去重（精确 hash + 语义相似 ≥ 0.9 且表/字段一致），合并时高分优先；MySQL 保留原文（`question`）、改写需求（`effective_query`）与确认方案（`resolved_question`），FAISS 用原文召回、用 `effective_query` 注入 Few-shot。
 
 长期经验记忆不恢复某个 Topic 的运行状态，而是为未来新 Topic 提供 Few-shot 示例：
 
@@ -611,22 +612,29 @@ new → clarifying → confirmed → generating_sql
 `AnalysisSpec` 当前增加：
 
 ```python
-pending_metric_clarification = {
-    "clarification_id": "request-id",
-    "mention": "租赁中订单数量",
-    "options": [
-        {"index": 1, "field": "...", "table": "...", "meaning": "..."},
-        {"index": 2, "field": "...", "table": "...", "meaning": "..."},
-    ],
-}
+pending_clarifications = [
+    {
+        "clarification_id": "request-id",
+        "mention": "租赁中订单数量",
+        "question": "“租赁中订单数量”存在多个口径，请选择：",
+        "options": [
+            {"index": 1, "field": "...", "table": "...", "meaning": "..."},
+            {"index": 2, "field": "...", "table": "...", "meaning": "..."},
+        ],
+        "status": "open",
+        "created_request_id": "request-id",
+        "last_active_request_id": "request-id",
+        "resolved_value": {},
+    }
+]
 ```
 
-该结构解决的是“紧接下一轮回复编号”的稳定性：
+该结构解决的是“紧接下一轮回复编号”的稳定性，并支持延迟澄清恢复：
 
-- 首轮 Advisor 无论是否调用 `submit_query_plan`，候选都会写回 State。
-- Planner 在 LLM 前解析数字、中文序号、字段名和完整中文含义。
-- 编号以创建 pending 时的 options 为准，不受后续候选重排影响。
-- 命中后生成 `resolution_source=explicit_user` 并清理 pending。
+- 首轮 Advisor 无论是否调用 `submit_query_plan`，候选都会写回 State（`pending_clarifications`）。
+- 下一轮 Planner LLM 结合【对话历史】+【待澄清候选】判断 `user_selection`，程序 `validate_user_selection` 做白名单校验。
+- 编号以创建 pending 时的 options 为准，不受后续候选重排影响；用户未选择同一概念时复用原 open pending。
+- 校验通过后生成 `resolution_source=explicit_user` 并清理 pending。
 - Advisor 从 AnalysisSpec 读取 resolved 指标，LLM 漏传时仍可继续锁定方案。
 
 ### 14.2 为什么下一课不能只依赖 messages
