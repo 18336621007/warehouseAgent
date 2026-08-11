@@ -47,7 +47,7 @@ confirmed_plan → CoverageAnalyzer → JoinPlanner
 
 > "多表场景下，SQL 生成 prompt 中明确包含 JOIN 约束（关联表、关联键、JOIN 类型），LLM 只能按方案执行，不允许自创关联。校验环节增加了笛卡尔积检测和 JOIN 键匹配，用正则做轻量级 AST 分析，不引入额外依赖。"
 
-## 五、2026-08-04 当前架构补充
+## 五、当前架构补充
 
 本课链路已补充以下生产化规则：
 

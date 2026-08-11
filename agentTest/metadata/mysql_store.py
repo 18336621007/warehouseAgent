@@ -2,6 +2,13 @@
 import json
 import pymysql
 
+# 元数据变更事件类型（M3 审计，供 metadata_change_log 使用）
+EVENT_COLUMN_ADDED = "column_added"
+EVENT_COLUMN_MODIFIED = "column_modified"
+EVENT_COLUMN_REMOVED = "column_removed"
+EVENT_ENUM_REFRESHED = "enum_refreshed"
+EVENT_TABLE_RETIRED = "table_retired"
+
 from agentTest.db.db_config import get_mysql_config
 
 
@@ -125,6 +132,32 @@ def init_metadata_tables():
                 "UPDATE enriched_columns SET meta_source = 'ddl_comment' "
                 "WHERE original_comment IS NOT NULL AND original_comment != ''"
             )
+
+            # M2: schema 指纹同步状态表（表级指纹 + 字段级指纹）
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metadata_sync_state (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    database_name VARCHAR(100) NOT NULL,
+                    table_name VARCHAR(100) NOT NULL,
+                    table_fingerprint VARCHAR(64) DEFAULT '',
+                    column_fingerprints JSON,
+                    last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_db_table (database_name, table_name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            # M3: 元数据变更审计日志（可回放）
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metadata_change_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    event_type VARCHAR(32) NOT NULL,
+                    database_name VARCHAR(100) DEFAULT '',
+                    table_name VARCHAR(100) DEFAULT '',
+                    column_name VARCHAR(100) DEFAULT '',
+                    detail JSON,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -495,5 +528,118 @@ def update_user_score(dialogue_id: int, user_score: float):
             "effective_query": old_effective,
             "score": comprehensive,
         }
+    finally:
+        conn.close()
+
+
+# ── M2/M3: schema 指纹同步状态与变更审计 ─────────────────────────────
+def get_sync_state(database_name: str, table_name: str):
+    """读取某张表的指纹同步状态，不存在返回 None"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT table_fingerprint, column_fingerprints FROM metadata_sync_state "
+                "WHERE database_name = %s AND table_name = %s",
+                (database_name, table_name)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "table_fingerprint": row[0] or "",
+                "column_fingerprints": json.loads(row[1]) if row[1] else {},
+            }
+    finally:
+        conn.close()
+
+
+def get_all_sync_states() -> dict:
+    """返回全部指纹同步状态 {db.table: {table_fingerprint, column_fingerprints}}"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT database_name, table_name, table_fingerprint, column_fingerprints "
+                "FROM metadata_sync_state"
+            )
+            result = {}
+            for row in cursor.fetchall():
+                result[f"{row[0]}.{row[1]}"] = {
+                    "table_fingerprint": row[2] or "",
+                    "column_fingerprints": json.loads(row[3]) if row[3] else {},
+                }
+            return result
+    finally:
+        conn.close()
+
+
+def save_sync_state(database_name: str, table_name: str, table_fingerprint: str, column_fingerprints: dict):
+    """写入/更新某张表的指纹同步状态（upsert）"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO metadata_sync_state
+                    (database_name, table_name, table_fingerprint, column_fingerprints)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    table_fingerprint = VALUES(table_fingerprint),
+                    column_fingerprints = VALUES(column_fingerprints)
+            """, (
+                database_name, table_name, table_fingerprint,
+                json.dumps(column_fingerprints, ensure_ascii=False),
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_sync_state(database_name: str, table_name: str):
+    """删除某张表的指纹同步状态（表被废弃/移除时）"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM metadata_sync_state WHERE database_name = %s AND table_name = %s",
+                (database_name, table_name)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_metadata_changes(events: list):
+    """批量写入元数据变更审计事件（M3，可回放）"""
+    if not events:
+        return
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            for ev in events:
+                cursor.execute(
+                    "INSERT INTO metadata_change_log "
+                    "(event_type, database_name, table_name, column_name, detail) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        ev.get("event_type", ""),
+                        ev.get("database_name", ""),
+                        ev.get("table_name", ""),
+                        ev.get("column_name", ""),
+                        json.dumps(ev.get("detail", {}), ensure_ascii=False),
+                    )
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_enriched_column(full_key: str):
+    """删除某字段的增强数据（字段从 Hive 移除时清理）"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM enriched_columns WHERE full_key = %s", (full_key,))
+        conn.commit()
     finally:
         conn.close()

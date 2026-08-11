@@ -555,7 +555,7 @@ sequenceDiagram
 - [元数据与向量检索架构](./元数据与向量检索架构.md)
 - [后续课程规划](../课程/后续课程规划.md)
 
-## 十三、2026-08-04 State 契约同步
+## 十三、State 契约同步
 
 ### 13.1 QueryPlan 当前关键字段
 
@@ -607,7 +607,7 @@ new → clarifying → confirmed → generating_sql
 - `request_id` 用于同轮消息去重和日志关联。
 - `MemorySaver` 仅提供进程内恢复，不等于生产级持久化。
 - 未来持久化时应优先保存 QueryPlan、Topic 状态、关键消息摘要和元数据版本，Schema Context 与大结果集按需重建。
-## 十四、2026-08-05 指标 pending 与连续问答状态设计
+## 十四、指标 pending 与连续问答状态设计
 
 ### 14.1 当前已经实现的状态闭环
 
@@ -654,7 +654,7 @@ User：第二个
 
 如果只看最近一条 Advisor 消息，“第二个”可能已经没有显式候选文本；如果重新检索候选，排序也可能变化。因此延迟选择必须读取结构化 pending，而不是从消息历史恢复编号。
 
-### 14.3 第13课目标状态
+### 14.3 连续问答状态结构
 
 ```python
 class PendingClarification(TypedDict, total=False):
@@ -678,12 +678,8 @@ class QueryResultSnapshot(TypedDict, total=False):
     result_summary: str
     entity_keys: list[str]
 
-class FollowUpContext(TypedDict, total=False):
-    mode: str  # new_query / result_follow_up / plan_refinement / clarification_explanation
-    referenced_result_id: str
-    base_plan: dict
-    changed_slots: list[str]
-    resolved_question: str
+# 方案增量修改不引入 FollowUpContext 结构化状态：
+# Planner 结合【对话历史 + effective_query 需求基线】处理“换成近 7 天”“再加城市”等表达，评估后不再新增。
 ```
 
 ### 14.4 生命周期规则

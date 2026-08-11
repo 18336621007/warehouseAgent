@@ -75,6 +75,6 @@ Advisor 的 LLM 文本声称"当前方案已完整明确"，但日志显示 `loc
 
 BaseState 会被所有子图继承，包括 Seeker。Seeker 只负责执行已确认方案，不需要知道 Planner 的原始判定上下文。抽取独立契约只让 Planner 和 Advisor 感知，遵循接口隔离原则。
 
-## 七、2026-08-04 当前架构补充
+## 七、当前架构补充
 
 Handoff 修复后进一步完成确认协议收敛：Planner 的 accept_locked_plan 只负责把现有 locked 方案转为 confirmed；Advisor 必须在用户解决歧义的当前轮真实调用 submit_query_plan。未锁定时即使 LLM 输出完整方案，也会被标记为“仅用于继续核对”，禁止请求最终执行确认。

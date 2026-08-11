@@ -1,6 +1,6 @@
-﻿# 查看所有 FAISS 向量数据库内容
-# 用法: python -m agentTest.scripts.view_faiss
-import os, sys, json
+﻿# 查看 FAISS 向量数据库内容
+# 用法: python -m agentTest.scripts.view_faiss [--index db] [--index table] ...
+import os, sys, json, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
@@ -9,23 +9,30 @@ from langchain_community.vectorstores import FAISS
 BASE = os.path.join(os.path.dirname(__file__), "..", "langgraph_app", "cache")
 
 INDEXES = {
-    # "db":     os.path.join(BASE, "db_faiss_index"),
-    # "table":  os.path.join(BASE, "table_faiss_index"),
-    "column": os.path.join(BASE, "column_faiss_index"),
-    # "example": os.path.join(BASE, "example_faiss_index"),
+    # "db":       os.path.join(BASE, "db_faiss_index"),
+    "table":    os.path.join(BASE, "table_faiss_index"),
+    # "column":   os.path.join(BASE, "column_faiss_index"),
+    # "example":  os.path.join(BASE, "example_faiss_index"),
     # "enriched": os.path.join(BASE, "enriched_faiss_index"),
-    # "schema": os.path.join(BASE, "schema_faiss_index"),
+    # "schema":   os.path.join(BASE, "schema_faiss_index"),
 }
 
 
 def main():
+    parser = argparse.ArgumentParser(description="查看 FAISS 向量数据库内容")
+    parser.add_argument("--index", action="append", choices=list(INDEXES.keys()),
+                        help="只查看指定索引，可重复指定，默认查看全部")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("FAISS 向量数据库内容查看器")
     print("=" * 60)
 
     embedding = BailianEmbeddings()
 
-    for name, path in INDEXES.items():
+    targets = args.index or list(INDEXES.keys())
+    for name in targets:
+        path = INDEXES[name]
         if not os.path.exists(path) or not os.listdir(path):
             print(f"\n[{name}] 不存在或为空")
             continue
@@ -49,7 +56,8 @@ def main():
                 elif name == "db":
                     print(f"  [{i+1}] {doc.page_content[:120]}")
                 elif name == "table":
-                    print(f"  [{i+1}] 表={meta.get('table','?')}  {doc.page_content[:100]}")
+                    # 表文档完整打印（含原始备注等较长内容），避免截断误导排查
+                    print(f"  [{i+1}] 表={meta.get('table','?')}\n{doc.page_content}")
                 elif name == "column":
                     print(f"  [{i+1}] 字段={meta.get('column','?')}  {doc.page_content[:100]}")
                 else:

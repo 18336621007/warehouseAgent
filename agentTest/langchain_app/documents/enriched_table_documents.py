@@ -16,6 +16,7 @@ class EnrichedTableDocumentsBuilder:
             f"表名: {table_name}",
             f"所属领域: {table_data.get('domain', '')}",
             f"核心功能: {table_data.get('core_function', '')}",
+            f"原始备注: {table_data.get('original_comment', '')}",
             f"关键词: {', '.join(table_data.get('key_entities', []))}",
             f"适用场景: {', '.join(table_data.get('potential_use_cases', []))}",
         ]

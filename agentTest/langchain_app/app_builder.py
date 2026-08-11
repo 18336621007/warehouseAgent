@@ -60,7 +60,7 @@ def build_langchain_tools(meta_provider=None):
 
 
 # 简要注释：创建基于增强元数据的 Schema RAG 链，用于和原始版对比。
-def build_enriched_schema_rag_app(embedding, force_rebuild=False):
+def build_enriched_schema_rag_app(embedding, force_rebuild=False, return_stats=False):
     from agentTest.langchain_app.documents.enriched_schema_documents import EnrichedSchemaDocumentsBuilder
     from agentTest.langchain_app.retrievers.enriched_schema_retriever import EnrichedSchemaRetriever
 
@@ -69,51 +69,91 @@ def build_enriched_schema_rag_app(embedding, force_rebuild=False):
 
     # 优先从磁盘加载，不存在则从 MySQL 构建并落盘
     vector_store_manager = SchemaVectorStore(embedding)
-    vector_store = vector_store_manager.load_or_build(_CACHE_ENRICHED_DIR, documents, force_rebuild=force_rebuild)
+    loaded = vector_store_manager.load_or_build(
+        _CACHE_ENRICHED_DIR, documents, force_rebuild=force_rebuild, return_stats=return_stats
+    )
+    if return_stats:
+        vector_store, sync_stats = loaded
+    else:
+        vector_store = loaded
+        sync_stats = None
 
     retriever = EnrichedSchemaRetriever(vector_store)
 
-    return {
+    result = {
         "documents": documents,
         "vector_store": vector_store,
         "retriever": retriever,
     }
+    if sync_stats is not None:
+        result["sync_stats"] = sync_stats
+    return result
 
 
 # 简要注释：构建库级向量库，每库一个 Document
-def build_db_rag(embedding, force_rebuild=False):
+def build_db_rag(embedding, force_rebuild=False, return_stats=False):
     from agentTest.langchain_app.documents.enriched_db_documents import EnrichedDatabaseDocumentsBuilder
 
     document_builder = EnrichedDatabaseDocumentsBuilder()
     documents = document_builder.build_documents()
 
     vector_store_manager = SchemaVectorStore(embedding)
-    vector_store = vector_store_manager.load_or_build(_CACHE_DB_DIR, documents, force_rebuild=force_rebuild)
+    loaded = vector_store_manager.load_or_build(
+        _CACHE_DB_DIR, documents, force_rebuild=force_rebuild, return_stats=return_stats
+    )
+    if return_stats:
+        vector_store, sync_stats = loaded
+    else:
+        vector_store = loaded
+        sync_stats = None
 
-    return {"vector_store": vector_store, "documents": documents}
+    result = {"vector_store": vector_store, "documents": documents}
+    if sync_stats is not None:
+        result["sync_stats"] = sync_stats
+    return result
 
 
 # 简要注释：构建表级向量库，每表一个 Document
-def build_table_rag(embedding, force_rebuild=False):
+def build_table_rag(embedding, force_rebuild=False, return_stats=False):
     from agentTest.langchain_app.documents.enriched_table_documents import EnrichedTableDocumentsBuilder
 
     document_builder = EnrichedTableDocumentsBuilder()
     documents = document_builder.build_documents()
 
     vector_store_manager = SchemaVectorStore(embedding)
-    vector_store = vector_store_manager.load_or_build(_CACHE_TABLE_DIR, documents, force_rebuild=force_rebuild)
+    loaded = vector_store_manager.load_or_build(
+        _CACHE_TABLE_DIR, documents, force_rebuild=force_rebuild, return_stats=return_stats
+    )
+    if return_stats:
+        vector_store, sync_stats = loaded
+    else:
+        vector_store = loaded
+        sync_stats = None
 
-    return {"vector_store": vector_store, "documents": documents}
+    result = {"vector_store": vector_store, "documents": documents}
+    if sync_stats is not None:
+        result["sync_stats"] = sync_stats
+    return result
 
 
 # 简要注释：构建字段级向量库，每字段一个 Document
-def build_column_rag(embedding, force_rebuild=False):
+def build_column_rag(embedding, force_rebuild=False, return_stats=False):
     from agentTest.langchain_app.documents.enriched_column_documents import EnrichedColumnDocumentsBuilder
 
     document_builder = EnrichedColumnDocumentsBuilder()
     documents = document_builder.build_documents()
 
     vector_store_manager = SchemaVectorStore(embedding)
-    vector_store = vector_store_manager.load_or_build(_CACHE_COLUMN_DIR, documents, force_rebuild=force_rebuild)
+    loaded = vector_store_manager.load_or_build(
+        _CACHE_COLUMN_DIR, documents, force_rebuild=force_rebuild, return_stats=return_stats
+    )
+    if return_stats:
+        vector_store, sync_stats = loaded
+    else:
+        vector_store = loaded
+        sync_stats = None
 
-    return {"vector_store": vector_store, "documents": documents}
+    result = {"vector_store": vector_store, "documents": documents}
+    if sync_stats is not None:
+        result["sync_stats"] = sync_stats
+    return result

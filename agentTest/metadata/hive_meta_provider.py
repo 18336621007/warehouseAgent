@@ -37,6 +37,9 @@ class HiveMetadataProvider(BaseMetadataProvider):
 
     def list_tables(self, with_comment: bool = False):
         if self._tables_cache is not None:
+            # 缓存命中但请求表备注且缓存尚未填充时，补充表备注查询
+            if with_comment and any(not table.get("table_comment") for table in self._tables_cache):
+                self._fill_table_comments()
             return [dict(table) for table in self._tables_cache] #缓存命中返回拷贝，防止缓存被修改
 
         # 列出所有表
@@ -82,26 +85,44 @@ class HiveMetadataProvider(BaseMetadataProvider):
             cursor.close()
             conn.close()
 
-    def _fill_table_comments(self, cursor):
-        # 复用同一连接逐表解析表备注，失败静默降级为空
-        for table in self._tables_cache or []:
-            table_name = table["table_name"]
-            database_name = table["database_name"]
-            try:
-                cursor.execute(f"describe formatted {database_name}.{table_name}")
-                rows = cursor.fetchall()
-                comment = ""
-                for row in rows:
-                    parts = [str(x).strip() for x in row if x is not None and str(x).strip()]
-                    if not parts:
-                        continue
-                    # 兼容 Detailed Table Information 的 Comment: 与 Table Parameters 的 comment 键值行
-                    if parts[0].rstrip(":") in ("Comment", "comment"):
-                        comment = " ".join(parts[1:]).strip()
-                        break
-                table["table_comment"] = comment
-            except Exception:
+    @staticmethod
+    def _parse_table_comment(rows):
+        # 从 DESCRIBE FORMATTED 结果中解析表级备注（Detailed Table Information 的 Comment: 或 Table Parameters 的 comment 键值行）
+        for row in rows:
+            parts = [str(x).strip() for x in row if x is not None and str(x).strip()]
+            if not parts:
                 continue
+            if parts[0].rstrip(":") in ("Comment", "comment"):
+                comment = " ".join(parts[1:]).strip()
+                # 空注释不直接返回，继续查找（部分 Hive 版本 Detailed Table Information 的 Comment 为空但 Table Parameters 有值）
+                if comment:
+                    return comment
+        return ""
+
+    def _fill_table_comments(self, cursor=None):
+        # 逐表解析表备注，失败静默降级为空；未传入 cursor 时自行建立连接（供缓存命中后补注释）
+        conn = None
+        if cursor is None:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+        try:
+            for table in self._tables_cache or []:
+                table_name = table["table_name"]
+                database_name = table["database_name"]
+                # 复用 describe_table 已缓存的表备注，避免重复查询
+                cached = self._table_schema_cache.get(table_name)
+                if cached and cached.get("table_comment"):
+                    table["table_comment"] = cached["table_comment"]
+                    continue
+                try:
+                    cursor.execute(f"describe formatted {database_name}.{table_name}")
+                    table["table_comment"] = self._parse_table_comment(cursor.fetchall())
+                except Exception:
+                    continue
+        finally:
+            if conn is not None:
+                cursor.close()
+                conn.close()
 
     def describe_table(self, table_name: str):
         # 单表结构查询也要做白名单校验，避免绕过 list_tables 直接访问非白名单表
@@ -160,10 +181,18 @@ class HiveMetadataProvider(BaseMetadataProvider):
                     "nullable": None,
                     "partition_key": False,
                 })
+            # DESCRIBE 只返回列定义，表级备注需额外执行 DESCRIBE FORMATTED 解析
+            table_comment = ""
+            try:
+                cursor.execute(f"describe formatted {database_name}.{table_name}")
+                table_comment = self._parse_table_comment(cursor.fetchall())
+            except Exception:
+                pass
+
             res = {
                 "database_name": database_name,
                 "table_name": table_name,
-                "table_comment": "",
+                "table_comment": table_comment,
                 "table_type": "",
                 "columns": columns,
             }

@@ -1,6 +1,5 @@
 # 智能数仓助手 — 多智能体 Text2SQL 系统
 
-> 最后更新：2026-08-05
 > [查看完整文档索引](./文档索引.md)
 
 基于 LangGraph 的多智能体协同框架，将自然语言分析需求自动转换为 Hive SQL 并执行查询。
@@ -42,27 +41,14 @@ HIVE_USER=hive
 HIVE_DATABASE=default
 ```
 
-### 4. 初始化元数据
+### 4. 初始化元数据与向量索引（首次运行前）
 
 ```bash
-# 从 Hive 采集表结构并 LLM 增强 → 写入 MySQL（增量：已存在的跳过）
-python -m agentTest.metadata.metadata_enricher
+# 一键完成元数据采集、增强与向量索引同步（拆分命令见下方【常用操作】）
+python -m agentTest.scripts.sync_metadata
 ```
 
-### 5. 构建向量索引（MySQL → FAISS）
-
-```bash
-# 增量构建（已有缓存则跳过）
-python -m agentTest.scripts.build_indexes
-
-# 强制重建（删除所有缓存重新构建）
-python -m agentTest.scripts.build_indexes --force
-
-# 只重建指定索引
-python -m agentTest.scripts.build_indexes --target column
-```
-
-### 6. 启动
+### 5. 启动
 
 **CLI 模式**（终端对话）：
 
@@ -169,45 +155,79 @@ Project/
 
 ## 常用操作
 
-### 采集与增强元数据（Hive → MySQL）
+### 一键同步元数据与向量索引（推荐）
 
 ```bash
+python -m agentTest.scripts.sync_metadata [--force-table] [--force] [--skip-vector] [--dry-run]
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--force-table` | 强制重跑表级/库级增强并同步向量库，字段级复用 MySQL 现有结果不重新采样 |
+| `--force` | 强制重建向量索引（删除缓存重新 embedding） |
+| `--skip-vector` | 只更新 MySQL，不同步向量库 |
+| `--dry-run` | 只打印将执行的步骤，不实际执行 |
+
+### 仅采集与增强元数据（Hive → MySQL）
+
+```bash
+# 从 Hive 采集表结构并 LLM 增强 → 写入 MySQL（schema 指纹增量，未变化跳过）
 python -m agentTest.metadata.metadata_enricher
 ```
 
-### 构建向量索引（MySQL → FAISS）
+### 仅构建/同步向量索引（MySQL → FAISS）
 
 ```bash
-# 增量构建（已有缓存则跳过）
-python -m agentTest.scripts.build_indexes
-
-# 强制重建（删除所有缓存重新构建）
-python -m agentTest.scripts.build_indexes --force
-
-# 只重建指定索引
-python -m agentTest.scripts.build_indexes --target column
+python -m agentTest.scripts.build_indexes [--force] [--target {db,table,column,enriched}]
 ```
+
+| 参数 | 作用 |
+|---|---|
+| `--force` | 强制重建（删除所有缓存重新构建） |
+| `--target` | 只同步指定索引，取值 db / table / column / enriched |
+
+### 枚举采样刷新（内容变化才写库 + 更新 column 向量层）
+
+```bash
+python agentTest/scripts/refresh_enum_samples.py [--table 表名] [--column 字段名] [--refresh] [--skip-vector] [--dry-run]
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--table` | 只处理指定表名 |
+| `--column` | 只处理指定字段名 |
+| `--refresh` | 强制重新采样（默认只补采空 sample_values），内容变化才更新 MySQL 与向量 |
+| `--skip-vector` | 不同步 column 向量索引（只更新 MySQL） |
+| `--dry-run` | 只打印待处理清单，不写库 |
 
 ### 查看向量数据库内容
 
 ```bash
-python -m agentTest.scripts.view_faiss
+python -m agentTest.scripts.view_faiss [--index {db,table,column,example,enriched,schema}]
 ```
+
+| 参数 | 作用 |
+|---|---|
+| `--index` | 只查看指定索引，取值 db / table / column / example / enriched / schema，可重复指定，默认查看全部 |
 
 ### 查看日志
 
 ```bash
-# 列出最近 20 个请求（耗时、结果、节点数）
-python agentTest/scripts/trace_view.py list
+python agentTest/scripts/trace_view.py [--date 日期] [--no-color] <list|show|slow|filter|tail|nodeslow> [子命令参数]
+```
 
-# 按 request_id 前缀还原一次请求的树形调用链
-python agentTest/scripts/trace_view.py show <request_id前缀>
+| 子命令 | 参数 |
+|---|---|
+| `list` | 列出最近请求：`--limit N` 条数（默认 20） |
+| `show <trace_id>` | 渲染单个请求的树形调用链：`--full` 不截断长文本 |
+| `slow` | 按请求耗时排行：`--top N` 条数（默认 10） |
+| `filter` | 按条件过滤：`--event` 事件名、`--node` 节点名、`--request` request_id 前缀、`--topic` topic_id、`--error` error_id、`--keyword` 关键词、`--limit` 条数（默认 50）、`--full` 不截断 |
+| `tail` | 查看原始日志尾部：`--lines N` 行数（默认 20）、`--follow` 持续跟踪新增内容 |
+| `nodeslow` | 节点耗时排行：`--top N` 条数（默认 20） |
 
-# 实时跟踪最新日志
-python agentTest/scripts/trace_view.py tail --lines 50 --follow
+全局参数：`--date YYYY-MM-DD` 指定日志日期（默认读取当前文件）；`--no-color` 禁用彩色输出。
 
 完整字段、事件说明、错误编号定位和常见问题排查见 [日志使用与问题排查指南](./指南/日志使用与问题排查指南.md)。
-```
 
 ### 查看 MySQL 中的评估记录
 
@@ -222,13 +242,6 @@ FROM evaluated_dialogues WHERE is_high_quality = 1;
 
 -- 用户未打分的记录
 SELECT id, question FROM evaluated_dialogues WHERE user_score = 75;
-```
-
-### 清除向量数据库缓存（重新构建）
-
-```bash
-# 删除所有 FAISS 索引，下次启动自动重建
-python -m agentTest.scripts.build_indexes --force
 ```
 
 ## 数据流转
@@ -249,7 +262,7 @@ FAISS（example_faiss_index，原文召回）→ 后续查询的 RAG Few-shot �
 MySQL 重算综合分 → is_high_quality 变化时 → FAISS 自动增删
 ```
 
-## 2026-08-05 当前稳定架构
+## 当前架构
 
 当前系统已从“单表 Text2SQL 原型”演进为具备多轮澄清、安全多表规划、确定性降级和全链路审计能力的智能数仓助手。
 
@@ -279,7 +292,7 @@ Web / CLI 请求
 
 ### 当前能力边界
 
-- 当前只支持单个活动指标 pending；候选提出后隔数轮回复编号、多 pending 冲突消解和查询结果追问将在第13课实现。
+- 当前一次只澄清一个指标口径；候选提出后支持隔数轮回复编号（延迟澄清恢复），查询成功后支持基于结果追问；多 pending 冲突消解等能力经评估不再引入。
 - Checkpointer 仍为进程内 `MemorySaver`，服务重启后不能恢复 Topic。
 - 时间表达式的确定性 SQL 构造目前优先覆盖“昨天”场景，复杂时间范围继续走 LLM 修复链。
 - JoinPlanner 当前连接 QueryPlan 涉及表，尚未自动引入桥表或基于成本选择最优路径。
@@ -289,11 +302,11 @@ Web / CLI 请求
 
 - [大厂 AI 数据开发岗位简历项目](./求职/大厂AI数据开发岗位简历项目.md)
 - [项目面试问题、困难与参考答案](./求职/项目面试问题与参考答案.md)
-### 下一课：连续问答与延迟澄清恢复
+### 连续问答能力（第13课已实现）
 
-第13课将在现有架构上增加两类 Topic 级能力：
+现有架构已实现两类 Topic 级连续问答能力：
 
 - 查询完成后，用户可以继续问“第一名的业务经理是谁”“这些经销商里有几个正常状态”“换成最近 7 天”。
 - Advisor 给出候选后，用户可以先询问口径差异或修改其他条件，隔数轮再回复“第二个”。
 
-设计上使用 `QueryResultSnapshot + pending_clarifications + FollowUpContext`，不新增独立 Agent，也不把大结果和全部消息直接塞给 LLM。只有一个 open pending 时允许短编号直接命中；多个 pending 冲突时必须要求用户指定业务概念。
+设计上使用 `QueryResultSnapshot（last_query_result）+ pending_clarifications`，不新增独立 Agent，也不把大结果和全部消息直接塞给 LLM；`FollowUpContext` 等结构化跟进状态经评估不再引入。

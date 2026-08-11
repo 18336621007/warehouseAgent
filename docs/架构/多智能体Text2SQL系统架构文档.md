@@ -1,6 +1,6 @@
 # 多智能体 Text2SQL 系统架构文档
 
-> 最后更新：2026-08-05 | 指标跨轮确认闭环已完成，下一课进入连续问答与延迟澄清恢复
+> 最后更新：2026-08-11 | 指标跨轮确认闭环已完成；元数据支持 db.table 白名单、schema 指纹增量采集与向量库按唯一键增量同步
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -343,27 +343,9 @@ http://localhost:5000
 
 ---
 
-## 八、入口命令速查
+## 八、入口命令
 
-```bash
-# 元数据采集增强（Hive → MySQL，增量）
-python -m agentTest.metadata.metadata_enricher
-
-# 构建向量索引（MySQL → FAISS）
-python -m agentTest.scripts.build_indexes
-
-# 强制重建所有索引
-python -m agentTest.scripts.build_indexes --force
-
-# 查看向量库内容
-python -m agentTest.scripts.view_faiss
-
-# CLI 聊天
-python -m agentTest.langgraph_app.demo
-
-# Web 服务
-python web/server.py
-```
+启动与常用命令统一见 [README 快速开始与常用操作](../README.md)，避免命令清单多份维护导致与最新操作（如 `sync_metadata` 一键同步）不一致。
 
 ---
 
@@ -455,7 +437,7 @@ agentTest/
 - [State 与记忆系统架构](./State与记忆系统架构.md)
 - [元数据与向量检索架构](./元数据与向量检索架构.md)
 
-## 十六、2026-08-04 架构同步：确认协议与多表安全闭环
+## 十六、确认协议与多表安全闭环
 
 ### 16.1 Agent 职责边界
 
@@ -518,7 +500,7 @@ WHERE a.pt_dt = yesterday_expression
 
 ---
 
-## 十七、2026-08-05 架构同步：AnalysisSpec 与指标口径歧义门禁
+## 十七、AnalysisSpec 与指标口径歧义门禁
 
 ### 17.1 背景
 
@@ -595,7 +577,7 @@ Advisor 给用户展示的内容统一由程序模板生成，LLM 原文不作�
 | `MAX_AMBIGUITY_CANDIDATES` | 6 | 澄清候选数量上限 |
 | `MIN_CANDIDATE_SCORE` | 0.5 | 候选相似度下限，低于该分视为不相关 |
 | `EXAMPLE_FIELD_BOOST` | 0.1 | 优秀案例命中字段的排序加权，只影响展示顺序，不产生解析证据 |
-## 十八、2026-08-05 架构同步：指标跨轮确认闭环
+## 十八、指标跨轮确认闭环
 
 ### 18.1 原循环路径
 
@@ -641,35 +623,27 @@ lock_query_plan
 - Advisor Graph 只保留编排，澄清领域逻辑迁入 `MetricClarificationService`。
 - 日志 `answer_summary` 记录最终用户可见文本，而非被程序覆盖的 LLM 原始回复。
 
-### 18.3 当前限制
+### 18.3 连续问答落地结果
 
-当前 `pending_clarifications` 已支持单 open pending 的延迟澄清恢复，但还不能完整表达：
+- 用户先询问候选差异、数轮后再选择：已支持（单 open pending 延迟澄清恢复，候选编号创建时冻结）。
+- 查询成功后引用“第一名”“这些经销商”：已支持（对话历史 + `last_query_result` 结果快照）。
+- 基于上一轮 QueryPlan 只修改时间、过滤或维度：由 Planner 结合对话历史与 `effective_query` 需求基线处理，不引入 `FollowUpContext` 结构化状态。
+- 同一 Topic 同时存在多个未解决澄清：经评估不再引入（当前一次只澄清一个问题）。
 
-- 用户先询问候选差异，数轮后才选择。
-- 同一 Topic 同时存在多个未解决澄清。
-- 查询成功后引用“第一名”“这些经销商”“刚才结果”。
-- 基于上一轮 QueryPlan 只修改时间、过滤或维度。
-
-这些能力进入第13课。
-
-## 十九、第13课目标架构：连续问答与延迟澄清恢复
+## 十九、连续问答与延迟澄清恢复
 
 ### 19.1 不新增 Agent
 
-连续问答是在现有状态契约上的增强，不新增 FollowUp Agent。建议使用轻量服务或节点完成：
+连续问答在现有状态契约上实现，不新增 FollowUp Agent，由现有 Capture / Planner / Advisor / Seeker 链路完成：
 
 ```text
-Capture
+Capture → Planner（结合对话历史 + pending + last_query_result 判断 user_selection / follow_up_mode）
   ↓
-PendingClarificationResolver
-  ↓
-FollowUpAnalyzer
-  ↓
-Planner → Advisor / Seeker
+Advisor / Seeker
 ```
 
-- `PendingClarificationResolver` 先处理可确定的编号、字段名和中文含义。
-- `FollowUpAnalyzer` 判断本轮是结果追问、方案增量修改、候选解释还是新查询。
+- Planner LLM 结合【对话历史 + 待澄清候选 + 结果快照】判断 `user_selection` 与 `follow_up_mode`，程序 `validate_user_selection` 只做白名单校验，不写死编号/字段名解析规则。
+- 结果追问、方案增量修改、候选解释或新查询由 Planner 统一判断，不再单独拆 FollowUpAnalyzer。
 - Planner 继续负责形成完整有效需求和 AnalysisSpec。
 - Advisor 继续负责元数据核验与业务澄清。
 - Seeker 继续只执行 confirmed QueryPlan。
@@ -683,7 +657,7 @@ Planner → Advisor / Seeker
 - 返回列、有限预览行、总行数和结果摘要。
 - 可继续查询的实体键，例如 `company_id`。
 
-用户问“第一名的业务经理电话”时，系统先从快照定位第一名实体，再基于实体键补充查询；不能只把上一轮自然语言答案拼接给模型猜测。
+用户问“第一名的业务经理电话”时，系统结合对话历史与 `last_query_result` 快照定位第一名实体并补充查询；不能只把上一轮自然语言答案拼接给模型猜测。
 
 ### 19.3 延迟澄清
 
@@ -692,23 +666,13 @@ Planner → Advisor / Seeker
 - 每条记录有稳定 `clarification_id`、创建请求、候选快照和状态。
 - 用户询问选项差异时保持 `open`，不能误判为选择。
 - 只有一个 open pending 时，隔数轮回复“第二个”仍可直接命中。
-- 多个 open pending 时，单独编号必须安全拒绝，并要求指定业务概念。
+- 当前实现一次只澄清一个问题；多 open pending 冲突消解经评估不引入，仍保留“必须要求用户指定业务概念”的安全原则。
 - 新 Topic 与旧 Topic 状态严格隔离。
-- 过期策略必须配置化，不写死固定轮数。
+- pending 过期策略经评估不引入，当前不自动过期。
 
 ### 19.4 方案增量修改
 
-对“换成近 7 天”“再加城市”“改成净增订单”等表达，生成 `FollowUpContext`：
-
-```json
-{
-  "mode": "plan_refinement",
-  "referenced_result_id": "...",
-  "base_plan": {},
-  "changed_slots": ["time_range"],
-  "resolved_question": "查询近7天……"
-}
-```
+对“换成近 7 天”“再加城市”“改成净增订单”等表达，Planner 结合【对话历史 + `effective_query` 需求基线】判断，复用上一轮已确认 QueryPlan 的槽位，只修改用户变更的槽位；不引入 `FollowUpContext` 结构化状态。
 
 程序只继承未修改槽位；任何新指标仍要经过指标歧义门禁，不能因为来自上一轮计划就绕过。
 
