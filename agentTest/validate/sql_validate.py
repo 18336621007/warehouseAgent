@@ -1,8 +1,7 @@
-﻿import re
+import re
 
 from agentTest.db.hive_guardrails import (
-    ALLOWED_DATABASES,
-    ALLOWED_TABLES,
+    is_table_allowed,
     REQUIRE_LIMIT,
     ALLOW_JOIN,
     ALLOW_WITH,
@@ -100,17 +99,12 @@ def validate_hive_sql(sql: str) -> tuple[bool, str]:
     if not ALLOW_JOIN and re.search(r"\bJOIN\b", upper_sql):
         return False, "Hive 查询当前阶段不允许使用 JOIN"
 
-    # 限制访问的数据库必须在白名单中
+    # 限制访问的数据库和表必须在白名单中
     table_refs = re.findall(r"\b(?:FROM|JOIN)\s+([A-Z0-9_]+)\.([A-Z0-9_]+)", upper_sql)
     for db_name, table_name in table_refs:
         db_name_lower = db_name.lower()
         table_name_lower = table_name.lower()
-
-        if db_name_lower not in ALLOWED_DATABASES:
-            return False, f"Hive 查询访问了非白名单库: {db_name_lower}"
-
-        # 如果配置了白名单表，则要求只能访问这些表
-        if ALLOWED_TABLES and table_name_lower not in ALLOWED_TABLES:
-            return False, f"Hive 查询访问了非白名单表: {table_name_lower}"
+        if not is_table_allowed(table_name_lower, db_name_lower):
+            return False, f"Hive 查询访问了非白名单表: {db_name_lower}.{table_name_lower}"
 
     return True, "Hive SQL 校验通过"

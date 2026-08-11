@@ -92,22 +92,34 @@ def has_partition_filter(expression, partition_fields: list[str]) -> bool:
     return False
 
 
-def check_table_whitelist(expression, allowed_tables: list[str]):
-    # 校验 SQL 中使用的表是否都在白名单中
-    normalized_allowed_tables = {table.lower() for table in allowed_tables}
-    used_tables = extract_table_names(expression)
+def check_table_whitelist(expression, allow_table_fn=None, allowed_tables: list[str] | None = None):
+    # 校验 SQL 中使用的表是否都在白名单中（支持 db.table 精确判定）
+    used_tables = []
+    for table in expression.find_all(exp.Table):
+        db_name = (table.db or "").lower()
+        table_name = (table.name or "").lower()
+        if table_name:
+            used_tables.append((db_name, table_name))
 
-    for table_name in used_tables:
-        if table_name not in normalized_allowed_tables:
-            return False, f"SQL 使用了非白名单表: {table_name}"
+    for db_name, table_name in used_tables:
+        if allow_table_fn is not None:
+            if not allow_table_fn(table_name, db_name):
+                full = f"{db_name}.{table_name}" if db_name else table_name
+                return False, f"SQL 使用了非白名单表: {full}"
+        else:
+            normalized = {t.lower() for t in (allowed_tables or [])}
+            candidate = f"{db_name}.{table_name}" if db_name else table_name
+            if table_name not in normalized and candidate not in normalized:
+                return False, f"SQL 使用了非白名单表: {candidate}"
 
     return True, ""
 
 
 def validate_sql_ast_guardrails(
     sql: str,
-    allowed_tables: list[str],
-    partition_fields: list[str],
+    allow_table_fn=None,
+    allowed_tables: list[str] | None = None,
+    partition_fields: list[str] | None = None,
 ):
     # 1. 先做只读校验（AST 版）
     is_valid, message = is_read_only_ast(sql)
@@ -120,7 +132,7 @@ def validate_sql_ast_guardrails(
     except Exception as error:
         return False, f"SQL AST 解析失败: {error}"
 
-    is_valid, message = check_table_whitelist(expression, allowed_tables)
+    is_valid, message = check_table_whitelist(expression, allow_table_fn=allow_table_fn, allowed_tables=allowed_tables)
     if not is_valid:
         return False, message
 
@@ -130,7 +142,7 @@ def validate_sql_ast_guardrails(
     if has_select_star(expression):
         return False, "SQL 使用了 select *，存在宽表全列扫描风险"
 
-    if not has_partition_filter(expression, partition_fields):
+    if not has_partition_filter(expression, partition_fields or ["pt_dt"]):
         return False, "SQL 未包含时间/分区过滤条件，存在全表扫描风险"
 
     return True, ""

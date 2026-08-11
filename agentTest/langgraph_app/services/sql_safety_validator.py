@@ -7,8 +7,8 @@
 import re
 import sqlparse
 from sqlparse.sql import IdentifierList, Identifier, Where, Comparison
-from sqlparse.tokens import Keyword, DML, Name
-from agentTest.db.hive_guardrails import ALLOWED_TABLES, ALLOWED_DATABASES
+from sqlparse.tokens import Keyword, DML, Name, Punctuation
+from agentTest.db.hive_guardrails import is_table_allowed
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event, log_node_error
 
 
@@ -38,19 +38,17 @@ def validate_sql_safety(sql: str, hive_datasource=None) -> SafetyCheckResult:
             if d in sql_upper:
                 return SafetyCheckResult(False, f"禁止的操作: {d.strip()}", layer=1)
 
-        # 1b. 检查表在白名单
+        # 1b. 检查表在白名单（配置支持 db.table 精确匹配）
         tables_in_sql = _extract_tables(statement)
         for t in tables_in_sql:
+            db_name = t.split(".")[0] if "." in t else ""
             table_short = t.split(".")[-1] if "." in t else t
-            if table_short not in ALLOWED_TABLES and t not in ALLOWED_TABLES:
-                # Check if any allowed table is a substring
-                allowed = any(at in t or table_short in at for at in ALLOWED_TABLES)
-                if not allowed:
-                    return SafetyCheckResult(
-                        False,
-                        f"表 {t} 不在白名单中，允许的表: {ALLOWED_TABLES}",
-                        layer=1
-                    )
+            if not is_table_allowed(table_short, db_name):
+                return SafetyCheckResult(
+                    False,
+                    f"表 {t} 不在白名单中",
+                    layer=1
+                )
 
         # 1c. 检测笛卡尔积（逗号分隔多表）
         if _detect_cartesian(sql):
@@ -106,6 +104,20 @@ def _extract_tables(statement) -> list[str]:
     def _walk(token):
         nonlocal from_seen
         if token.is_group:
+            # ???? db.table ?????? from dim_trip.dim_company_snapshot_day a?
+            if from_seen:
+                parts = []
+                for t in token.tokens:
+                    if t.ttype is Name:
+                        parts.append(t.value.strip().strip("`\"'"))
+                    elif t.ttype is Punctuation and t.value == "." and parts:
+                        continue
+                    else:
+                        break
+                if len(parts) >= 2:
+                    tables.append(".".join(parts[:2]))
+                    from_seen = False
+                    return
             for t in token.tokens:
                 _walk(t)
             return

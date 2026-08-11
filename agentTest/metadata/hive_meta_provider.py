@@ -1,7 +1,10 @@
-﻿import copy
+import copy
+from collections import Counter
 
 from agentTest.db.hive_config import get_hive_config
-from agentTest.db.hive_guardrails import ALLOWED_TABLES, ALLOWED_DATABASES
+from agentTest.db.hive_guardrails import is_table_allowed
+from agentTest.db.metadata_scope import get_allowed_databases
+from agentTest.db.metadata_scope import is_allowed_table as _scope_is_allowed_table
 from agentTest.metadata.base_metadata_provider import BaseMetadataProvider
 from pyhive import hive
 
@@ -28,13 +31,11 @@ class HiveMetadataProvider(BaseMetadataProvider):
             auth=self.config["auth"]
         )
 
-    def _is_allowed_table(self, table_name: str):
-        # 当配置了表白名单时，只允许访问白名单内的表
-        if not ALLOWED_TABLES:
-            return True
-        return table_name in ALLOWED_TABLES
+    def _is_allowed_table(self, table_name: str, database_name: str = ""):
+        # 统一接入范围判定：配置白名单（metadata_scope）
+        return is_table_allowed(table_name, database_name)
 
-    def list_tables(self):
+    def list_tables(self, with_comment: bool = False):
         if self._tables_cache is not None:
             return [dict(table) for table in self._tables_cache] #缓存命中返回拷贝，防止缓存被修改
 
@@ -47,7 +48,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
             all_tables = []
 
             # 遍历所有白名单库，查询每个库下的表
-            for database_name in ALLOWED_DATABASES:
+            for database_name in get_allowed_databases():
                 sql = f"show tables in {database_name}"
                 cursor.execute(sql)
                 rows = cursor.fetchall()
@@ -60,32 +61,63 @@ class HiveMetadataProvider(BaseMetadataProvider):
                         "table_type": ""
                     })
 
+            # 统计同名表出现库数，用于裸表名白名单条目的唯一性判定（跨库同名需 db.table 精确指定）
+            name_occurrences = Counter(table["table_name"] for table in all_tables)
 
             # 在 metadata 层执行白名单过滤，避免上层拿到非白名单表
-            result = [table for table in all_tables if self._is_allowed_table(table["table_name"])]
+            result = [
+                table for table in all_tables
+                if _scope_is_allowed_table(
+                    table["table_name"], table["database_name"], table_name_occurrences=name_occurrences
+                )
+            ]
             self._tables_cache = result #缓存
+
+            # 可选：逐表 DESCRIBE FORMATTED 拿表备注（表多时较慢，默认关闭）
+            if with_comment:
+                self._fill_table_comments(cursor)
+
             return  [dict(table) for table in self._tables_cache]
         finally:
             cursor.close()
             conn.close()
 
+    def _fill_table_comments(self, cursor):
+        # 复用同一连接逐表解析表备注，失败静默降级为空
+        for table in self._tables_cache or []:
+            table_name = table["table_name"]
+            database_name = table["database_name"]
+            try:
+                cursor.execute(f"describe formatted {database_name}.{table_name}")
+                rows = cursor.fetchall()
+                comment = ""
+                for row in rows:
+                    parts = [str(x).strip() for x in row if x is not None and str(x).strip()]
+                    if not parts:
+                        continue
+                    # 兼容 Detailed Table Information 的 Comment: 与 Table Parameters 的 comment 键值行
+                    if parts[0].rstrip(":") in ("Comment", "comment"):
+                        comment = " ".join(parts[1:]).strip()
+                        break
+                table["table_comment"] = comment
+            except Exception:
+                continue
+
     def describe_table(self, table_name: str):
         # 单表结构查询也要做白名单校验，避免绕过 list_tables 直接访问非白名单表
-        if not self._is_allowed_table(table_name):
+        # 先定位表所属库名：缓存未初始化时先列出全部表
+        if self._tables_cache is None:
+            self.list_tables()
+        database_name = ""
+        for table in self._tables_cache:
+            if table["table_name"] == table_name:
+                database_name = table["database_name"]
+                break
+        if not database_name or not is_table_allowed(table_name, database_name):
             raise ValueError(f"table not allowed: {table_name}")
 
         if table_name in self._table_schema_cache:
             return copy.deepcopy(self._table_schema_cache[table_name])
-
-        # 先从 tables_cache 中找到表所属的库名，没有则遍历白名单库
-        database_name = self.config["database"]  # 兜底
-        if self._tables_cache:
-            for table in self._tables_cache:
-                if table["table_name"] == table_name:
-                    database_name = table["database_name"]
-                    break
-        if not database_name:
-            database_name = self.config["database"]
 
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -94,7 +126,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
             self._describe_table_query_cnt += 1
             # 用找到的库名尝试，失败则遍历所有白名单库重试
             last_error = None
-            databases_to_try = [database_name] + [db for db in ALLOWED_DATABASES if db != database_name]
+            databases_to_try = [database_name] + [db for db in get_allowed_databases() if db != database_name]
             for db_name in databases_to_try:
                 try:
                     sql = f"describe {db_name}.{table_name}"

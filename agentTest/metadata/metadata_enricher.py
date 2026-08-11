@@ -1,4 +1,4 @@
-﻿"""
+"""
 metadata_enricher.py — 基于 SQL-MARS 论文第四章/第五章的分层元数据自动构建脚本
 
 流程（自底向上反哺）：
@@ -19,7 +19,7 @@ import re
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.datasource.hive_datasource import HiveDataSource
 from agentTest.llm import LLM
-from agentTest.db.hive_guardrails import ALLOWED_DATABASES
+from agentTest.db.metadata_scope import get_allowed_databases
 from agentTest.metadata.mysql_store import (
     init_metadata_tables,
     column_exists, table_exists,
@@ -43,9 +43,9 @@ def _parse_json_response(response: str) -> dict:
 def _sample_column_values(datasource, database_name, table_name, column_name, limit=3):
     """对单个字段采样 N 条去重非空真实值"""
     sql = (
-        f"SELECT DISTINCT {column_name} "
+        f"SELECT {column_name} "
         f"FROM {database_name}.{table_name} "
-        f"WHERE {column_name} IS NOT NULL AND {column_name} != '' "
+        f"WHERE pt_dt = '20260810' AND {column_name} IS NOT NULL AND {column_name} != '' "
         f"LIMIT {limit}"
     )
     try:
@@ -219,9 +219,9 @@ def _enrich_tables(meta_provider, llm, enriched_columns, new_column_tables):
 def _enrich_databases(meta_provider, llm, enriched_tables):
     """自底向上增强：用表级增强结果反哺库级元数据"""
     result = {}
-    total_dbs = len(ALLOWED_DATABASES)
+    total_dbs = len(get_allowed_databases())
 
-    for idx, db_name in enumerate(ALLOWED_DATABASES):
+    for idx, db_name in enumerate(get_allowed_databases()):
         # 筛选属于该库的表
         db_tables = {
             k: v for k, v in enriched_tables.items()
