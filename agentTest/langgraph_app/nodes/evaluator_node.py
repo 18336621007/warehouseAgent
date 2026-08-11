@@ -4,7 +4,7 @@
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
 from agentTest.config.evaluator import (
     WEIGHT_TIME, WEIGHT_TURNS, WEIGHT_LLM_SELF, WEIGHT_USER,
     HIGH_QUALITY_THRESHOLD, DEFAULT_USER_SCORE,
@@ -28,6 +28,7 @@ def build_evaluator_node(runtime):
         base_url=get_openai_base_url(),
         model=get_model_name(),
         temperature=0,
+        extra_body=get_model_extra_body(),
     )
     structured_llm = llm.with_structured_output(EvaluatorSelfScore)
 

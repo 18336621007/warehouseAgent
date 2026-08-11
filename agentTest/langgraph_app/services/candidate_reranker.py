@@ -97,12 +97,14 @@ def build_candidate_reranker(llm=None) -> Callable:
             get_model_name,
             get_openai_api_key,
             get_openai_base_url,
+            get_model_extra_body,
         )
         llm = ChatOpenAI(
             api_key=get_openai_api_key(),
             base_url=get_openai_base_url(),
             model=get_model_name(),
             temperature=0,
+        extra_body=get_model_extra_body(),
         )
     structured_llm = llm.with_structured_output(ClarificationRerankOutput)
     prompt = ChatPromptTemplate.from_messages([

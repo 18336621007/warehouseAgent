@@ -9,7 +9,7 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from agentTest.langgraph_app.state.advisor_state import AdvisorState
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_timer, log_node_start, elapsed_ms, log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import log_tools_called, log_example_retrieved, log_plan_locked, log_advisor_mode
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
@@ -274,6 +274,7 @@ def build_advisor_subgraph(runtime):
         base_url=get_openai_base_url(),
         model=get_model_name(),
         temperature=0,
+        extra_body=get_model_extra_body(),
     )
 
     tools = build_advisor_tools(

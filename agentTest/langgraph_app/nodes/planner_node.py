@@ -12,7 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage
 from agentTest.langgraph_app.services.query_plan_service import confirm_query_plan
 from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
 from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_event
@@ -132,6 +132,7 @@ def build_planner_node(runtime):
         base_url=get_openai_base_url(),
         model=get_model_name(),
         temperature=0,                   # 判定任务不需要随机性
+        extra_body=get_model_extra_body(),
     )
     # with_structured_output：告诉 LLM 按 PlannerOutput 的格式返回 JSON
     structured_llm = chat_openai.with_structured_output(PlannerOutput)

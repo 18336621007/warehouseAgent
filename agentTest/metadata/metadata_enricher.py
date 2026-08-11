@@ -17,7 +17,7 @@ import os
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from agentTest.config.settings import get_model_name
+from agentTest.config.settings import get_model_name, get_model_extra_body
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.datasource.hive_datasource import HiveDataSource
 from agentTest.db.metadata_scope import get_allowed_databases
@@ -46,6 +46,7 @@ def _build_structured_llm(output_model):
     chat_openai = ChatOpenAI(
         model=get_model_name(),
         temperature=0,  # 元数据增强任务不需要随机性
+        extra_body=get_model_extra_body(),
     )
     return chat_openai.with_structured_output(output_model)
 
