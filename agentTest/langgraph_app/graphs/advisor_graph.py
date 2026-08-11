@@ -824,13 +824,13 @@ def build_advisor_subgraph(runtime):
                 ambiguity_result = pre_result
 
         if ambiguity_result is not None:
-            # 本轮提交过方案但门禁未通过 → 回退模板列候选；
-            # 否则优先使用 LLM 基于候选事实的回复，程序只做字段白名单兜底
+            # 需要用户选口径：默认用程序模板列选项，保证简洁稳定；
+            # 仅当用户明确询问口径区别（clarification_explanation）时才用 LLM 解释文案
             if submit_args_list:
                 final_answer = MetricClarificationService.build_clarification_message(
                     ambiguity_result
                 )
-            else:
+            elif planner_entities.get("follow_up_mode") == "clarification_explanation":
                 llm_reply = str(getattr(last_msg, "content", "") or "").strip()
                 if llm_reply and MetricClarificationService.validate_field_references(
                     llm_reply,
@@ -838,15 +838,14 @@ def build_advisor_subgraph(runtime):
                 ):
                     final_answer = llm_reply
                 else:
-                    # 引用候选外字段或空回复：回退模板，保证口径信息来自真实备注
-                    if planner_entities.get("follow_up_mode") == "clarification_explanation":
-                        final_answer = MetricClarificationService.build_clarification_explanation(
-                            ambiguity_result
-                        )
-                    else:
-                        final_answer = MetricClarificationService.build_clarification_message(
-                            ambiguity_result
-                        )
+                    # 引用候选外字段或空回复：回退模板说明口径区别，保证信息来自真实备注
+                    final_answer = MetricClarificationService.build_clarification_explanation(
+                        ambiguity_result
+                    )
+            else:
+                final_answer = MetricClarificationService.build_clarification_message(
+                    ambiguity_result
+                )
         elif locked_plan:
             # 只展示经过程序校验的 locked 方案
             # 确认消息附带真实元数据的中文含义（字段/表），避免只给名称
