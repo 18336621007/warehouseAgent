@@ -36,6 +36,13 @@ def _is_measure_candidate(candidate: dict) -> bool:
     return semantic_type == "measure" or "【度量】" in comment
 
 
+def _is_dimension_candidate(candidate: dict) -> bool:
+    """判断候选是否为维度字段：优先使用 semantic_type，兼容旧文本标记。"""
+    semantic_type = str(candidate.get("semantic_type") or "").lower()
+    comment = str(candidate.get("comment") or "")
+    return semantic_type == "dimension" or "【维度】" in comment
+
+
 def _mention_matches_candidate(mention: str, candidate: dict) -> bool:
     """指标概念与候选的关联判断：字段名、注释或别名包含该概念词。"""
     text = (mention or "").strip().lower()
@@ -71,11 +78,20 @@ class MetricAmbiguityValidator:
         llm_resolutions: list = None,
         table_candidates: list = None,
         truncate: bool = True,
+        dimension_mentions: list[str] = None,
     ) -> ResolutionResult:
-        """对每个指标概念计算解析结果：信任 LLM 提交的解析字段，程序只校验字段合法性。"""
-        mentions = [m for m in (metric_mentions or []) if m and m.strip()]
-        if not mentions:
-            return ResolutionResult(resolved=True, reason="无指标概念需要解析")
+        """对每个业务概念（指标/维度）计算解析结果：信任 LLM 提交的解析字段，程序只校验字段合法性。"""
+        concepts: list[tuple[str, str]] = []
+        for mention in (metric_mentions or []):
+            if mention and mention.strip():
+                concepts.append((mention.strip(), "metric"))
+        for mention in (dimension_mentions or []):
+            if mention and mention.strip() and mention.strip() not in {
+                item[0] for item in concepts
+            }:
+                concepts.append((mention.strip(), "dimension"))
+        if not concepts:
+            return ResolutionResult(resolved=True, reason="无业务概念需要解析")
 
         previous_map = {
             resolution.get("mention", ""): resolution
@@ -98,7 +114,7 @@ class MetricAmbiguityValidator:
         ambiguities: list[dict] = []
         clarification_options: list[dict] = []
 
-        for mention in mentions:
+        for mention, concept_type in concepts:
             candidates = self._collect_candidates(
                 mention,
                 planner_candidates=planner_candidates,
@@ -107,6 +123,7 @@ class MetricAmbiguityValidator:
                 example_fields=example_fields,
                 table_candidates=table_candidates,
                 truncate=truncate,
+                concept_type=concept_type,
             )
             previous = previous_map.get(mention)
             llm_resolution = llm_map.get(mention)
@@ -121,6 +138,7 @@ class MetricAmbiguityValidator:
             if llm_field:
                 resolution = self._resolve_from_llm(
                     mention, llm_field, previous, candidates,
+                    concept_type=concept_type,
                 )
                 if resolution is not None:
                     resolutions.append(resolution)
@@ -144,8 +162,22 @@ class MetricAmbiguityValidator:
                 continue
 
             if len(candidates) == 1:
+                # 唯一候选直锁仅限与概念语义相关的字段：维度概念候选来自向量召回，
+                # 若与 mention 无字面/别名关联（如“负责人”遇到 company_business_type），
+                # 不直锁、继续澄清，避免把不相关维度字段当成唯一口径
+                if concept_type == "dimension" and not _mention_matches_candidate(
+                    mention, candidates[0]
+                ):
+                    ambiguity = self._build_ambiguity(
+                        mention, candidates, concept_type=concept_type,
+                    )
+                    ambiguities.append(ambiguity)
+                    if not clarification_options:
+                        clarification_options = self._build_clarification_options(ambiguity)
+                    continue
                 resolutions.append(self._build_resolution(
                     mention, candidates[0], "unique_metadata",
+                    concept_type=concept_type,
                 ))
                 log_metric_event(
                     "metric_resolution.completed",
@@ -168,7 +200,9 @@ class MetricAmbiguityValidator:
                 )
                 continue
 
-            ambiguity = self._build_ambiguity(mention, candidates)
+            ambiguity = self._build_ambiguity(
+                mention, candidates, concept_type=concept_type,
+            )
             ambiguities.append(ambiguity)
             log_metric_event(
                 "metric_ambiguity.detected",
@@ -221,6 +255,7 @@ class MetricAmbiguityValidator:
                     "field": item["selected_field"],
                     "table": item.get("selected_table", ""),
                     "source": item.get("resolution_source", "unknown"),
+                    "concept_type": item.get("concept_type") or "metric",
                 }
         return plan_resolutions
 
@@ -235,10 +270,12 @@ class MetricAmbiguityValidator:
         example_fields: list = None,
         table_candidates: list = None,
         truncate: bool = True,
+        concept_type: str = "metric",
     ) -> list[dict]:
         """两段式召回真实元数据候选：先按目标表/表级候选确定表作用域（先召回表），
         再在作用域表内逐表检索字段，最后全局字段检索兜底（再召回字段）；
-        再合并 Planner/Advisor 显式候选，去重、收敛并排序。"""
+        再合并 Planner/Advisor 显式候选，去重、收敛并排序；
+        metric 概念优先度量字段，dimension 概念优先维度字段。"""
         raw_candidates: list[dict] = []
 
         # 表作用域 = 目标表 + 表级召回 top-K（“先召回表”）
@@ -300,11 +337,24 @@ class MetricAmbiguityValidator:
                     table_hit=str(doc.metadata.get("table", "")).strip().lower() in scoped_set,
                 ))
 
-        # Planner 全局候选按指标概念词过滤，避免无关字段混入
+        # Planner 全局候选过滤：指标概念按概念词匹配；维度概念要求语义相关
+        # （字面匹配，或该字段出现在本概念向量检索的召回集合中），
+        # 避免“负责人”概念混入 company_business_type 这类高分但不相关的维度字段
+        recalled_fields = {
+            (str(item.get("table") or "").strip().lower(), str(item.get("field") or ""))
+            for item in raw_candidates
+            if item.get("field")
+        }
         for candidate in planner_candidates or []:
             if not isinstance(candidate, dict) or not candidate.get("field"):
                 continue
-            if not _mention_matches_candidate(mention, candidate):
+            if concept_type == "dimension":
+                cand_key = (str(candidate.get("table") or "").strip().lower(), str(candidate.get("field") or ""))
+                if not _is_dimension_candidate(candidate) and not _mention_matches_candidate(mention, candidate):
+                    continue
+                if not _mention_matches_candidate(mention, candidate) and cand_key not in recalled_fields:
+                    continue
+            elif not _mention_matches_candidate(mention, candidate):
                 continue
             raw_candidates.append({
                 "table": candidate.get("table", ""),
@@ -336,15 +386,19 @@ class MetricAmbiguityValidator:
                 "table_hit": str(candidate.get("table") or "").strip().lower() in scoped_set,
             })
 
-        # 度量优先；若全部被过滤则保留全部（兼容旧元数据缺少 fields_type）
-        measure_candidates = [
-            candidate for candidate in raw_candidates
-            if _is_measure_candidate(candidate)
-        ]
-        if measure_candidates:
-            matched = measure_candidates
+        # 指标概念度量优先，维度概念维度优先；全部被过滤则保留全部（兼容旧元数据缺少 fields_type）
+        if concept_type == "dimension":
+            dimension_candidates = [
+                candidate for candidate in raw_candidates
+                if _is_dimension_candidate(candidate)
+            ]
+            matched = dimension_candidates or raw_candidates
         else:
-            matched = raw_candidates
+            measure_candidates = [
+                candidate for candidate in raw_candidates
+                if _is_measure_candidate(candidate)
+            ]
+            matched = measure_candidates or raw_candidates
 
         # 表作用域优先 + 优秀案例加权 + 分数下限 + 每表配额 + 数量上限收敛
         ranked = self._rank_candidates(
@@ -445,7 +499,7 @@ class MetricAmbiguityValidator:
             table_name = str(item.get("table") or "").strip().lower()
             return 1 if target_set and table_name in target_set else 0
 
-        # 相似度下限：低于阈值视为不相关；过滤为空时回退全量，兼容无分数旧元数据
+        # 相似度下限：低于阈值视为不相关；过滤为空时回退全量，兼容无分数旧元数据。
         filtered = [
             candidate for candidate in candidates
             if float(candidate.get("score") or 0) >= MIN_CANDIDATE_SCORE
@@ -522,6 +576,7 @@ class MetricAmbiguityValidator:
         llm_field: str,
         previous: dict,
         candidates: list[dict],
+        concept_type: str = "metric",
     ) -> dict:
         """按 LLM 提交的字段构造解析记录；字段非法时返回 None 交由后续判定。"""
         # 兼容 "db.table.field" 完整路径：拆出物理字段名再校验
@@ -547,7 +602,9 @@ class MetricAmbiguityValidator:
         if matched is None:
             # 仅出现在上轮记录时按上轮结果处理
             return previous
-        return self._build_resolution(mention, matched, "llm_submitted")
+        return self._build_resolution(
+            mention, matched, "llm_submitted", concept_type=concept_type,
+        )
 
     # ── 结果构造 ────────────────────────────────────────────
 
@@ -556,10 +613,11 @@ class MetricAmbiguityValidator:
         mention: str,
         candidate: dict,
         source: str,
+        concept_type: str = "metric",
     ) -> dict:
         return {
             "mention": mention,
-            "concept_type": "metric",
+            "concept_type": concept_type,
             "status": "resolved",
             "selected_field": candidate.get("field", ""),
             "selected_table": candidate.get("table", ""),
@@ -568,10 +626,14 @@ class MetricAmbiguityValidator:
         }
 
     @staticmethod
-    def _build_ambiguity(mention: str, candidates: list[dict]) -> dict:
+    def _build_ambiguity(
+        mention: str,
+        candidates: list[dict],
+        concept_type: str = "metric",
+    ) -> dict:
         return {
             "mention": mention,
-            "concept_type": "metric",
+            "concept_type": concept_type,
             "status": "ambiguous",
             "selected_field": "",
             "selected_table": "",

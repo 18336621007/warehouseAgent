@@ -45,7 +45,7 @@ def build_rerank_input(
     """构造精选模型输入：候选只含字段名 + 原始备注 + 来源表，不含别名。"""
     candidates = candidates or []
     lines = [
-        f"指标概念：{mention}",
+        f"业务概念：{mention}",
         f"用户当前意图：{effective_query}",
     ]
     if user_input.strip():

@@ -49,19 +49,24 @@ def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
     return "\n".join(lines)
 
 
-def _build_pending_options_text(pendings, resolutions=None):
-    """把待澄清候选组装成精简文本，供 Planner 判断用户选择。
+def _build_recent_candidates_text(recent_shown_candidates, resolutions=None):
+    """把最近展示候选组装成精简事实文本，供 Planner 判断用户选择。
 
-    pending 已关闭（用户已完成选择）时，回退展示已确认概念的候选快照，
-    让“改成第一个/第二个”等改选指代有稳定参照，不依赖模型记忆。
+    候选不带程序编号：编号由模型在澄清文案中定义，模型需结合对话历史中的
+    展示文案还原“编号→字段”映射；已确认概念回退展示候选快照，供改选指代参照。
     """
     lines = []
-    for pending in pendings or []:
-        lines.append(f"[{pending.get('mention', '')} id={pending.get('clarification_id', '')}]")
-        for option in pending.get("options") or []:
-            lines.append(
-                f"{option.get('index')}. {option.get('meaning', '')}（字段：{option.get('field', '')}）"
-            )
+    for group in recent_shown_candidates or []:
+        mention = group.get("mention", "")
+        candidates = group.get("candidates") or []
+        if not mention or not candidates:
+            continue
+        lines.append(f"[{mention} 最近展示候选]")
+        for candidate in candidates:
+            field = candidate.get("field", "")
+            table = str(candidate.get("table") or "").split(".")[-1]
+            comment = str(candidate.get("comment") or "").strip()
+            lines.append(f"- {field}（含义：{comment}，表：{table}）")
     if not lines:
         for resolution in (resolutions or []):
             if resolution.get("status") != "resolved":
@@ -70,12 +75,12 @@ def _build_pending_options_text(pendings, resolutions=None):
             if len(candidates) <= 1:
                 continue
             lines.append(f"[{resolution.get('mention', '')} 历史展示候选（改选时参考）]")
-            for index, candidate in enumerate(candidates, 1):
+            for candidate in candidates:
                 field = candidate.get("field", "")
                 table = str(candidate.get("table") or "").split(".")[-1]
-                lines.append(f"{index}. {field}（表：{table}）")
+                comment = str(candidate.get("comment") or "").strip()
+                lines.append(f"- {field}（含义：{comment}，表：{table}）")
     return "\n".join(lines)
-
 
 def _build_table_scope(table_docs_with_scores, top_k: int = TABLE_SEARCH_K) -> list[str]:
     """从表级召回结果提取表作用域（小写表名，按召回顺序），供字段级召回限定范围。"""
@@ -152,6 +157,9 @@ def _apply_user_selection_to_draft(confirmed_plan: dict, selected_resolution: di
         return None
     mention = str(selected_resolution.get("mention") or "")
     new_field = str(selected_resolution.get("selected_field") or "")
+    concept_type = str(selected_resolution.get("concept_type") or "metric")
+    # 指标概念落 measures，维度概念落 dimensions
+    target_key = "dimensions" if concept_type == "dimension" else "measures"
     if not mention or not new_field:
         return None
     concepts = plan.get("concept_resolutions") or {}
@@ -162,21 +170,43 @@ def _apply_user_selection_to_draft(confirmed_plan: dict, selected_resolution: di
     if isinstance(previous, dict):
         old_field = str(previous.get("field") or "")
     if not old_field:
-        # 方案尚未记录该概念解析：无法确定旧字段位置，交由 Advisor 重建
-        return None
+        # 方案尚未记录该概念解析：确认的是新维度字段时直接落到 dimensions，
+        # 保证“负责人”这类属性字段不丢失；指标概念仍交由 Advisor 重建
+        if concept_type != "dimension":
+            return None
+        dimensions = list(plan.get("dimensions") or [])
+        if new_field not in dimensions:
+            plan["dimensions"] = dimensions + [new_field]
+        concepts = dict(concepts)
+        concepts[mention] = {
+            "field": new_field,
+            "table": str(selected_resolution.get("selected_table") or ""),
+            "source": "explicit_user",
+            "concept_type": concept_type,
+        }
+        plan["concept_resolutions"] = concepts
+        plan["status"] = "draft"
+        plan.pop("locked_at", None)
+        plan.pop("confirmed_at", None)
+        return plan
     concepts = dict(concepts)
     concepts[mention] = {
         "field": new_field,
         "table": str(selected_resolution.get("selected_table") or ""),
         "source": "explicit_user",
+        "concept_type": concept_type,
     }
     plan["concept_resolutions"] = concepts
-    # measures/fields 中替换该概念旧字段
-    if old_field in (plan.get("measures") or []):
-        plan["measures"] = [
+    # 按概念类型分流：替换目标列表中的旧字段；维度字段缺失时追加保证不丢失
+    if old_field in (plan.get(target_key) or []):
+        plan[target_key] = [
             new_field if m == old_field else m
-            for m in (plan.get("measures") or [])
+            for m in (plan.get(target_key) or [])
         ]
+    elif concept_type == "dimension":
+        dimensions = list(plan.get("dimensions") or [])
+        if new_field not in dimensions:
+            plan["dimensions"] = dimensions + [new_field]
     if old_field in (plan.get("fields") or []):
         plan["fields"] = [
             new_field if f == old_field else f
@@ -363,9 +393,10 @@ def build_planner_node(runtime):
                 "example_context": example_context,
                 "confirmed_context": confirmed_context,
                 "history_context": _build_history_context(state.get("messages") or []),
-                "pending_options": _build_pending_options_text(
-                    (state.get("analysis_spec") or {}).get("pending_clarifications") or [],
-                    (state.get("analysis_spec") or {}).get("metric_resolutions") or [],
+                "recent_candidates_text": _build_recent_candidates_text(
+                    (state.get("analysis_spec") or {}).get("recent_shown_candidates") or [],
+                    list((state.get("analysis_spec") or {}).get("metric_resolutions") or [])
+                    + list((state.get("analysis_spec") or {}).get("dimension_resolutions") or []),
                 ),
                 "resolution_context": MetricClarificationService.build_resolution_context(
                     state.get("analysis_spec") or {}
@@ -527,27 +558,26 @@ def build_planner_node(runtime):
 
             # 以下这段代码让 AnalysisSpec 从“每轮被 LLM 覆盖重建”变成“增量更新”：
             # 模型判断用户选择（PlannerOutput.user_selection），程序只做白名单校验（validate_user_selection），
-            # 再保留上轮 resolved 证据，只补新概念的 ambiguous 记录，并按概念是否存活正确清理/保留 pending，
+            # 再保留上轮 resolved 证据，只补新概念的 ambiguous 记录；最近展示候选由 Advisor 写回，
             # 从状态层面消除“模型理解了、State 却还停在 ambiguous”导致的重复确认循环。
-            # ── 组装 AnalysisSpec：模型判断 + 程序白名单校验 + pending 生命周期 ──
+            # ── 组装 AnalysisSpec：模型判断 + 程序白名单校验 + 最近展示候选快照 ──
 
-            # 1. 读取上轮状态，建立索引
+            # 1. 读取上轮状态，建立索引（指标与维度解析证据合并反查，支持维度改选）
             existing_spec = state.get("analysis_spec") or {}
-            existing_resolutions = existing_spec.get("metric_resolutions") or []
+            existing_resolutions = (
+                list(existing_spec.get("metric_resolutions") or [])
+                + list(existing_spec.get("dimension_resolutions") or [])
+            )
             resolution_by_mention = {
                 item.get("mention", ""): item
                 for item in existing_resolutions
                 if isinstance(item, dict) and item.get("mention")
             }
-            pending_clarifications = list(existing_spec.get("pending_clarifications") or [])
-            open_pending = next(
-                (p for p in pending_clarifications if p.get("status") == "open"),
-                None,
-            )
+            recent_shown_candidates = list(existing_spec.get("recent_shown_candidates") or [])
 
             # 2. 模型判断用户选择，程序白名单校验（判断归模型，校验归程序）
-            # 不要求存在 open pending：用户改选、补充选择时同样生效，
-            # 白名单 = pending 候选 ∪ 上轮已确认字段 ∪ 本轮召回候选字段
+            # 不要求存在最近展示候选：用户改选、补充选择时同样生效，
+            # 白名单 = 最近展示候选 ∪ 上轮已确认字段 ∪ 本轮召回候选字段
             selected_resolution = None
             user_selection = (
                 planner_output.user_selection.model_dump()
@@ -562,86 +592,91 @@ def build_planner_node(runtime):
                 ] + list(planner_output.fields or [])
                 selected_resolution = MetricClarificationService.validate_user_selection(
                     user_selection,
-                    pending_clarifications,
+                    recent_shown_candidates,
                     existing_resolutions,
                     candidate_fields,
                     list(planner_output.metric_mentions or []),
+                    list(planner_output.dimension_mentions or []),
+                    list(new_entities.get("column_candidates") or []),
                 )
                 if selected_resolution is None:
                     # 模型判断了选择但程序白名单未命中：记录证据，便于排查改选失败
                     log_sub_info(
                         "user_selection未命中: "
                         f"field={user_selection.get('field', '')} "
+                        f"mention={user_selection.get('mention', '')} "
                         f"reasoning={str(user_selection.get('reasoning', ''))[:120]}",
                         node_name="planner",
                     )
 
-            # 3. 决定本轮的 metric_mentions
+            # 3. 决定本轮的 metric_mentions / dimension_mentions
             # 只保留 LLM 输出的当前需求概念：上轮 resolved 概念不再自动追加，
             # 用户改选/放弃后旧概念从概念集消失，避免“纯新用户的新增订单”这类
             # 旧口径因跨轮保留而复活；用户明确提到的概念由 LLM 自然输出。
             metric_mentions = list(planner_output.metric_mentions or [])
             if not metric_mentions:
                 metric_mentions = list(existing_spec.get("metric_mentions") or [])
+            dimension_mentions = list(planner_output.dimension_mentions or [])
+            if not dimension_mentions:
+                dimension_mentions = list(existing_spec.get("dimension_mentions") or [])
             if selected_resolution is not None:
-                # 白名单校验通过：用户选定单一口径时确保该概念在集合中，
+                # 白名单校验通过：用户选定单一口径时确保该概念在对应类型集合中，
                 # 其余概念以 LLM 输出为准，不自动补回已放弃概念。
                 selected_mention = selected_resolution.get("mention", "")
                 resolution_by_mention[selected_mention] = selected_resolution
-                if selected_mention and selected_mention not in metric_mentions:
-                    metric_mentions.append(selected_mention)
+                selected_concept_type = selected_resolution.get("concept_type") or "metric"
+                if selected_mention:
+                    if selected_concept_type == "dimension":
+                        if selected_mention not in dimension_mentions:
+                            dimension_mentions.append(selected_mention)
+                    elif selected_mention not in metric_mentions:
+                        metric_mentions.append(selected_mention)
 
 
-            # 4. 重建 metric_resolutions（只保留程序可信的解析证据）
+            # 4. 重建解析证据（指标/维度分别落盘，只保留程序可信的解析）
             # llm_submitted 只是模型单轮解读，不跨轮保留，避免改选后旧口径残留；
             # 用户明确选择(explicit_user)或元数据唯一(unique_metadata)的解析可保留。
-            new_resolutions = []
-            for mention in metric_mentions:
-                existing = resolution_by_mention.get(mention)
-                if (
-                    existing
-                    and existing.get("status") == "resolved"
-                    and existing.get("resolution_source") in ("explicit_user", "unique_metadata")
-                ):
-                    new_resolutions.append(existing)
-                else:
-                    new_resolutions.append({
-                        "mention": mention,
-                        "concept_type": "metric",
-                        "status": "ambiguous",
-                        "selected_field": "",
-                        "selected_table": "",
-                        "resolution_source": "",
-                        "candidates": [],
-                    })
+            def _rebuild_resolutions(mentions: list[str], concept_type: str) -> list[dict]:
+                rebuilt = []
+                for mention in mentions:
+                    existing = resolution_by_mention.get(mention)
+                    if (
+                        existing
+                        and existing.get("status") == "resolved"
+                        and existing.get("resolution_source") in ("explicit_user", "unique_metadata")
+                    ):
+                        rebuilt.append(existing)
+                    else:
+                        rebuilt.append({
+                            "mention": mention,
+                            "concept_type": concept_type,
+                            "status": "ambiguous",
+                            "selected_field": "",
+                            "selected_table": "",
+                            "resolution_source": "",
+                            "candidates": [],
+                        })
+                return rebuilt
 
-            # 5. 组装新 AnalysisSpec + 管理 pending 生命周期
+            new_metric_resolutions = _rebuild_resolutions(metric_mentions, "metric")
+            new_dimension_resolutions = _rebuild_resolutions(dimension_mentions, "dimension")
+
+            # 5. 组装新 AnalysisSpec：最近展示候选快照跨轮保留，由 Advisor 负责更新
             analysis_spec = dict(existing_spec)
             analysis_spec.update({
                 "analysis_type": planner_output.analysis_type,
                 "metric_mentions": metric_mentions,
-                "dimension_mentions": list(planner_output.dimension_mentions or []),
+                "dimension_mentions": dimension_mentions,
                 "time_range": "",
                 "time_grain": "",
                 "filters": [],
                 "order_by": [],
                 "limit": 0,
                 "comparison": {},
-                "metric_resolutions": new_resolutions,
+                "metric_resolutions": new_metric_resolutions,
+                "dimension_resolutions": new_dimension_resolutions,
+                "recent_shown_candidates": recent_shown_candidates,
             })
-            if selected_resolution is not None:
-                # 选择已通过白名单校验：关闭对应 pending（按澄清 ID），解析证据保留在 metric_resolutions
-                resolved_cid = selected_resolution.get("clarification_id", "")
-                analysis_spec["pending_clarifications"] = [
-                    p for p in pending_clarifications
-                    if p.get("clarification_id") != resolved_cid
-                ]
-            elif open_pending and open_pending.get("mention") in metric_mentions:
-                # 概念仍存活且用户未选择：保留 open pending（延迟澄清恢复）
-                analysis_spec["pending_clarifications"] = pending_clarifications
-            else:
-                # 概念已不在需求中（换话题/推翻）：清理 pending
-                analysis_spec["pending_clarifications"] = []
 
             # 6. 写回 State（首轮记录话题原文；每轮更新改写后的有效需求）
             return_value = {

@@ -84,6 +84,10 @@ def _extract_aliases_from_content(page_content: str) -> list[str]:
 def search_column_candidates(question: str, table: str = "", k: int = None) -> list[dict]:
     """返回结构化字段候选，供指标歧义门禁程序化校验，不直接格式化给 LLM。"""
     top_k = k or SEARCH_COLUMN_K
+    question = str(question or "").strip()
+    if not question:
+        # 空查询无法生成向量，直接返回空候选，避免 embedding 接口 400
+        return []
     if table:
         docs_with_scores = _column_vector_store.similarity_search_with_score(
             question,
@@ -128,6 +132,9 @@ def _format_docs(docs) -> str:
 @tool
 def search_databases(question: str) -> str:
     """搜索与用户问题相关的数据库。返回库名、领域、描述。"""
+    question = str(question or "").strip()
+    if not question:
+        return "未找到匹配结果。"
     docs = _db_vector_store.similarity_search(question, k=SEARCH_DB_K)
     return _format_docs(docs)
 
@@ -135,6 +142,9 @@ def search_databases(question: str) -> str:
 @tool
 def search_tables(question: str, database: str = "") -> str:
     """搜索与用户问题相关的数据表，指定 database 时只检索该库。"""
+    question = str(question or "").strip()
+    if not question:
+        return "未找到匹配结果。"
     if database:
         docs = _table_vector_store.similarity_search(
             question,
@@ -154,6 +164,9 @@ def search_tables(question: str, database: str = "") -> str:
 @tool
 def search_columns(question: str, table: str = "") -> str:
     """搜索与用户问题相关的字段，指定 table 时只检索该表字段。"""
+    question = str(question or "").strip()
+    if not question:
+        return "未找到匹配结果。"
     candidates = search_column_candidates(question, table=table)
     if not candidates:
         return "未找到匹配结果。"

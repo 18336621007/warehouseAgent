@@ -218,12 +218,34 @@ def chat():
         ev_score = result.get("evaluator_score", 0)
         ev_self = result.get("evaluator_self_score", 0)
         dialogue_id = result.get("evaluator_dialogue_id", 0)
+        # 评分只属于本轮真正执行过 Evaluator 的查询；Evaluator 输出持久化在
+        # AgentState 中会跨轮残留，必须按本轮执行节点判断，避免澄清/追问轮重复展示评分
+        has_evaluator = "evaluator" in seen
+        # generated_sql 同样持久化在 AgentState 中会跨轮残留，只有本轮真正
+        # 执行过 Seeker 查询链路时才透传，避免澄清/追问轮展示上一轮的旧 SQL
+        sql_query_nodes = {
+            "retrieve_schema",
+            "generate_sql",
+            "validate_sql",
+            "prepare_sql_fix",
+            "execute_sql",
+            "prepare_sql_exec_fix",
+            "build_final_answer",
+        }
+        has_sql_query = bool(seen & sql_query_nodes)
+        display_sql = generated_sql if has_sql_query else ""
+        evaluator_payload = (
+            {"score": ev_score, "self_score": ev_self}
+            if (has_evaluator and ev_score)
+            else None
+        )
 
         session["messages"].append({"role": "user", "content": message})
         session["messages"].append({
-            "role": "assistant", "content": final_answer, "sql": generated_sql,
-            "thinking": "\n".join(thinking_parts), "dialogue_id": dialogue_id,
-            "evaluator": {"score": ev_score, "self_score": ev_self} if ev_score else None,
+            "role": "assistant", "content": final_answer, "sql": display_sql,
+            "thinking": "\n".join(thinking_parts),
+            "dialogue_id": dialogue_id if has_evaluator else 0,
+            "evaluator": evaluator_payload,
         })
 
         # ── 根据本轮语义决定下一次查数任务 ──
@@ -247,14 +269,11 @@ def chat():
         yield _sse({
             "type": "done",
             "content": final_answer,
-            "sql": generated_sql,
+            "sql": display_sql,
             "topic_status": topic_status,
             "thinking": "\n".join(thinking_parts),
-            "evaluator": {
-                "score": ev_score,
-                "self_score": ev_self,
-            } if ev_score else None,
-            "dialogue_id": dialogue_id,
+            "evaluator": evaluator_payload,
+            "dialogue_id": dialogue_id if has_evaluator else 0,
         })
 
     def generate_with_log_context():

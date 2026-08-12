@@ -24,16 +24,11 @@ class ConceptResolution(TypedDict, total=False):
     resolution_source: str  # llm_submitted / explicit_user / unique_metadata / semantic_default / unknown
     candidates: list[dict]  # ConceptCandidate 列表（按排序分数降序）
 
-class PendingClarification(TypedDict, total=False):
-    """一次待用户确认的澄清：候选创建时固化，编号不随后续召回重排变化。"""
-    clarification_id: str          # 稳定 ID，跨轮定位
-    mention: str                   # 业务概念，如"新增回流订单数"
-    question: str                  # 给用户看的澄清问题
-    options: list[dict]            # 固化候选：index/field/meaning/table_short
-    status: str                    # open / resolved / cancelled
-    created_request_id: str
-    last_active_request_id: str
-    resolved_value: dict
+class ShownCandidateGroup(TypedDict, total=False):
+    """最近展示给用户的候选快照（无编号）：供改选参照与程序白名单，编号由模型在澄清文案中定义。"""
+    mention: str                    # 业务概念，如"新增订单"
+    concept_type: str               # metric / dimension，区分指标与维度概念
+    candidates: list[ConceptCandidate]  # 最近展示过的候选（字段+含义+来源表）
 
 # 跨轮保存“用户分析意图 + 指标解析证据”的结构化状态
 class AnalysisSpec(TypedDict, total=False):
@@ -48,4 +43,5 @@ class AnalysisSpec(TypedDict, total=False):
     limit: int                        # TopN 数量
     comparison: dict                  # 同比/环比/基期对比
     metric_resolutions: list[ConceptResolution]  # 指标解析证据，跨轮保留候选
-    pending_clarifications: list[PendingClarification]  # 待确认澄清列表（默认长度 1，多 pending 时扩展）
+    dimension_resolutions: list[ConceptResolution]  # 维度解析证据，跨轮保留候选
+    recent_shown_candidates: list[ShownCandidateGroup]  # 最近展示候选快照（无编号，编号由模型文案定义）

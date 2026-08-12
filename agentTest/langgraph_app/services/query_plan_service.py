@@ -47,6 +47,7 @@ def _normalize_concept_resolutions(value) -> dict:
             "source": str(
                 item.get("source") or item.get("resolution_source") or "unknown"
             ),
+            "concept_type": str(item.get("concept_type") or "metric"),
         }
     return normalized
 
@@ -213,10 +214,57 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
     if errors:
         raise ValueError("查询方案不完整：" + "；".join(errors))
 
+    # 硬校验：指标列表中禁止出现元数据为 dimension 的属性字段
+    semantic_errors = validate_measure_semantic_types(plan)
+    if semantic_errors:
+        raise ValueError("查询方案指标语义错误：" + "；".join(semantic_errors))
+
     return plan
 
 
 _TABLE_COLUMNS_INDEX = None
+_SEMANTIC_TYPE_INDEX = None
+
+
+def _build_field_semantic_index() -> dict:
+    """懒加载 MySQL 增强元数据字段语义类型索引：{field: semantic_type}，供指标硬校验。"""
+    global _SEMANTIC_TYPE_INDEX
+    if _SEMANTIC_TYPE_INDEX is not None:
+        return _SEMANTIC_TYPE_INDEX
+    index = {}
+    try:
+        from agentTest.metadata.mysql_store import load_enriched_columns
+        for col in load_enriched_columns():
+            field = str(col.get("column_name") or "")
+            ftype = str(col.get("fields_type") or "").lower()
+            if field and ftype:
+                index[field] = ftype
+    except Exception:
+        # 元数据不可用时返回空索引，校验退化为不拦截
+        pass
+    _SEMANTIC_TYPE_INDEX = index
+    return index
+
+
+def validate_measure_semantic_types(plan: dict) -> list[str]:
+    """硬校验：measures 中的字段元数据语义类型若为 dimension，则拦截。
+
+    防止“负责人/业务经理”这类属性字段被当成指标聚合；这是不依赖模型的最终防线。
+    """
+    measures = plan.get("measures") or []
+    if not measures:
+        return []
+    index = _build_field_semantic_index()
+    if not index:
+        return []
+    errors = []
+    for field in measures:
+        field = str(field)
+        if "." in field:
+            field = field.rsplit(".", 1)[-1]
+        if index.get(field) == "dimension":
+            errors.append(f"{field}（元数据类型=dimension，不能作为指标聚合）")
+    return errors
 
 
 def _build_table_columns_index() -> dict:

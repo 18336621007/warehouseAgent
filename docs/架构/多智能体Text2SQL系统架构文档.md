@@ -1,6 +1,6 @@
 # 多智能体 Text2SQL 系统架构文档
 
-> 最后更新：2026-08-11 | 指标跨轮确认闭环已完成；元数据支持 db.table 白名单、schema 指纹增量采集与向量库按唯一键增量同步
+> 最后更新：2026-08-12 | 全局单一共享查询方案（Planner 改选落草稿、门禁只信 explicit_user）；Evaluator 改为复杂度预算评分
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -43,7 +43,8 @@ flowchart TD
 - **父图**（Supervisor）：记录用户消息 → Planner 路由决策 → Advisor/Seeker。
 - **Advisor 统一模式**：只使用 `plan_agent`（绑定全部工具）；指标编号、字段名和中文含义优先由 pending 状态确定性解析，其余语义再交给模型。
 - **同轮锁定**：`partial/none` 时先检索并追问，未确认口径由指标歧义门禁在 `submit_query_plan → lock_query_plan` 之间拦截；用户本轮解决歧义后直接提交完整方案生成 `locked`。
-- **查询方案领域服务**：`lock_query_plan()` 将 Advisor 提案标准化为 `locked`；`confirm_query_plan()` 只允许 Planner 将合法 `locked` 方案升级为 `confirmed`。
+- **查询方案领域服务**：`lock_query_plan()` 将 Advisor 提案标准化为 `locked`；`confirm_query_plan()` 只允许 Planner 将合法 `locked` 方案升级为 `confirmed`；`merge_draft_plan()` 将追问中确认的部分槽位持久化为 `draft`（`concept_resolutions` 统一为字典结构）。
+- **全局唯一共享方案**：`confirmed_plan` 是 Topic 内唯一查询契约，三态（`draft` 追问中 / `locked` 待确认 / `confirmed` 可执行）；用户选择或改选口径时 Planner 通过 `_apply_user_selection_to_draft()` 直接替换该概念旧字段并回到 `draft`，不再平行维护一份“已确认口径”。
 - **Seeker 子图**：`retrieve_schema → generate_sql → validate_sql → execute_sql → build_final_answer → evaluator`。
 - **状态隔离**：MemorySaver 以 `conversation_id:topic_id` 为 checkpoint `thread_id`，同一 Topic 多轮共享状态。
 - **消息记忆**：`messages + add_messages` 统一保存用户、Advisor、工具和 Seeker 消息。
@@ -95,15 +96,18 @@ state/
 
 1. 用“原始问题 + 本轮输入 + Advisor 最近回复 + 当前方案”组成检索问题，避免用户只回复“1”“A”时丢失语义。
 2. 从表层和字段层 FAISS 召回候选元数据，并由 LLM 输出 `effective_query / tables / fields / completeness / accept_locked_plan`。
-3. 目标设计使用 LLM 还原后的 `effective_query` 统计高相似候选数量，仅作为可观测指标记录到日志；当前代码仍存在覆盖 `completeness` 的硬分支，尚待删除。
+3. 使用 LLM 还原后的 `effective_query` 统计高相似候选数量，仅作为可观测指标记录到日志，不覆盖 LLM 的 `completeness` 判定；仅当 LLM 未填或填了无效值时由程序兜底（无表→`none`、无字段→`partial`、其余→`full`）。
 4. `none/partial` 时进入 Advisor 自适应核验；若本轮解决全部歧义可以提交，否则由程序门禁生成候选并保持 clarifying。
-5. 需求明确但尚无最终确认时路由 Advisor 的方案模式，由 Advisor 生成完整 `locked` 方案。
-6. 只有 `accept_locked_plan=true` 且 `confirm_query_plan()` 校验通过时，才写回 `status=confirmed` 并路由 Seeker。
+5. 用户选择/改选口径且 `user_selection` 白名单校验通过时，Planner 调用 `_apply_user_selection_to_draft()` 改写共享方案草稿（替换该概念旧字段、更新 `concept_resolutions`、状态回到 `draft`）。
+6. 需求明确但尚无最终确认时路由 Advisor 的方案模式，由 Advisor 生成完整 `locked` 方案。
+7. 只有 `accept_locked_plan=true` 且 `confirm_query_plan()` 校验通过时，才写回 `status=confirmed` 并路由 Seeker。
 
 **关键边界**：
 
 - `planner_entities` 是语义分析结果，不是执行契约。
 - 用户修改部分口径时，LLM 应尽量在当前 `locked` 方案基础上修改；如果方案根本错误，也允许重新规划。
+- `metric_mentions` 只保留 LLM 输出的当前需求概念，不再自动复活上轮已 resolved 概念；改选/放弃后旧口径从概念集消失，`llm_submitted` 解析证据不跨轮保留。
+- Planner 改写草稿只在方案已记录该概念旧字段时生效；方案尚无该概念时交 Advisor 通过 `update_draft_plan` 重建，避免凭空造方案。
 - 最终确认后严格复用 locked 方案中的表和字段，禁止新一轮向量检索覆盖用户已确认内容。
 
 **配置项（`config/planner.py`）**：
@@ -112,8 +116,8 @@ state/
 |---|---:|---|
 | `TABLE_SEARCH_K` | 5 | 表级召回数量 |
 | `COLUMN_SEARCH_K` | 7 | 字段级召回数量 |
-| `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 目标定位为高相似候选观测阈值；当前硬分支待删除 |
-| `MAX_HIGH_SIMILARITY_COUNT` | 3 | 目标定位为统计和告警基线；当前仍参与硬路由 |
+| `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 高相似候选观测阈值（仅日志观测，不参与路由） |
+| `MAX_HIGH_SIMILARITY_COUNT` | 3 | 高相似候选统计与告警基线 |
 | `EXAMPLE_SIMILARITY_THRESHOLD` | 0.7 | 优质示例最低相似度 |
 
 ### 3.3 Advisor（`graphs/advisor_graph.py`）
@@ -135,15 +139,16 @@ Advisor 统一使用 `plan_agent`；用户回复的编号、第几个、候选�
 - 用户本轮原始输入。
 - Planner 候选表、已确定字段和 `completeness`。
 - `planner_reason`，目标用于解释具体是哪一个指标、维度或表存在歧义；当前跨子图传递待 `PlannerHandoffState` 修复。
-- 当前已有 `locked/confirmed` 方案。
+- 当前已有 `draft/locked/confirmed` 共享方案（唯一口径事实来源），不再注入独立的“已确认口径”列表。
 
 **方案锁定流程**：
 
 1. Planner 返回 `full`，Advisor 选择 `plan_agent`。
 2. 必要时按库 → 表 → 字段逐层检索；提交方案前必须检索目标表字段。
-3. 调用 `submit_query_plan` 提交完整提案。
-4. 图级代码调用 `lock_query_plan()`，由程序派生 `tables/fields/status/locked_at` 并执行结构校验。
-5. Advisor 将标准方案展示给用户，等待下一轮确认或局部修改。
+3. 调用 `submit_query_plan` 提交完整提案，携带 `concept_resolutions`（mention 必须来自当前需求指标概念，禁止把候选含义当作独立概念提交）。
+4. 指标歧义门禁只采信 `resolution_source=explicit_user` 的解析证据收敛 `measures`；`llm_submitted` 只是模型单轮解读，不能作为用户确认口径的证据。
+5. 图级代码调用 `lock_query_plan()`，由程序派生 `tables/fields/status/locked_at` 并执行结构校验。
+6. Advisor 将标准方案展示给用户，等待下一轮确认或局部修改。
 
 **防幻觉机制**：
 
@@ -152,6 +157,7 @@ Advisor 统一使用 `plan_agent`；用户回复的编号、第几个、候选�
 - 图级钩子校验目标表字段是否在工具结果中。
 - `tables`、`fields`、状态和时间戳由领域服务维护，不交给 LLM 自由生成。
 - Advisor 不能写入 `status=confirmed`，也不能直接路由 Seeker。
+- Advisor 只依赖【当前已有方案】中的 `concept_resolutions` 判断已确认口径，不再注入“已确认口径”列表，用户改选后旧口径不会因程序提示而保留。
 
 ### 3.4 Seeker（`graphs/seeker_graph.py`）
 
@@ -196,8 +202,8 @@ retrieve_schema → generate_sql → validate_sql
 **评分指标**：
 | 指标 | 类型 | 说明 |
 |------|------|------|
-| `time_score` | 客观 | LLM 响应耗时（归一化到 0-100） |
-| `turn_score` | 客观 | `advisor_turns`（同一 Topic 的 Advisor 澄清次数） |
+| `time_score` | 客观 | 实际耗时按复杂度预算评分：预算内满分，超支按比例衰减（0-100） |
+| `turn_score` | 客观 | 实际澄清轮次按复杂度预算评分：预算内满分，超支按比例衰减（0-100） |
 | `llm_self_score` | 主观 | LLM 对上下文连贯性、需求满足度的自评（0-100） |
 | `user_score` | 主观 | 用户打分（1-5 星，映射到 0-100） |
 
@@ -206,6 +212,8 @@ retrieve_schema → generate_sql → validate_sql
 comprehensive_score = W_TIME * time_score + W_TURN * turn_score
                     + W_LLM_SELF * llm_self_score + W_USER * user_score
 ```
+
+**复杂度预算（`_estimate_complexity`）**：根据 `analysis_spec.metric_mentions/dimension_mentions` 与 `confirmed_plan.measures/dimensions/tables/fields/complex` 估算期望轮次与期望耗时；指标多、维度多、多表、复杂查询的预算相应放大，避免“指标多导致轮次必然上升”被误判为低效。实际值在预算×(1+容忍率) 内给满分（`score_by_budget`），超支按比例衰减，保底 20 分；`total_topic_time_ms` 缺失时 `time_score` 取中性 50。
 
 **优质对话存储**：
 - `comprehensive_score >= 80` → 标记 `is_high_quality = 1`
@@ -220,10 +228,13 @@ comprehensive_score = W_TIME * time_score + W_TURN * turn_score
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `HIGH_QUALITY_THRESHOLD` | 80 | 优质对话分数线 |
-| `WEIGHT_TIME` | 0.2 | 响应时间权重 |
-| `WEIGHT_TURNS` | 0.2 | 交互轮次权重 |
-| `WEIGHT_LLM_SELF` | 0.4 | LLM 自评权重 |
-| `WEIGHT_USER` | 0.2 | 用户评分权重 |
+| `WEIGHT_TIME` | 0.1 | 响应时间权重 |
+| `WEIGHT_TURNS` | 0.1 | 交互轮次权重 |
+| `WEIGHT_LLM_SELF` | 0.3 | LLM 自评权重 |
+| `WEIGHT_USER` | 0.5 | 用户评分权重（未打分默认 75） |
+| `BASE_TURNS` / `TURNS_PER_METRIC` / `TURNS_PER_DIMENSION` / `TURNS_PER_EXTRA_TABLE` / `COMPLEX_TURN_BONUS` | 1.0 / 1.0 / 0.5 / 0.5 / 1.0 | 期望轮次预算：基础 1 轮 + 每指标 1 轮 + 每维度 0.5 轮 + 每额外表 0.5 轮 + 复杂查询 1 轮 |
+| `TIME_BASE_MS` / `TIME_PER_METRIC_MS` / `TIME_PER_DIMENSION_MS` / `TIME_PER_TABLE_MS` / `TIME_PER_FIELD_MS` / `COMPLEX_TIME_MS` | 8000 / 4000 / 1500 / 3000 / 800 / 5000 | 期望耗时预算（ms） |
+| `BUDGET_TOLERANCE_RATIO` / `MIN_BUDGET_SCORE` | 0.5 / 20 | 预算容忍率与最低分保底 |
 
 ### 3.6 状态可观测性与日志（`runtime/graph_logger.py`）
 
@@ -327,7 +338,7 @@ http://localhost:5000
 | `config/planner.py` | `TABLE_SEARCH_K` | 5 | Planner FAISS 表检索数量 |
 | | `COLUMN_SEARCH_K` | 7 | Planner FAISS 字段检索数量 |
 | | `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 高相似候选观测阈值（余弦距离换算） |
-| | `MAX_HIGH_SIMILARITY_COUNT` | 3 | 目标为历史观测基线；当前强制路由分支待删除 |
+| | `MAX_HIGH_SIMILARITY_COUNT` | 3 | 高相似候选统计与告警基线（仅观测） |
 | | `EXAMPLE_SIMILARITY_THRESHOLD` | 0.7 | 优质示例最低相似度 |
 | `config/advisor.py` | `SEARCH_DB_K` | 3 | Advisor 库检索数量 |
 | `config/advisor.py` | `SEARCH_TABLE_K` | 5 | Advisor 表检索数量 |
@@ -509,8 +520,9 @@ WHERE a.pt_dt = yesterday_expression
 ### 17.2 AnalysisSpec 与解析证据
 
 - `AnalysisSpec`（`state/analysis_spec.py`）从自然语言提取 `analysis_type / metric_mentions / dimension_mentions / time_range / time_grain / filters / order_by / limit / comparison`，作为跨轮 Topic 状态保留。
-- 每个指标概念携带 `ConceptResolution`：`mention / status / selected_field / selected_table / resolution_source / candidates`。
+- 每个业务概念携带 `ConceptResolution`：`mention / concept_type(metric|dimension) / status / selected_field / selected_table / resolution_source / candidates`；指标解析证据落在 `metric_resolutions`，维度/属性解析证据（如“负责人”→“company_manager”）落在 `dimension_resolutions`，两者分开收敛，维度字段不会进入 `measures`。
 - 可信解析来源只有三种：`explicit_user`（用户明确选择字段/业务词/选项编号）、`unique_metadata`（元数据唯一候选）、`semantic_default`（正式语义默认口径，第14-15课接入）。
+- `llm_submitted`（模型单轮解读）不跨轮保留：Planner 重建 `metric_resolutions`、`update_analysis_spec` 写回、`build_resolution_context` 展示均过滤该类证据，避免改选后旧口径残留。
 - 历史案例、最高相似度、ADS 优先规则和 LLM 常识选择均不能独立证明用户已确认口径。
 
 ### 17.3 指标歧义门禁
@@ -527,9 +539,11 @@ Agent 调用 submit_query_plan
 ```
 
 - 候选必须来自真实元数据（向量库检索 + Planner/Advisor 结构化候选），LLM 不能编造字段。
-- 只对 `measure` 类型字段判指标歧义，维度单独处理。
+- 指标概念优先度量字段，维度概念优先维度字段（“负责人”与“业务经理”等为同义描述，不强制字面匹配）；指标/维度候选都进入门禁澄清，`recent_shown_candidates` 携带 `concept_type` 供改选反查。
 - 排序分数只决定候选展示顺序，不产生解析证据。
-- LLM 提交的 `concept_resolutions` 必须落在真实候选或上轮已确认字段内；State 中的 `explicit_user` 选择优先，LLM 漏传不能使 resolved 状态退回 ambiguous。
+- LLM 提交的 `concept_resolutions` 必须落在真实候选或上轮已确认字段内，且每条携带 `concept_type`；提交门禁只采信 `explicit_user` 证据，并按类型分流收敛：`metric` 覆盖 `measures`、`dimension` 合并进 `dimensions`，`llm_submitted` 不能进入最终方案；State 中的 `explicit_user` 选择优先，LLM 漏传不能使 resolved 状态退回 ambiguous。
+- 用户选择字段的归属由模型声明（`UserSelection.mention/concept_type`）且程序校验：字段反查不到概念时宁可不解析，禁止把维度/属性字段硬挂到唯一指标概念下；指标概念解析到元数据为 `dimension` 的字段会被拒绝。
+- 硬校验双保险：`validate_measure_semantic_types`（提交门禁）与 `lock_query_plan` 都拦截“`measures` 中出现元数据 `fields_type=dimension` 的字段”，从机制上杜绝“负责人”这类属性字段被当指标聚合。
 - 唯一候选场景仍允许同轮锁定，不采用“所有 partial 一律禁止提交”的简单方案。
 
 ### 17.4 历史案例使用边界
@@ -603,12 +617,14 @@ MetricAmbiguityValidator 生成候选
 MetricClarificationService 固化 clarification_id + options
   ↓ 写入 AnalysisSpec.pending_clarifications
 下一轮 Planner LLM 判断 user_selection（结合历史对话与待澄清候选）
-  ↓ 程序 validate_user_selection 白名单校验（field 命中 options、id 对齐）
+  ↓ 程序 validate_user_selection 白名单校验（field 命中候选集合）
 ConceptResolution(status=resolved, source=explicit_user)
   ↓ 清理 pending、effective_query 基线滚动更新（original_question 保留原文）
-Advisor 接收已确认指标上下文
+Planner 将选择落到共享方案草稿（_apply_user_selection_to_draft：替换旧字段、状态回 draft）
   ↓
-程序按 resolved field 收敛 measures
+Advisor 只看到【当前已有方案】，不再注入“已确认口径”列表
+  ↓
+门禁只采信 explicit_user 证据收敛 measures（llm_submitted 不进最终方案）
   ↓
 lock_query_plan
 ```
@@ -620,6 +636,10 @@ lock_query_plan
 - Planner 基于已有 AnalysisSpec 增量更新，不再重新创建后丢失 pending。
 - Validator 保留上轮真实候选中的 resolved field，候选重排不使选择失效。
 - Advisor 未调用提交工具时的预校验结果也会写回 State。
+- Advisor 不再注入“已确认指标口径”上下文，只依赖当前共享方案，避免改选后旧口径被程序提示保留。
+- `metric_mentions` 只保留 LLM 输出的当前需求概念，上轮 resolved 概念不自动复活；`llm_submitted` 解析证据不跨轮保留。
+- 概念字符串跨轮一致性：LLM 每轮输出的 `metric_mentions/dimension_mentions` 必须逐字沿用已确认概念字符串，候选展示含义（字段原始备注）不是业务概念字符串（如“新增订单”不得改写成“新增订单数”），避免已确认解析按 mention 精确匹配断链、触发重复澄清；该约束同时写入 Planner prompt 规则与【已确认口径】提示语。
+- Planner 在用户选择/改选后调用 `_apply_user_selection_to_draft` 改写共享方案草稿，与 Advisor 使用同一份方案状态。
 - Advisor Graph 只保留编排，澄清领域逻辑迁入 `MetricClarificationService`。
 - 日志 `answer_summary` 记录最终用户可见文本，而非被程序覆盖的 LLM 原始回复。
 

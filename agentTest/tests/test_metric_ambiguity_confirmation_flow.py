@@ -259,128 +259,116 @@ class MetricAmbiguityConfirmationFlowTest(unittest.TestCase):
         self.assertEqual(result.resolutions[0]["selected_field"], "new_order")
         self.assertEqual(result.resolutions[0]["resolution_source"], "explicit_user")
 
-    def test_unresolved_result_persists_fixed_pending_options(self):
-        """首轮多候选必须写入待确认状态，下一轮编号不能依赖重新召回顺序。"""
+    def test_unresolved_result_persists_recent_shown_candidates(self):
+        """首轮多候选必须写入最近展示候选快照（无编号），供下一轮改选参照与白名单。"""
         result = self._validator().validate(
             metric_mentions=["新增订单"],
             advisor_candidates=_metric_candidates(),
         )
 
-        updated_spec = MetricClarificationService.update_analysis_spec(
+        updated_spec = MetricClarificationService.update_recent_shown_candidates(
             {"metric_mentions": ["新增订单"]},
             result,
-            "request-1",
         )
 
-        pending = updated_spec["pending_clarifications"][0]
-        self.assertEqual(pending["clarification_id"], "request-1")
-        self.assertEqual(pending["mention"], "新增订单")
-        self.assertEqual(pending["status"], "open")
-        self.assertEqual(pending["options"][1]["field"], "really_add_order")
+        shown = updated_spec["recent_shown_candidates"]
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(shown[0]["mention"], "新增订单")
+        fields = [c["field"] for c in shown[0]["candidates"]]
+        self.assertIn("really_add_order", fields)
+        self.assertNotIn("index", shown[0]["candidates"][0])
 
-    def test_unresolved_result_preserves_existing_open_pending(self):
-        """用户未选择时 update_analysis_spec 复用原 open pending，编号不随后续召回变化。"""
+
+    def test_unresolved_result_overwrites_recent_shown_candidates(self):
+        """每轮未解决时最近展示候选以本轮召回为准重写，不依赖跨轮编号记忆。"""
         result = self._validator().validate(
             metric_mentions=["新增订单"],
             advisor_candidates=_metric_candidates(),
         )
-        current_spec = MetricClarificationService.update_analysis_spec(
+        current_spec = MetricClarificationService.update_recent_shown_candidates(
             {"metric_mentions": ["新增订单"]},
             result,
-            "request-1",
         )
-        first_pending = current_spec["pending_clarifications"][0]
+        first = current_spec["recent_shown_candidates"][0]
 
-        # 第二轮用户只问解释，再次触发未解析 → 复用原 pending（clarification_id/options 不变）
-        again = MetricClarificationService.update_analysis_spec(
+        again = MetricClarificationService.update_recent_shown_candidates(
             current_spec,
             result,
-            "request-2",
         )
-        second_pending = again["pending_clarifications"][0]
+        second = again["recent_shown_candidates"][0]
 
-        self.assertEqual(second_pending["clarification_id"], first_pending["clarification_id"])
         self.assertEqual(
-            [option["field"] for option in second_pending["options"]],
-            [option["field"] for option in first_pending["options"]],
+            [c["field"] for c in second["candidates"]],
+            [c["field"] for c in first["candidates"]],
         )
+
 
     def test_validate_user_selection_accepts_model_choice(self):
-        """模型从历史对话判断用户选择了某候选，程序白名单校验通过后生成 explicit_user。"""
-        result = self._validator().validate(
-            metric_mentions=["新增订单"],
-            advisor_candidates=_metric_candidates(),
-        )
-        pending = MetricClarificationService.build_pending_clarification(result)
+        """模型从对话历史判断用户选择了某候选，程序白名单校验通过后生成 explicit_user。"""
+        shown = [{
+            "mention": "新增订单",
+            "candidates": _metric_candidates(),
+        }]
 
         resolution = MetricClarificationService.validate_user_selection(
             {
                 "selected": True,
-                "clarification_id": pending["clarification_id"],
                 "field": "really_add_order",
                 "reasoning": "用户回复“2”",
             },
-            pending,
+            shown,
         )
 
         self.assertIsNotNone(resolution)
         self.assertEqual(resolution["selected_field"], "really_add_order")
         self.assertEqual(resolution["resolution_source"], "explicit_user")
+        self.assertEqual(resolution["mention"], "新增订单")
+
 
     def test_validate_user_selection_rejects_outside_field(self):
         """模型误判候选外字段时程序拒绝，宁可不选也不猜测。"""
-        result = self._validator().validate(
-            metric_mentions=["新增订单"],
-            advisor_candidates=_metric_candidates(),
-        )
-        pending = MetricClarificationService.build_pending_clarification(result)
+        shown = [{
+            "mention": "新增订单",
+            "candidates": _metric_candidates(),
+        }]
 
         resolution = MetricClarificationService.validate_user_selection(
             {
                 "selected": True,
-                "clarification_id": pending["clarification_id"],
                 "field": "made_up_order",
                 "reasoning": "用户提到某字段",
             },
-            pending,
+            shown,
         )
 
         self.assertIsNone(resolution)
+
 
     def test_validate_user_selection_requires_explicit_selection(self):
         """用户只是询问解释时 selected=false，不能视为已选择。"""
-        result = self._validator().validate(
-            metric_mentions=["新增订单"],
-            advisor_candidates=_metric_candidates(),
-        )
-        pending = MetricClarificationService.build_pending_clarification(result)
-
         resolution = MetricClarificationService.validate_user_selection(
-            {"selected": False, "clarification_id": "", "field": "", "reasoning": ""},
-            pending,
+            {"selected": False, "field": "", "reasoning": ""},
         )
 
         self.assertIsNone(resolution)
 
-    def test_validate_user_selection_rejects_wrong_clarification_id(self):
-        """clarification_id 对不上当前 open pending 时拒绝。"""
-        result = self._validator().validate(
-            metric_mentions=["新增订单"],
-            advisor_candidates=_metric_candidates(),
-        )
-        pending = MetricClarificationService.build_pending_clarification(result)
 
+    def test_validate_user_selection_accepts_previous_resolution_field(self):
+        """用户改选为上轮已确认字段时，程序同样认可。"""
         resolution = MetricClarificationService.validate_user_selection(
             {
                 "selected": True,
-                "clarification_id": "stale-id",
-                "field": "really_add_order",
-                "reasoning": "选择 2",
+                "field": "new_order",
+                "reasoning": "用户回复“第一个”",
             },
-            pending,
+            [],
+            _previous_new_order(),
         )
 
-        self.assertIsNone(resolution)
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution["selected_field"], "new_order")
+        self.assertEqual(resolution["mention"], "新增订单")
+
 
     def test_previous_selection_survives_candidate_reordering(self):
         """重新召回缺少已选字段时，仍认可上轮真实候选中的用户选择。"""
@@ -406,8 +394,8 @@ class MetricAmbiguityConfirmationFlowTest(unittest.TestCase):
         self.assertIn(f"{BASE_TABLE}.new_order", context)
         self.assertIn("不得再次追问", context)
 
-    def test_resolved_result_clears_pending_state(self):
-        """用户选择已解析后自动清理 pending，避免下一轮继续重复确认。"""
+    def test_resolved_result_clears_recent_shown_candidates(self):
+        """用户选择已解析后自动清理最近展示候选，避免下一轮继续重复确认。"""
         result = self._validator().validate(
             metric_mentions=["新增订单"],
             advisor_candidates=_metric_candidates(),
@@ -416,16 +404,19 @@ class MetricAmbiguityConfirmationFlowTest(unittest.TestCase):
         )
         current_spec = {
             "metric_mentions": ["新增订单"],
-            "pending_clarifications": [
-                {"clarification_id": "request-1", "mention": "新增订单",
-                 "status": "open", "options": []},
+            "recent_shown_candidates": [
+                {"mention": "新增订单", "candidates": _metric_candidates()},
             ],
         }
 
-        updated_spec = MetricClarificationService.update_analysis_spec(current_spec, result)
+        updated_spec = MetricClarificationService.update_recent_shown_candidates(
+            current_spec,
+            result,
+        )
 
-        self.assertEqual(updated_spec["pending_clarifications"], [])
+        self.assertEqual(updated_spec["recent_shown_candidates"], [])
         self.assertEqual(updated_spec["metric_resolutions"][0]["status"], "resolved")
+
 
     def test_lock_query_plan_writes_concept_resolutions(self):
         """lock_query_plan 将已解决指标写入可审计 concept_resolutions。"""

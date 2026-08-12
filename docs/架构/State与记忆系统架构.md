@@ -1,6 +1,6 @@
 # State 与记忆系统架构
 
-> 最后更新：2026-08-04
+> 最后更新：2026-08-12
 > [返回文档索引](../文档索引.md)
 
 ## 一、设计目标
@@ -213,7 +213,7 @@ AdvisorState 保存澄清过程产生的业务结果：
 
 | 字段 | 类型 | 主要写入者 | 主要读取者 | 状态 | 说明 |
 |---|---|---|---|---|---|
-| `confirmed_plan` | `QueryPlan` | Advisor 的 `submit_query_plan` + `lock_query_plan()` | Planner | 使用中 | Advisor 根据检索结果和用户口径提交完整方案，由领域服务派生 `tables/fields/status/locked_at` 并写成 `status=locked`。它只是待确认方案，不能直接进入 Seeker。 |
+| `confirmed_plan` | `QueryPlan` | Advisor 的 `submit_query_plan`/`update_draft_plan` + Planner 的 `_apply_user_selection_to_draft` | Planner、Seeker、Evaluator | 使用中 | 全局唯一共享查询方案，三态：`draft`（追问中逐步完善，Advisor `update_draft_plan` 或 Planner 改选落草稿）、`locked`（Advisor 提交完整方案，领域服务派生 `tables/fields/status/locked_at`）、`confirmed`（Planner 确认，允许进入 Seeker）。 |
 | `final_answer` | `str` | Advisor | Web/CLI、Evaluator | 使用中 | Advisor 本轮向用户展示的澄清问题、候选项或方案确认文本。 |
 
 AdvisorState 中的 `confirmed_plan` 与 TopicState、PlannerState、SeekerState 中的同名字段仍然是 checkpoint 中的同一个键，不会产生多份方案。
@@ -559,7 +559,8 @@ sequenceDiagram
 
 ### 13.1 QueryPlan 当前关键字段
 
-- `status`：`locked` 表示等待用户最终确认，`confirmed` 表示允许进入 Seeker。
+- `status`：`draft` 表示追问中逐步完善的方案（允许槽位为空），`locked` 表示等待用户最终确认，`confirmed` 表示允许进入 Seeker。
+- `concept_resolutions`：`{指标概念: {field, table, source}}` 字典；draft/locked/confirmed 三态统一为该结构，`source=explicit_user` 才可作为门禁收敛证据。
 - `tables/table`：完整参与表列表和主表。
 - `measures/dimensions/fields`：业务字段及统一字段集合。
 - `field_sources`：字段到物理表的锁定映射，执行阶段只能校验，不能静默改写。
@@ -637,7 +638,8 @@ pending_clarifications = [
 - 下一轮 Planner LLM 结合【对话历史】+【待澄清候选】判断 `user_selection`，程序 `validate_user_selection` 做白名单校验。
 - 编号以创建 pending 时的 options 为准，不受后续候选重排影响；用户未选择同一概念时复用原 open pending。
 - 校验通过后生成 `resolution_source=explicit_user` 并清理 pending。
-- Advisor 从 AnalysisSpec 读取 resolved 指标，LLM 漏传时仍可继续锁定方案。
+- 概念字符串跨轮一致性：`metric_mentions/dimension_mentions` 以已确认概念字符串为权威，候选展示含义（字段原始备注）不是业务概念，禁止同义改写（如“新增订单”→“新增订单数”）；该约束由 Planner prompt 与【已确认口径】提示语共同强化，避免概念漂移导致解析证据断链、重复澄清。
+- Advisor 只依赖【当前已有方案】的 `concept_resolutions` 判断已确认口径，不再注入“已确认口径”列表；LLM 漏传时程序按 `explicit_user` 证据收敛 `measures` 仍可锁定方案。
 
 ### 14.2 为什么下一课不能只依赖 messages
 
