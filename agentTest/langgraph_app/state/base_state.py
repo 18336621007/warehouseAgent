@@ -23,7 +23,7 @@ TopicStatus = Literal[
 class QueryResultSnapshot(TypedDict, total=False):
     result_id: str            # 结果快照 ID，格式 {request_id}:result
     source_request_id: str    # 产生该结果的请求 ID
-    confirmed_plan: dict      # 查询方案引用（不复制全量）
+    confirmed_plan: dict      # 当前查询方案（draft/locked/confirmed），不复制全量
     columns: list[str]        # 结果列名
     preview_rows: list[dict]  # 预览行（数量上限见 build_final_answer_node）
     row_count: int            # 总行数

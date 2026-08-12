@@ -20,7 +20,8 @@ def route_after_planner(state: AgentState):
             "status",
             "",
         ),
-        has_confirmed_plan=bool(confirmed_plan),
+        # draft 只是追问中的草稿，只有 locked/confirmed 才算已有完整方案
+        has_confirmed_plan=confirmed_plan.get("status") in ("locked", "confirmed"),
     )
 
     return route

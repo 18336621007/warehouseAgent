@@ -83,11 +83,16 @@ class MetricAmbiguityValidator:
             if isinstance(resolution, dict) and resolution.get("mention")
         }
         # LLM 提交的 concept_resolutions：对用户回复的解读完全信任，程序只校验字段合法性
-        llm_map = {
-            item.get("mention", ""): item
-            for item in (llm_resolutions or [])
-            if isinstance(item, dict) and item.get("mention")
-        }
+        # 兼容 mention/user_intent/concept 等概念字段名
+        llm_map = {}
+        for item in (llm_resolutions or []):
+            if not isinstance(item, dict):
+                continue
+            mention = str(
+                item.get("mention") or item.get("user_intent") or item.get("concept") or ""
+            ).strip()
+            if mention:
+                llm_map[mention] = item
 
         resolutions: list[dict] = []
         ambiguities: list[dict] = []
@@ -107,7 +112,12 @@ class MetricAmbiguityValidator:
             llm_resolution = llm_map.get(mention)
 
             # 信任 LLM 对用户回复的解读：字段必须落在真实候选或上轮已确认字段内
-            llm_field = (llm_resolution or {}).get("field", "")
+            llm_field = str(
+                (llm_resolution or {}).get("field")
+                or (llm_resolution or {}).get("resolved_field")
+                or (llm_resolution or {}).get("selected_field")
+                or ""
+            ).strip()
             if llm_field:
                 resolution = self._resolve_from_llm(
                     mention, llm_field, previous, candidates,
@@ -514,6 +524,9 @@ class MetricAmbiguityValidator:
         candidates: list[dict],
     ) -> dict:
         """按 LLM 提交的字段构造解析记录；字段非法时返回 None 交由后续判定。"""
+        # 兼容 "db.table.field" 完整路径：拆出物理字段名再校验
+        if "." in llm_field:
+            llm_field = llm_field.rsplit(".", 1)[-1]
         valid_fields = {
             candidate.get("field", "") for candidate in candidates
         }

@@ -149,29 +149,11 @@ class QueryPlanSchemaResolver:
                 f"{primary_table}"
             )
 
-        same_name_tables = [
-            table
-            for table in available_tables
-            if table.get("table_name") == table_name
-        ]
-
-        # 当前 Provider 只接收裸表名，因此同名表必须拒绝执行
-        if len(same_name_tables) > 1:
-            same_name_identifiers = [
-                (
-                    f"{table.get('database_name', '')}."
-                    f"{table.get('table_name', '')}"
-                )
-                for table in same_name_tables
-            ]
-            raise ValueError(
-                "当前元数据接口无法安全区分跨库同名表："
-                + ", ".join(same_name_identifiers)
-            )
+        # Provider 已支持 db.table 全名定位，跨库同名表由 describe_table 精确解析
 
         table_schema = (
             self.metadata_provider.describe_table(
-                table_name
+                primary_table
             )
         )
 
@@ -233,14 +215,11 @@ class QueryPlanSchemaResolver:
         total_columns = 0
 
         for table_identifier in tables:
-            database_name, table_name = (
-                _parse_table_identifier(table_identifier)
-            )
 
             # 加载该表的完整 Schema
             table_schema = (
                 self.metadata_provider.describe_table(
-                    table_name
+                    table_identifier
                 )
             )
 

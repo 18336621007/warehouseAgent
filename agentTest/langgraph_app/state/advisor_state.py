@@ -7,5 +7,5 @@ from agentTest.langgraph_app.state.query_plan import QueryPlan
 
 class AdvisorState(BaseState, PlannerHandoffState, total=False):
     # Advisor 负责生成 status=locked 的标准查询方案
-    confirmed_plan: QueryPlan         # Advisor 写入 locked 方案
+    confirmed_plan: QueryPlan         # 当前查询方案（draft/locked/confirmed），Advisor 写入
     final_answer: str            # Advisor 回复文本

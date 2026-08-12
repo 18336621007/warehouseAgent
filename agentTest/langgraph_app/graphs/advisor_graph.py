@@ -19,7 +19,7 @@ from agentTest.config.advisor import (
     MAX_COLUMN_CHECK_RETRIES,
 )
 from langchain_core.messages import HumanMessage, AIMessage
-from agentTest.langgraph_app.services.query_plan_service import lock_query_plan
+from agentTest.langgraph_app.services.query_plan_service import lock_query_plan, merge_draft_plan, validate_field_table_bindings
 from agentTest.langgraph_app.services.metric_ambiguity_validator import MetricAmbiguityValidator
 from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
 from agentTest.langgraph_app.services.candidate_reranker import (
@@ -72,10 +72,10 @@ def _build_rerank_history(messages, max_turns=6) -> str:
 
 
 def _freeze_reranked_options(result, reranker, history_text, effective_query, user_input) -> dict:
-    """对第一个未解析指标做模型受限精选并冻结编号；返回 {mention: options}。
+    """对第一个未解析指标做模型受限精选，生成候选快照；返回 {mention: options}。
 
-    精选/冻结失败时回退程序排序候选（complete_selection 保证下限），
-    澄清流程不中断且候选完整展示。
+    精选/失败时回退程序排序候选（complete_selection 保证下限），
+    澄清流程不中断且候选完整展示；编号仅作为展示参考，不参与用户选择解析。
     """
     if result.resolved:
         return {}
@@ -101,7 +101,7 @@ def _freeze_reranked_options(result, reranker, history_text, effective_query, us
 
 
 def _reuse_frozen_options(result, frozen_options_by_mention) -> None:
-    """把本轮预校验冻结的候选选项应用到门禁结果，保证编号与展示一致。"""
+    """把本轮预校验的候选快照应用到门禁结果，保证展示口径与注入事实一致。"""
     ambiguity = result.ambiguities[0] if (result.ambiguities or []) else None
     if ambiguity is None:
         return
@@ -443,12 +443,8 @@ def build_advisor_subgraph(runtime):
                 "如果整体目标已经变化，可以重新构建完整方案。",
             ])
 
-        metric_resolution_context = MetricClarificationService.build_resolution_context(
-            current_spec
-        )
-        if metric_resolution_context:
-            # 将程序已解析口径注入本轮上下文，避免 Advisor 再次依赖自然语言猜测。
-            context_lines.extend(["", metric_resolution_context])
+        # Advisor 只依赖【当前已有方案】中的 concept_resolutions 判断已确认口径，
+        # 不再注入“已确认口径”列表：用户改选后旧口径不会因程序提示而保留。
 
         # 指标歧义门禁预校验：多候选未解决时先由模型受限精选候选并冻结编号，
         # 再把候选事实注入上下文；LLM 决定怎么回答（问区别解释区别、闲聊简短回应），
@@ -501,7 +497,7 @@ def build_advisor_subgraph(runtime):
                         frozen_options_by_mention[pending_mention] = frozen_options
                         reused_pending = True
                 if not reused_pending:
-                    # 无可用固化候选：模型受限精选 + 程序冻结编号（精选只影响展示，不产生解析证据）
+                    # 无可用固化候选：模型受限精选生成候选快照（精选只影响展示，不产生解析证据）
                     frozen_options_by_mention.update(_freeze_reranked_options(
                         pre_clarification_result,
                         reranker,
@@ -688,6 +684,16 @@ def build_advisor_subgraph(runtime):
             "submit_query_plan",
         )
 
+        # update_draft_plan：模型在追问中逐步落盘当前已确认的方案部分（status=draft）
+        draft_args_list = _get_tool_call_args(
+            current_round_messages,
+            "update_draft_plan",
+        )
+        draft_plan = None
+        if draft_args_list:
+            draft_args, _ = draft_args_list[-1]
+            draft_plan = merge_draft_plan(current_plan, draft_args)
+
         # 指标歧义门禁结果，None 表示未启用或未触发
         resolution_result = None
         ambiguity_result = None
@@ -738,13 +744,24 @@ def build_advisor_subgraph(runtime):
                 )
                 if not resolution_result.resolved:
                     # 多候选且用户未选择：阻止锁定，程序生成候选选项并追问；
-                    # 复用本轮预校验冻结的编号，避免展示列表与用户看到的选项错位
+                    # 复用本轮预校验的候选快照，保证展示口径与注入事实一致
                     ambiguity_result = resolution_result
                     _reuse_frozen_options(ambiguity_result, frozen_options_by_mention)
                     log_node_event(
                         "advisor_agent",
                         f"指标歧义门禁拦截: {resolution_result.reason}",
                     )
+                else:
+                    # 指标已解决：只把用户明确确认(explicit_user)的解析证据转成
+                    # 可审计的 concept_resolutions 用于收敛 measures；
+                    # llm_submitted 只是模型单轮解读，不能作为用户确认口径的证据
+                    resolved_concept_resolutions = {
+                        mention: info
+                        for mention, info in metric_validator.to_plan_resolutions(
+                            resolution_result
+                        ).items()
+                        if isinstance(info, dict) and info.get("source") == "explicit_user"
+                    }
 
             proposed_plan = {
                 "tables": list(args.get("tables") or []),
@@ -781,29 +798,41 @@ def build_advisor_subgraph(runtime):
                 # 指标歧义未解决或解析证据不合法时，禁止生成 locked_plan
                 locked_plan = None
             else:
-                try:
-                    # tables、fields、状态和时间戳统一由领域服务生成
-                    locked_plan = lock_query_plan(
-                        proposed_plan,
-                        concept_resolutions=resolved_concept_resolutions,
+                # 字段-表归属校验：程序保证元数据准确，防止字段挂错表导致执行阶段失败
+                binding_errors = validate_field_table_bindings(proposed_plan)
+                if binding_errors:
+                    plan_validation_error = (
+                        "字段与声明表不匹配：" + ", ".join(binding_errors)
                     )
-
-                    log_plan_locked(
-                        "advisor_agent",
-                        table=locked_plan.get("table", ""),
-                        measures=locked_plan.get("measures", []),
-                        dimensions=locked_plan.get("dimensions", []),
-                        order_by=locked_plan.get("order_by", []),
-                        result_limit=locked_plan.get("result_limit", 1000),
-                        table_plans=locked_plan.get("table_plans") or [],
-                    )
-                except ValueError as error:
-                    # 方案不完整时禁止伪装成已锁定
-                    plan_validation_error = str(error)
                     log_node_event(
                         "advisor_agent",
-                        f"方案锁定失败: {plan_validation_error}",
+                        f"字段归属校验失败: {plan_validation_error}",
                     )
+                    locked_plan = None
+                else:
+                    try:
+                        # tables、fields、状态和时间戳统一由领域服务生成
+                        locked_plan = lock_query_plan(
+                            proposed_plan,
+                            concept_resolutions=resolved_concept_resolutions,
+                        )
+
+                        log_plan_locked(
+                            "advisor_agent",
+                            table=locked_plan.get("table", ""),
+                            measures=locked_plan.get("measures", []),
+                            dimensions=locked_plan.get("dimensions", []),
+                            order_by=locked_plan.get("order_by", []),
+                            result_limit=locked_plan.get("result_limit", 1000),
+                            table_plans=locked_plan.get("table_plans") or [],
+                        )
+                    except ValueError as error:
+                        # 方案不完整时禁止伪装成已锁定
+                        plan_validation_error = str(error)
+                        log_node_event(
+                            "advisor_agent",
+                            f"方案锁定失败: {plan_validation_error}",
+                        )
 
         elif metric_mentions and not submission_blocked:
             # LLM 未提交方案时：存在未解析指标歧义也必须由程序生成澄清候选，
@@ -824,28 +853,29 @@ def build_advisor_subgraph(runtime):
                 ambiguity_result = pre_result
 
         if ambiguity_result is not None:
-            # 需要用户选口径：默认用程序模板列选项，保证简洁稳定；
-            # 仅当用户明确询问口径区别（clarification_explanation）时才用 LLM 解释文案
+            # 需要用户选口径：优先透传 LLM 生成的回复（模型自由组织文案与编号），
+            # 程序只做字段白名单兜底（禁止引用候选之外的字段）
             if submit_args_list:
                 final_answer = MetricClarificationService.build_clarification_message(
                     ambiguity_result
                 )
-            elif planner_entities.get("follow_up_mode") == "clarification_explanation":
+            else:
                 llm_reply = str(getattr(last_msg, "content", "") or "").strip()
                 if llm_reply and MetricClarificationService.validate_field_references(
                     llm_reply,
                     ambiguity_result,
                 ):
                     final_answer = llm_reply
-                else:
-                    # 引用候选外字段或空回复：回退模板说明口径区别，保证信息来自真实备注
+                elif planner_entities.get("follow_up_mode") == "clarification_explanation":
+                    # 用户问区别：程序基于候选原始备注生成解释，保证口径信息来自真实备注
                     final_answer = MetricClarificationService.build_clarification_explanation(
                         ambiguity_result
                     )
-            else:
-                final_answer = MetricClarificationService.build_clarification_message(
-                    ambiguity_result
-                )
+                else:
+                    # 空回复或引用候选外字段：回退模板，保证候选可见
+                    final_answer = MetricClarificationService.build_clarification_message(
+                        ambiguity_result
+                    )
         elif locked_plan:
             # 只展示经过程序校验的 locked 方案
             # 确认消息附带真实元数据的中文含义（字段/表），避免只给名称
@@ -917,8 +947,11 @@ def build_advisor_subgraph(runtime):
         if locked_plan:
             # State 字段沿用 confirmed_plan，具体阶段由 plan.status 区分
             return_value["confirmed_plan"] = locked_plan
+        elif draft_plan is not None:
+            # 追问中逐步完善的方案以 draft 状态持久化，供下一轮继续补充
+            return_value["confirmed_plan"] = draft_plan
 
-        # 提交校验和预校验统一回写，首轮候选必须固化后才能可靠解释下一轮编号。
+        # 提交校验和预校验统一回写，候选快照跨轮复用，供模型判断下一轮用户选择。
         effective_result = resolution_result or ambiguity_result
         if effective_result is not None:
             return_value["analysis_spec"] = MetricClarificationService.update_analysis_spec(

@@ -170,6 +170,44 @@ def search_columns(question: str, table: str = "") -> str:
     return "\n".join(lines)
 
 
+
+@tool
+def update_draft_plan(
+    tables: list[str] = None,
+    measures: list[str] = None,
+    dimensions: list[str] = None,
+    time_field: str = "",
+    time_range: str = "",
+    filters: str = "",
+    field_sources: list[str] = None,   # ["db.table.field", ...]
+    order_by: list[dict] = None,       # [{"field": "new_order", "direction": "DESC"}]
+    having: str = "",
+    result_limit: int = 1000,
+    complex: bool = False,
+    concept_resolutions: list[dict] = None,  # 指标解析证据（审计用）
+) -> str:
+    """在追问过程中，把当前已确认的查询方案部分写入草稿状态（status=draft）。
+
+    与 submit_query_plan 的区别：本工具允许只提交部分槽位（如先确认指标、再补维度），
+    程序会保留旧方案未修改部分；当你判断查询方案已满足查询需求时，
+    必须调用 submit_query_plan 提交完整方案并等待用户最终确认。
+
+    参数说明：
+    - tables: 查询涉及的全部表列表，单表如 ["ads_trip.xxx"]，多表如 ["ads_trip.xxx", "dim_trip.yyy"]
+    - measures: 度量字段列表（裸字段名），无则传 []
+    - dimensions: 维度字段列表（裸字段名），无则传 []
+    - time_field: 目标表中的时间字段
+    - time_range: 用户确认的时间范围，如 昨天、最近7天
+    - filters: 额外过滤条件，没有时传 ""
+    - field_sources: 每个字段的完整物理标识列表，格式 ["db.table.field", ...]
+    - concept_resolutions: 指标解析证据列表，字段必须来自候选列表或上轮已确认字段
+    """
+    return (
+        f"方案草稿已更新: 表={tables}, 度量={measures}, "
+        f"维度={dimensions}, 时间={time_field}({time_range or '未指定'}), "
+        f"过滤={filters or '无'}"
+    )
+
 def build_advisor_tools(db_vector_store, table_vector_store, column_vector_store):
     """注入三层 FAISS 实例，返回 Advisor 工具列表。"""
     global _db_vector_store, _table_vector_store, _column_vector_store
@@ -181,5 +219,6 @@ def build_advisor_tools(db_vector_store, table_vector_store, column_vector_store
         search_databases,
         search_tables,
         search_columns,
+        update_draft_plan,
         submit_query_plan,
     ]

@@ -109,8 +109,8 @@ class HiveMetadataProvider(BaseMetadataProvider):
             for table in self._tables_cache or []:
                 table_name = table["table_name"]
                 database_name = table["database_name"]
-                # 复用 describe_table 已缓存的表备注，避免重复查询
-                cached = self._table_schema_cache.get(table_name)
+                # 复用 describe_table 已缓存的表备注，避免重复查询（缓存按 db.table 全名）
+                cached = self._table_schema_cache.get(f"{database_name}.{table_name}")
                 if cached and cached.get("table_comment"):
                     table["table_comment"] = cached["table_comment"]
                     continue
@@ -124,42 +124,59 @@ class HiveMetadataProvider(BaseMetadataProvider):
                 cursor.close()
                 conn.close()
 
-    def describe_table(self, table_name: str):
+    def describe_table(self, table_identifier: str):
         # 单表结构查询也要做白名单校验，避免绕过 list_tables 直接访问非白名单表
-        # 先定位表所属库名：缓存未初始化时先列出全部表
+        # 支持 db.table 全名精确定位；短表名仅在同名表唯一时可用，跨库同名必须显式写 db.table
         if self._tables_cache is None:
             self.list_tables()
-        database_name = ""
-        for table in self._tables_cache:
-            if table["table_name"] == table_name:
-                database_name = table["database_name"]
-                break
-        if not database_name or not is_table_allowed(table_name, database_name):
-            raise ValueError(f"table not allowed: {table_name}")
 
-        if table_name in self._table_schema_cache:
-            return copy.deepcopy(self._table_schema_cache[table_name])
+        identifier = str(table_identifier or "").strip()
+        if "." in identifier:
+            database_name, table_name = identifier.split(".", 1)
+            database_name = database_name.strip()
+            table_name = table_name.strip()
+        else:
+            database_name = ""
+            table_name = identifier
+
+        # 在白名单过滤后的表清单中定位物理表，避免跨库同名表歧义
+        matches = [
+            table
+            for table in self._tables_cache
+            if table["table_name"] == table_name
+            and (not database_name or table["database_name"] == database_name)
+        ]
+        if not matches:
+            raise ValueError(f"table not allowed or not exists: {identifier}")
+        if len(matches) > 1:
+            same_name_identifiers = [
+                f"{table['database_name']}.{table['table_name']}"
+                for table in matches
+            ]
+            raise ValueError(
+                "表名存在跨库歧义，必须使用 db.table 完整标识："
+                + ", ".join(same_name_identifiers)
+            )
+
+        table = matches[0]
+        database_name = table["database_name"]
+        table_name = table["table_name"]
+        cache_key = f"{database_name}.{table_name}"
+
+        if not is_table_allowed(table_name, database_name):
+            raise ValueError(f"table not allowed: {identifier}")
+
+        if cache_key in self._table_schema_cache:
+            return copy.deepcopy(self._table_schema_cache[cache_key])
 
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
             self._describe_table_query_cnt += 1
-            # 用找到的库名尝试，失败则遍历所有白名单库重试
-            last_error = None
-            databases_to_try = [database_name] + [db for db in get_allowed_databases() if db != database_name]
-            for db_name in databases_to_try:
-                try:
-                    sql = f"describe {db_name}.{table_name}"
-                    cursor.execute(sql)
-                    database_name = db_name  # 找到后更新真实库名
-                    break
-                except Exception as error:
-                    last_error = error
-                    continue
-            else:
-                raise last_error
-
+            # 全名定位后直接描述目标库表，不再遍历猜测
+            sql = f"describe {database_name}.{table_name}"
+            cursor.execute(sql)
             rows = cursor.fetchall()
 
             columns = []
@@ -196,8 +213,8 @@ class HiveMetadataProvider(BaseMetadataProvider):
                 "table_type": "",
                 "columns": columns,
             }
-            self._table_schema_cache[table_name] = res
-            return copy.deepcopy(self._table_schema_cache[table_name])
+            self._table_schema_cache[cache_key] = res
+            return copy.deepcopy(self._table_schema_cache[cache_key])
         finally:
             cursor.close()
             conn.close()

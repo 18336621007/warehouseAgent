@@ -98,7 +98,7 @@ def _enrich_columns(meta_provider, datasource, structured_llm):
         table_name = table_info["table_name"]
         database_name = table_info["database_name"]
         full_name = f"{database_name}.{table_name}"
-        schema = meta_provider.describe_table(table_name)
+        schema = meta_provider.describe_table(full_name)
         columns = schema.get("columns", [])
         total_cols = len(columns)
 
@@ -225,7 +225,7 @@ def _enrich_tables(meta_provider, structured_llm, enriched_columns, changed_tabl
         # 进度提示
         print(f"  [{idx+1}/{total_tables}] {full_name} 增强中...", end=" ")
 
-        schema = meta_provider.describe_table(table_name)
+        schema = meta_provider.describe_table(full_name)
 
         # 构建包含字段增强信息的上下文（维度/度量标记 + 别名）
         column_details = []

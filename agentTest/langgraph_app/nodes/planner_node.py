@@ -6,6 +6,8 @@
 #   ② LLM 解析：将召回元数据 + 用户问题 + 用户实际输入 + 已确认方案 + Advisor 上轮回复传给 LLM
 #   ③ 阈值判定：模糊需求进入 Advisor；明确需求先由 Advisor 锁定方案；
 #       只有用户最终确认 locked 方案后才能进入 Seeker
+from copy import deepcopy
+
 from langchain.agents.middleware.todo import Todo
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -47,8 +49,12 @@ def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
     return "\n".join(lines)
 
 
-def _build_pending_options_text(pendings):
-    """把待澄清候选组装成精简文本，供 Planner 判断用户选择。"""
+def _build_pending_options_text(pendings, resolutions=None):
+    """把待澄清候选组装成精简文本，供 Planner 判断用户选择。
+
+    pending 已关闭（用户已完成选择）时，回退展示已确认概念的候选快照，
+    让“改成第一个/第二个”等改选指代有稳定参照，不依赖模型记忆。
+    """
     lines = []
     for pending in pendings or []:
         lines.append(f"[{pending.get('mention', '')} id={pending.get('clarification_id', '')}]")
@@ -56,6 +62,18 @@ def _build_pending_options_text(pendings):
             lines.append(
                 f"{option.get('index')}. {option.get('meaning', '')}（字段：{option.get('field', '')}）"
             )
+    if not lines:
+        for resolution in (resolutions or []):
+            if resolution.get("status") != "resolved":
+                continue
+            candidates = resolution.get("candidates") or []
+            if len(candidates) <= 1:
+                continue
+            lines.append(f"[{resolution.get('mention', '')} 历史展示候选（改选时参考）]")
+            for index, candidate in enumerate(candidates, 1):
+                field = candidate.get("field", "")
+                table = str(candidate.get("table") or "").split(".")[-1]
+                lines.append(f"{index}. {field}（表：{table}）")
     return "\n".join(lines)
 
 
@@ -121,6 +139,65 @@ def _recall_columns(column_vector_store, question: str, table_scope: list[str]) 
     return docs
 
 
+def _apply_user_selection_to_draft(confirmed_plan: dict, selected_resolution: dict) -> dict:
+    """用户选择/改选口径后，Planner 将选择落到共享方案草稿：
+    更新该概念的 concept_resolutions，并把 measures/fields/order_by 中旧字段替换为最新选择，
+    方案状态回到 draft（Advisor 下一轮在此基础上继续完善或直接锁定）。
+
+    仅当方案已存在且能反查该概念旧字段时才改写；否则返回 None，
+    由 Advisor 通过 update_draft_plan 落草稿，避免凭空造方案。
+    """
+    plan = deepcopy(confirmed_plan or {})
+    if not plan or not selected_resolution:
+        return None
+    mention = str(selected_resolution.get("mention") or "")
+    new_field = str(selected_resolution.get("selected_field") or "")
+    if not mention or not new_field:
+        return None
+    concepts = plan.get("concept_resolutions") or {}
+    if not isinstance(concepts, dict):
+        concepts = {}
+    old_field = ""
+    previous = concepts.get(mention)
+    if isinstance(previous, dict):
+        old_field = str(previous.get("field") or "")
+    if not old_field:
+        # 方案尚未记录该概念解析：无法确定旧字段位置，交由 Advisor 重建
+        return None
+    concepts = dict(concepts)
+    concepts[mention] = {
+        "field": new_field,
+        "table": str(selected_resolution.get("selected_table") or ""),
+        "source": "explicit_user",
+    }
+    plan["concept_resolutions"] = concepts
+    # measures/fields 中替换该概念旧字段
+    if old_field in (plan.get("measures") or []):
+        plan["measures"] = [
+            new_field if m == old_field else m
+            for m in (plan.get("measures") or [])
+        ]
+    if old_field in (plan.get("fields") or []):
+        plan["fields"] = [
+            new_field if f == old_field else f
+            for f in (plan.get("fields") or [])
+        ]
+    # order_by 中的排序字段同步替换
+    order_by = list(plan.get("order_by") or [])
+    replaced_order = False
+    for item in order_by:
+        if isinstance(item, dict) and item.get("field") == old_field:
+            item["field"] = new_field
+            replaced_order = True
+    if replaced_order:
+        plan["order_by"] = order_by
+    # 改选后旧方案锁定/确认状态失效，回到草稿阶段
+    plan["status"] = "draft"
+    plan.pop("locked_at", None)
+    plan.pop("confirmed_at", None)
+    return plan
+
+
 def build_planner_node(runtime):
     # 三层索引中的表层和字段层
     table_vector_store = runtime["table_vector_store"]
@@ -151,7 +228,7 @@ def build_planner_node(runtime):
         original_question = state.get("original_question") or current_user_input
 
 
-        # ── 读取独立的 confirmed_plan（Advisor 写入，Planner 只读不改，首轮为空）──
+        # ── 读取共享方案 confirmed_plan（Advisor 写入草稿/locked；用户选择/改选时 Planner 改写草稿）──
         confirmed_plan = state.get("confirmed_plan") or {}
         has_plan = bool(
             confirmed_plan.get("table")
@@ -287,7 +364,8 @@ def build_planner_node(runtime):
                 "confirmed_context": confirmed_context,
                 "history_context": _build_history_context(state.get("messages") or []),
                 "pending_options": _build_pending_options_text(
-                    (state.get("analysis_spec") or {}).get("pending_clarifications") or []
+                    (state.get("analysis_spec") or {}).get("pending_clarifications") or [],
+                    (state.get("analysis_spec") or {}).get("metric_resolutions") or [],
                 ),
                 "resolution_context": MetricClarificationService.build_resolution_context(
                     state.get("analysis_spec") or {}
@@ -468,48 +546,64 @@ def build_planner_node(runtime):
             )
 
             # 2. 模型判断用户选择，程序白名单校验（判断归模型，校验归程序）
+            # 不要求存在 open pending：用户改选、补充选择时同样生效，
+            # 白名单 = pending 候选 ∪ 上轮已确认字段 ∪ 本轮召回候选字段
             selected_resolution = None
-            if open_pending:
-                user_selection = (
-                    planner_output.user_selection.model_dump()
-                    if planner_output.user_selection
-                    else {}
-                )
+            user_selection = (
+                planner_output.user_selection.model_dump()
+                if planner_output.user_selection
+                else {}
+            )
+            if user_selection.get("selected"):
+                candidate_fields = [
+                    str(candidate.get("field") or "")
+                    for candidate in (new_entities.get("column_candidates") or [])
+                    if candidate.get("field")
+                ] + list(planner_output.fields or [])
                 selected_resolution = MetricClarificationService.validate_user_selection(
                     user_selection,
-                    open_pending,
+                    pending_clarifications,
+                    existing_resolutions,
+                    candidate_fields,
+                    list(planner_output.metric_mentions or []),
                 )
+                if selected_resolution is None:
+                    # 模型判断了选择但程序白名单未命中：记录证据，便于排查改选失败
+                    log_sub_info(
+                        "user_selection未命中: "
+                        f"field={user_selection.get('field', '')} "
+                        f"reasoning={str(user_selection.get('reasoning', ''))[:120]}",
+                        node_name="planner",
+                    )
 
             # 3. 决定本轮的 metric_mentions
-            # 以 LLM 输出为基础；非换话题时保留上轮已确认(resolved)概念，
-            # 防止“选定单一候选口径”误删其他指标；换话题时完全信任 LLM 输出。
+            # 只保留 LLM 输出的当前需求概念：上轮 resolved 概念不再自动追加，
+            # 用户改选/放弃后旧概念从概念集消失，避免“纯新用户的新增订单”这类
+            # 旧口径因跨轮保留而复活；用户明确提到的概念由 LLM 自然输出。
             metric_mentions = list(planner_output.metric_mentions or [])
             if not metric_mentions:
                 metric_mentions = list(existing_spec.get("metric_mentions") or [])
-            elif planner_output.follow_up_mode != "new_query":
-                for existing_resolution in (existing_spec.get("metric_resolutions") or []):
-                    existing_mention = existing_resolution.get("mention", "")
-                    if (
-                        existing_mention
-                        and existing_resolution.get("status") == "resolved"
-                        and existing_mention not in metric_mentions
-                    ):
-                        metric_mentions.append(existing_mention)
             if selected_resolution is not None:
-                # 白名单校验通过：模型聚焦结果优先，用户选定单一口径时可缩小概念集，
-                # 模型未输出新概念时沿用上轮业务概念，避免“第二个”产生新的指标名称。
+                # 白名单校验通过：用户选定单一口径时确保该概念在集合中，
+                # 其余概念以 LLM 输出为准，不自动补回已放弃概念。
                 selected_mention = selected_resolution.get("mention", "")
                 resolution_by_mention[selected_mention] = selected_resolution
                 if selected_mention and selected_mention not in metric_mentions:
                     metric_mentions.append(selected_mention)
 
 
-            # 4. 重建 metric_resolutions（保留已解析，新概念初始为 ambiguous）
+            # 4. 重建 metric_resolutions（只保留程序可信的解析证据）
+            # llm_submitted 只是模型单轮解读，不跨轮保留，避免改选后旧口径残留；
+            # 用户明确选择(explicit_user)或元数据唯一(unique_metadata)的解析可保留。
             new_resolutions = []
             for mention in metric_mentions:
-                if mention in resolution_by_mention:
-                    # 保留 Advisor 已解析记录，避免用户选择被 Planner 重置
-                    new_resolutions.append(resolution_by_mention[mention])
+                existing = resolution_by_mention.get(mention)
+                if (
+                    existing
+                    and existing.get("status") == "resolved"
+                    and existing.get("resolution_source") in ("explicit_user", "unique_metadata")
+                ):
+                    new_resolutions.append(existing)
                 else:
                     new_resolutions.append({
                         "mention": mention,
@@ -536,10 +630,11 @@ def build_planner_node(runtime):
                 "metric_resolutions": new_resolutions,
             })
             if selected_resolution is not None:
-                # 选择已通过白名单校验：pending 关闭并移出活动列表，解析证据保留在 metric_resolutions
+                # 选择已通过白名单校验：关闭对应 pending（按澄清 ID），解析证据保留在 metric_resolutions
+                resolved_cid = selected_resolution.get("clarification_id", "")
                 analysis_spec["pending_clarifications"] = [
                     p for p in pending_clarifications
-                    if p.get("clarification_id") != open_pending.get("clarification_id")
+                    if p.get("clarification_id") != resolved_cid
                 ]
             elif open_pending and open_pending.get("mention") in metric_mentions:
                 # 概念仍存活且用户未选择：保留 open pending（延迟澄清恢复）
@@ -565,14 +660,23 @@ def build_planner_node(runtime):
             if updated_plan is not None:
                 return_value["confirmed_plan"] = updated_plan
 
-            if open_pending:
+            # 用户选择/改选口径后，Planner 将选择落到共享方案草稿
+            # （替换该概念旧字段，状态回到 draft；方案尚无该概念时交由 Advisor 重建）
+            if selected_resolution is not None:
+                selection_plan = _apply_user_selection_to_draft(
+                    state.get("confirmed_plan") or {},
+                    selected_resolution,
+                )
+                if selection_plan is not None:
+                    return_value["confirmed_plan"] = selection_plan
+                    log_sub_info(
+                        f"口径选择已落方案草稿: {selected_resolution.get('selected_field', '')}",
+                        node_name="planner",
+                    )
+
+            if selected_resolution is not None:
                 log_sub_info(
-                    "用户选择校验: "
-                    + (
-                        f"命中 {selected_resolution.get('selected_field', '')}"
-                        if selected_resolution
-                        else "未选择/未命中（pending 保留或清理）"
-                    ),
+                    f"用户选择校验: 命中 {selected_resolution.get('selected_field', '')}",
                     node_name="planner",
                 )
             log_sub_info(f"follow_up_mode: {planner_output.follow_up_mode}", node_name="planner")

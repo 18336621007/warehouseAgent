@@ -25,7 +25,7 @@ class SeekerState(BaseState, total=False):
     retry_count: int
     sql_fix_reason: str
     # Seeker 只接受 status=confirmed 的完整查询方案
-    confirmed_plan: QueryPlan         # 只读，SQL 一致性校验用
+    confirmed_plan: QueryPlan         # 当前查询方案（draft/locked/confirmed），只读，SQL 一致性校验用
 
     # SQL 执行重试相关字段
     sql_exec_failed: bool         # SQL 执行是否失败

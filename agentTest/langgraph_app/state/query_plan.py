@@ -2,8 +2,8 @@
 from typing import Literal, TypedDict
 
 
-# locked 表示完整方案等待确认，confirmed 表示允许 Seeker 执行
-PlanStatus = Literal["locked", "confirmed"]
+# draft 表示追问中逐步完善的方案，locked 表示完整方案等待确认，confirmed 表示允许 Seeker 执行
+PlanStatus = Literal["draft", "locked", "confirmed"]
 
 
 class QueryPlan(TypedDict, total=False):
@@ -56,6 +56,24 @@ def validate_query_plan(
 
     if not isinstance(plan, dict):
         return ["查询方案必须是字典"]
+
+    # draft：追问过程中逐步完善的方案，允许槽位为空，只做最小结构校验
+    if plan.get("status") == "draft":
+        draft_errors = []
+        draft_tables = plan.get("tables") or []
+        draft_measures = plan.get("measures") or []
+        draft_dimensions = plan.get("dimensions") or []
+        if not isinstance(draft_measures, list) or any(
+            not isinstance(item, str) for item in draft_measures
+        ):
+            draft_errors.append("measures 必须是字符串列表")
+        if not isinstance(draft_dimensions, list) or any(
+            not isinstance(item, str) for item in draft_dimensions
+        ):
+            draft_errors.append("dimensions 必须是字符串列表")
+        if (not draft_tables) and (not draft_measures) and (not draft_dimensions):
+            draft_errors.append("草稿方案至少需要数据表或字段")
+        return draft_errors
 
     table = plan.get("table", "")
     tables = plan.get("tables") or []

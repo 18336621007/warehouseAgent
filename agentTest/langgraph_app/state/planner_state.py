@@ -12,7 +12,7 @@ class PlannerState(BaseState, PlannerHandoffState, total=False):
     planner_confidence: float
 
     # Planner 负责检查方案并处理最终确认
-    confirmed_plan: QueryPlan
+    confirmed_plan: QueryPlan         # 当前查询方案（draft/locked/confirmed）
 
     # 连续问答类型：new_query / plan_refinement / result_follow_up / clarification_explanation
     follow_up_mode: str

@@ -13,6 +13,7 @@ from agentTest.langchain_app.app_builder import build_langchain_tools
 from agentTest.langchain_app.app_builder import build_table_rag
 from agentTest.langgraph_app.services.query_plan_schema_resolver import QueryPlanSchemaResolver
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
+from agentTest.langgraph_app.services.whitelist_filtered_store import WhitelistFilteredVectorStore
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 def build_graph_runtime():
     # 结构化日志由TimedRotatingFileHandler按天滚动，服务启动时保留历史日志
@@ -82,9 +83,9 @@ def build_graph_runtime():
             query_plan_schema_resolver
         ),
         # 新增：三层向量库（Advisor 用）
-        "db_vector_store": db_rag["vector_store"],
-        "table_vector_store": table_rag["vector_store"],
-        "column_vector_store": column_rag["vector_store"],
+        "db_vector_store": WhitelistFilteredVectorStore(db_rag["vector_store"], metadata_provider, key="database"),
+        "table_vector_store": WhitelistFilteredVectorStore(table_rag["vector_store"], metadata_provider, key="table"),
+        "column_vector_store": WhitelistFilteredVectorStore(column_rag["vector_store"], metadata_provider, key="table"),
         "example_vector_store": example_vector_store,  # Evaluator 示例向量库
         "tools": tools,
         "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}

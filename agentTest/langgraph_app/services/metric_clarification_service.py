@@ -40,8 +40,8 @@ class MetricClarificationService:
     ) -> list[dict]:
         """为模型精选后的字段按程序确定性顺序生成冻结选项（编号 1..n），供展示与 pending 共用。
 
-        编号必须在精选后由程序统一分配；跨轮复用由 pending 生命周期保证，
-        防止用户回复编号与展示列表错位。option 携带 mention，保证落位到对应指标概念。
+        编号仅作为候选快照的展示参考，不参与用户选择解析；跨轮复用由 pending 生命周期保证，
+        option 携带 mention，保证落位到对应指标概念。
         """
         mention = str(ambiguity.get("mention") or "")
         by_field = {
@@ -67,55 +67,127 @@ class MetricClarificationService:
         return options
 
     @classmethod
-    def validate_user_selection(cls, user_selection: dict, pending: dict) -> dict | None:
-        """模型判断的白名单校验：field 必须命中 pending.options，clarification_id 对齐。"""
-        if not pending or not user_selection:
-            return None
-        if str(pending.get("status") or "open") != "open":
+    def validate_user_selection(
+        cls,
+        user_selection: dict,
+        pending_clarifications: list[dict] = None,
+        existing_resolutions: list[dict] = None,
+        candidate_fields: list[str] = None,
+        metric_mentions: list[str] = None,
+    ) -> dict | None:
+        """模型判断用户选择的白名单校验：field 必须命中候选集合
+        （pending.options ∪ 上轮已确认字段 ∪ 本轮召回字段），程序不解析用户文本。
+
+        无 open pending 时同样生效（用户改选/补充选择），
+        返回解析记录；字段不在任何候选集合时返回 None（宁可不解析，不猜测）。
+        """
+        if not user_selection:
             return None
         if not user_selection.get("selected"):
             return None
         field = str(user_selection.get("field") or "").strip()
-        cid = str(user_selection.get("clarification_id") or "").strip()
         if not field:
             return None
-        if cid and cid != str(pending.get("clarification_id") or ""):
+        # 兼容 db.table.field 完整路径：统一拆成裸字段名后再做白名单匹配
+        if "." in field:
+            field = field.rsplit(".", 1)[-1]
+
+        # 候选白名单 = 所有 pending.options ∪ 上轮已确认字段 ∪ 本轮召回字段
+        allowed = set(str(item) for item in (candidate_fields or []) if item)
+        matched_pending = None
+        for pending in (pending_clarifications or []):
+            for option in (pending.get("options") or []):
+                option_field = str(option.get("field") or "")
+                if option_field:
+                    allowed.add(option_field)
+                if option_field == field:
+                    matched_pending = pending
+        for resolution in (existing_resolutions or []):
+            selected_field = str(resolution.get("selected_field") or "")
+            if selected_field:
+                allowed.add(selected_field)
+        if field not in allowed:
             return None
-        selected = next(
-            (
-                option
-                for option in (pending.get("options") or [])
-                if str(option.get("field") or "") == field
-            ),
-            None,
-        )
-        if selected is None:
-            return None
-        candidate = {
-            "table": selected.get("table", ""),
-            "field": selected.get("field", ""),
-            "semantic_type": "measure",
-            "comment": selected.get("comment", ""),
-            "aliases": [selected.get("meaning", "")] if selected.get("meaning") else [],
-        }
+
+        # 反查业务概念：优先命中的 pending，其次上轮已确认字段所属概念
+        mention = ""
+        clarification_id = ""
+        selected = None
+        if matched_pending is not None:
+            mention = str(matched_pending.get("mention") or "")
+            clarification_id = str(matched_pending.get("clarification_id") or "")
+            selected = next(
+                (
+                    option
+                    for option in (matched_pending.get("options") or [])
+                    if str(option.get("field") or "") == field
+                ),
+                None,
+            )
+        else:
+            for resolution in (existing_resolutions or []):
+                if str(resolution.get("selected_field") or "") == field:
+                    mention = str(resolution.get("mention") or "")
+                    break
+        if not mention:
+            # 字段在候选集合但无法反查概念：仅当本轮只有一个指标概念时可归属该概念，
+            # 多概念时宁可不解析，交由 Advisor 继续澄清
+            active_mentions = [m for m in (metric_mentions or []) if m]
+            if len(active_mentions) == 1:
+                mention = active_mentions[0]
+            else:
+                return None
+
+        # 候选快照：保留展示过的全部候选（供后续改选参照），至少包含选中的字段
+        snapshot_candidates = []
+        if matched_pending is not None:
+            for option in (matched_pending.get("options") or []):
+                snapshot_candidates.append({
+                    "table": option.get("table", ""),
+                    "field": option.get("field", ""),
+                    "semantic_type": "measure",
+                    "comment": option.get("comment", ""),
+                    "aliases": (
+                        [option.get("meaning", "")]
+                        if option.get("meaning")
+                        else []
+                    ),
+                })
+        if not snapshot_candidates:
+            snapshot_candidates.append({
+                "table": (selected or {}).get("table", ""),
+                "field": field,
+                "semantic_type": "measure",
+                "comment": (selected or {}).get("comment", ""),
+                "aliases": (
+                    [(selected or {}).get("meaning", "")]
+                    if (selected or {}).get("meaning")
+                    else []
+                ),
+            })
         return {
-            "mention": pending.get("mention", ""),
+            "mention": mention,
             "concept_type": "metric",
             "status": "resolved",
-            "selected_field": selected.get("field", ""),
-            "selected_table": selected.get("table", ""),
+            "selected_field": field,
+            "selected_table": snapshot_candidates[0]["table"],
             "resolution_source": "explicit_user",
-            "clarification_id": pending.get("clarification_id", ""),
-            "candidates": [candidate],
+            "clarification_id": clarification_id,
+            "candidates": snapshot_candidates,
         }
 
     @classmethod
     def update_analysis_spec(cls, current_spec: dict, result, clarification_id: str = "") -> dict:
         """将 Validator 结果写回 AnalysisSpec，并自动创建或清理待确认状态。"""
         updated_spec = dict(current_spec or {})
-        updated_spec["metric_resolutions"] = (
-            list(result.resolutions or []) + list(result.ambiguities or [])
-        )
+        # llm_submitted 只是模型单轮解读，不写入持久化状态，
+        # 避免改选后旧口径在下一轮被当作“已确认”复活
+        updated_spec["metric_resolutions"] = [
+            item for item in (
+                list(result.resolutions or []) + list(result.ambiguities or [])
+            )
+            if item.get("resolution_source") != "llm_submitted"
+        ]
         if result.resolved:
             updated_spec["pending_clarifications"] = []
         else:
@@ -136,10 +208,19 @@ class MetricClarificationService:
 
     @staticmethod
     def build_resolution_context(analysis_spec: dict) -> str:
-        """构造已确认指标上下文，确保 Advisor 使用程序状态而不是重新猜测。"""
+        """构造已确认指标上下文，供 Planner 判断用户选择/改选。
+
+        只展示用户明确选择(explicit_user)或元数据唯一(unique_metadata)的解析；
+        llm_submitted 只是模型单轮解读，不当作已确认口径展示，避免误导改选判断。
+        """
         lines = []
         for resolution in (analysis_spec or {}).get("metric_resolutions") or []:
             if resolution.get("status") != "resolved":
+                continue
+            if resolution.get("resolution_source") not in (
+                "explicit_user",
+                "unique_metadata",
+            ):
                 continue
             mention = resolution.get("mention", "")
             field = resolution.get("selected_field", "")
