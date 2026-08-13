@@ -39,6 +39,11 @@ HIVE_HOST=your_hive_host
 HIVE_PORT=10000
 HIVE_USER=hive
 HIVE_DATABASE=default
+
+# 日志开关（可选，见 agentTest/config/log_config.py）
+LOG_LLM_ENABLED=True        # 是否记录 LLM 调用（llm.call / llm.response）
+LOG_LLM_MAX_LENGTH=0        # LLM 输入输出最大长度，0=不截断
+LOG_STATE_TOP_N=3           # State 快照中列表字段最多记录条数
 ```
 
 ### 4. 初始化元数据与向量索引（首次运行前）
@@ -224,6 +229,8 @@ python agentTest/scripts/trace_view.py [--date 日期] [--no-color] <list|show|s
 | `filter` | 按条件过滤：`--event` 事件名、`--node` 节点名、`--request` request_id 前缀、`--topic` topic_id、`--error` error_id、`--keyword` 关键词、`--limit` 条数（默认 50）、`--full` 不截断 |
 | `tail` | 查看原始日志尾部：`--lines N` 行数（默认 20）、`--follow` 持续跟踪新增内容 |
 | `nodeslow` | 节点耗时排行：`--top N` 条数（默认 20） |
+| `prompt <request_id>` | 查看 LLM 输入与输出：调用→输出交错配对、同调用方输入去重，`--caller` 指定调用方、`--full` 不截断 |
+| `summary <request_id>` | 请求级摘要：输入/结果/耗时/节点数/LLM 调用数与事件分布 |
 
 全局参数：`--date YYYY-MM-DD` 指定日志日期（默认读取当前文件）；`--no-color` 禁用彩色输出。
 

@@ -121,6 +121,10 @@ def chat():
     # 每次HTTP请求使用独立request_id
     request_id = uuid.uuid4().hex
 
+    def _sse_req(data_dict):
+        # SSE 事件统一携带 request_id，前端可据此关联日志排查问题
+        return _sse({**data_dict, "request_id": request_id})
+
     # 每个Topic拥有独立的LangGraph Checkpoint
     graph_thread_id = f"{conversation_id}:{topic_id}"
     config = {
@@ -141,7 +145,7 @@ def chat():
 
         # 仅首条消息做意图识别，追问消息跳过（直接走 LangGraph）
         if is_first_topic_turn:
-            yield _sse({"type": "status", "text": "正在识别意图..."})
+            yield _sse_req({"type": "status", "text": "正在识别意图..."})
             try:
                 intent_result = classify_intent(message)
             except Exception as error:
@@ -159,10 +163,10 @@ def chat():
                 session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None})
                 log_request_end(
                     result_type="chat",
-                    node_count=0,
+                    summary={"nodes": 0, "intent": "chat"},
                     ms=elapsed_ms(request_timer),
                 )
-                yield _sse({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0})
+                yield _sse_req({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0})
                 return
 
         state_input = {
@@ -206,7 +210,7 @@ def chat():
                 seen.add(node_name)
                 label = NODE_LABELS.get(node_name, node_name)
                 thinking_parts.append("[" + node_name + "] " + label)
-                yield _sse({"type": "thinking", "node": node_name, "text": label})
+                yield _sse_req({"type": "thinking", "node": node_name, "text": label})
 
         final_state = APP.get_state(config)
         result = (final_state and final_state.values) or {}
@@ -262,11 +266,11 @@ def chat():
             result_type="query",
             route=route,
             topic_status=topic_status,
-            node_count=len(seen),
+            summary={"nodes": len(seen), "route": route, "topic_status": topic_status},
             ms=elapsed_ms(request_timer),
         )
 
-        yield _sse({
+        yield _sse_req({
             "type": "done",
             "content": final_answer,
             "sql": display_sql,
@@ -364,7 +368,7 @@ def chat():
                 ms=elapsed_ms(request_timer),
             )
 
-            yield _sse({
+            yield _sse_req({
                 "type": "error",
                 "text": QUERY_SAFE_ERROR_MESSAGE,
                 "error_code": QUERY_ERROR_CODE,

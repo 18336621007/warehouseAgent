@@ -113,7 +113,7 @@ def search_column_candidates(question: str, table: str = "", k: int = None) -> l
             "comment": page_content,
             "aliases": _extract_aliases_from_content(page_content),
             "enum_hint": _build_enum_hint(field, metadata.get("table", "")),
-            "score": float(round(1 - float(distance) / 2, 4)),
+            "score": float(round(float(distance), 4)),
         })
     return candidates
 

@@ -31,16 +31,26 @@ class ExampleVectorStore:
         path = _CACHE_EXAMPLE_DIR
         if os.path.exists(path) and os.listdir(path):
             try:
-                self._vector_store = FAISS.load_local(
+                import warnings
+                with warnings.catch_warnings():
+                    # 加载时抑制误导警告（IP+归一化后反序列化会触发）
+                    warnings.filterwarnings("ignore", message="Normalizing L2 is not applicable.*")
+                    self._vector_store = FAISS.load_local(
                     path, self.embeddings, allow_dangerous_deserialization=True
                 )
                 return
             except Exception:
                 pass
         placeholder = Document(page_content="placeholder", metadata={"_placeholder": True})
-        self._vector_store = FAISS.from_documents(
-            [placeholder], self.embeddings, distance_strategy=DistanceStrategy.COSINE
-        )
+        import warnings
+        with warnings.catch_warnings():
+            # 真正余弦：IP 索引 + 向量归一化，分数即余弦相似度
+            warnings.filterwarnings("ignore", message="Normalizing L2 is not applicable.*")
+            self._vector_store = FAISS.from_documents(
+                [placeholder], self.embeddings,
+                distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
+                normalize_L2=True,
+            )
 
     def add_example(self, question: str, sql: str, answer: str,
                     tables: list, fields: list, domain_tag: str, score: float,
@@ -62,7 +72,7 @@ class ExampleVectorStore:
         if existing:
             top_doc, top_score = existing[0]
             if not top_doc.metadata.get("_placeholder"):
-                similarity = 1 - top_score / 2
+                similarity = float(top_score)
                 doc_tables = json.loads(top_doc.metadata.get("tables", "[]"))
                 doc_fields = json.loads(top_doc.metadata.get("fields", "[]"))
                 same_structure = (
@@ -141,7 +151,7 @@ class ExampleVectorStore:
         docs_with_scores = self._vector_store.similarity_search_with_score(question, k=k * 3)
         candidates = [(doc, score) for doc, score in docs_with_scores
                       if not doc.metadata.get("_placeholder")
-                      and (1 - score / 2) >= min_similarity]
+                      and float(score) >= min_similarity]
         if not candidates:
             return []
         if current_tables:
@@ -152,15 +162,16 @@ class ExampleVectorStore:
                 table_overlap = len(set(doc_tables) & set(current_tables)) / max(len(current_tables), 1)
                 field_overlap = len(set(doc_fields)) / max(len(doc_fields), 1) if doc_fields else 0
                 structure_score = (table_overlap + field_overlap) / 2
-                combined = 0.3 * (1 - score / 2) + 0.7 * structure_score
+                combined = 0.3 * float(score) + 0.7 * structure_score
                 scored.append((doc, combined))
             scored.sort(key=lambda x: x[1], reverse=True)
             # _similarity 已在 candidates 处理阶段写入，此处直接返回
             return [doc for doc, _ in scored[:k]]
-        candidates.sort(key=lambda x: x[1])
+        # 余弦分数越大越相似，降序排列（IP 索引返回正则）
+        candidates.sort(key=lambda x: x[1], reverse=True)
         # 将相似度写入 metadata 供日志使用
         for doc, score in candidates[:k]:
-            doc.metadata["_similarity"] = round(1 - score / 2, 3)
+            doc.metadata["_similarity"] = round(float(score), 3)
         return [doc for doc, _ in candidates[:k]]
 
     def _save_to_disk(self):

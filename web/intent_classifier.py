@@ -4,6 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name
+from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 
 
 class IntentResult(BaseModel):
@@ -34,6 +35,7 @@ def _get_llm():
             model=get_model_name(),
             temperature=0,
             timeout=10,
+            callbacks=[build_llm_logging_handler("intent_classifier")],
         ).with_structured_output(IntentResult)
     return _llm
 

@@ -11,6 +11,7 @@ from agentTest.config.advisor import (
 )
 from agentTest.langgraph_app.prompts.reranker_prompt import RERANK_SYSTEM_PROMPT
 from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
+from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 
 
 class ClarificationRerankOutput(BaseModel):
@@ -105,6 +106,7 @@ def build_candidate_reranker(llm=None) -> Callable:
             model=get_model_name(),
             temperature=0,
         extra_body=get_model_extra_body(),
+            callbacks=[build_llm_logging_handler("candidate_reranker")],
         )
     structured_llm = llm.with_structured_output(ClarificationRerankOutput)
     prompt = ChatPromptTemplate.from_messages([
@@ -131,11 +133,14 @@ def build_candidate_reranker(llm=None) -> Callable:
             candidates=candidates,
         )
         try:
-            output = chain.invoke({
-                "mention": mention,  # 显式传入本次澄清的指标概念，供 prompt 精排约束使用
-                "max_candidates": MAX_AMBIGUITY_CANDIDATES,
-                "input_text": input_text,
-            })
+            output = chain.invoke(
+                {
+                    "mention": mention,  # 显式传入本次澄清的指标概念，供 prompt 精排约束使用
+                    "max_candidates": MAX_AMBIGUITY_CANDIDATES,
+                    "input_text": input_text,
+                },
+                config={"metadata": {"caller": "candidate_reranker"}},
+            )
         except Exception:
             # 精选失败不阻断澄清流程，回退程序排序
             return [], ""

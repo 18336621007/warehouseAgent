@@ -1,6 +1,6 @@
 # 多智能体 Text2SQL 系统架构文档
 
-> 最后更新：2026-08-12 | 全局单一共享查询方案（Planner 改选落草稿、门禁只信 explicit_user）；Evaluator 改为复杂度预算评分
+> 最后更新：2026-08-13 | 全局单一共享查询方案（Planner 改选落草稿、门禁只信 explicit_user）；Evaluator 复杂度预算评分；日志 call_id 配对与 LLM 输入去重
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -114,8 +114,9 @@ state/
 
 | 参数 | 当前值 | 说明 |
 |---|---:|---|
-| `TABLE_SEARCH_K` | 5 | 表级召回数量 |
-| `COLUMN_SEARCH_K` | 7 | 字段级召回数量 |
+| `TABLE_SEARCH_K` | 10 | 表级召回数量（先召回表，再在表内召回字段） |
+| `COLUMN_SEARCH_K` | 15 | 单表内字段检索 k 与全局兜底检索 k |
+| `PER_TABLE_COLUMN_QUOTA` | 4 | 每张召回表最多进入候选的字段数 |
 | `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 高相似候选观测阈值（仅日志观测，不参与路由） |
 | `MAX_HIGH_SIMILARITY_COUNT` | 3 | 高相似候选统计与告警基线 |
 | `EXAMPLE_SIMILARITY_THRESHOLD` | 0.7 | 优质示例最低相似度 |
@@ -245,7 +246,8 @@ comprehensive_score = W_TIME * time_score + W_TURN * turn_score
 - 每条事件携带 `seq / trace_id / span_id / parent_span_id`，可还原请求级树形调用链。
 - 核心异常在 Web 请求边界生成 `error_id` 并记录完整堆栈，前端只展示安全提示。
 - Intent Classifier、Evaluator 等可降级能力使用 `node.degraded`，不影响主查询结果。
-- 树形查看工具：`python agentTest/scripts/trace_view.py show <request_id前缀>`。
+- LLM 调用事件：`llm.call / llm.response / llm.error` 携带 `call_id` 配对，`prompt` 默认不截断（`LOG_LLM_MAX_LENGTH=0`），记录除系统提示词外的全部消息（human/ai/tool），ReAct 每步工具调用与工具结果都会体现。
+- 日志查看命令：`show`（树形链路）、`summary`（请求摘要）、`prompt`（LLM 输入输出，调用→输出交错配对、同调用方输入去重只保留新增部分）、`filter`（事件/节点/关键词过滤）、`slow/nodeslow`（耗时排行）。
 
 具体查询命令和排障流程见 [日志使用与问题排查指南](../指南/日志使用与问题排查指南.md)。
 
@@ -335,21 +337,27 @@ http://localhost:5000
 
 | 文件 | 配置项 | 默认值 | 说明 |
 |------|--------|--------|------|
-| `config/planner.py` | `TABLE_SEARCH_K` | 5 | Planner FAISS 表检索数量 |
-| | `COLUMN_SEARCH_K` | 7 | Planner FAISS 字段检索数量 |
+| `config/planner.py` | `TABLE_SEARCH_K` | 10 | Planner 表级检索数量（先召回表，再在表内召回字段） |
+| | `COLUMN_SEARCH_K` | 15 | 单表内字段检索 k 与全局兜底检索 k |
+| | `PER_TABLE_COLUMN_QUOTA` | 4 | 每张召回表最多进入候选的字段数 |
 | | `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 高相似候选观测阈值（余弦距离换算） |
 | | `MAX_HIGH_SIMILARITY_COUNT` | 3 | 高相似候选统计与告警基线（仅观测） |
 | | `EXAMPLE_SIMILARITY_THRESHOLD` | 0.7 | 优质示例最低相似度 |
-| `config/advisor.py` | `SEARCH_DB_K` | 3 | Advisor 库检索数量 |
-| `config/advisor.py` | `SEARCH_TABLE_K` | 5 | Advisor 表检索数量 |
-| | `SEARCH_COLUMN_K` | 10 | Advisor 字段检索数量 |
+| `config/advisor.py` | `SEARCH_DB_K` | 3 | Advisor 库级检索数量 |
+| | `SEARCH_TABLE_K` | 3 | Advisor 表级检索数量 |
+| | `SEARCH_COLUMN_K` | 5 | Advisor 字段级检索数量 |
 | | `MAX_DEMO_ADVISOR_TURNS` | 10 | 同一话题 Advisor 追问上限 |
 | | `MAX_COLUMN_CHECK_RETRIES` | 3 | 缺少字段检索时的图级重试上限 |
+| | `MAX_AMBIGUITY_CANDIDATES` | 6 | 澄清候选数量上限 |
+| | `MIN_CANDIDATE_SCORE` | 0.5 | 候选相似度下限，低于该分视为不相关 |
+| | `RERANK_MIN_CANDIDATES` | 2 | 多候选精选结果下限，防止收敛成单一口径 |
+| | `EXAMPLE_FIELD_BOOST` | 0.1 | 优秀案例命中字段的排序加权 |
 | `config/evaluator.py` | `HIGH_QUALITY_THRESHOLD` | 80 | 优质对话分数线 |
-| | `WEIGHT_TIME` | 0.2 | 响应时间权重 |
-| | `WEIGHT_TURNS` | 0.2 | 交互轮次权重 |
-| | `WEIGHT_LLM_SELF` | 0.4 | LLM 自评权重 |
-| | `WEIGHT_USER` | 0.2 | 用户评分权重 |
+| | `WEIGHT_TIME` | 0.1 | 响应时间权重 |
+| | `WEIGHT_TURNS` | 0.1 | 交互轮次权重 |
+| | `WEIGHT_LLM_SELF` | 0.3 | LLM 自评权重 |
+| | `WEIGHT_USER` | 0.5 | 用户评分权重（未打分默认 75） |
+| | 复杂度预算参数 | 见 `config/evaluator.py` | 期望轮次/耗时按指标数、维度数、表数等复杂度估算，不再写死固定阈值 |
 | `config/settings.py` | 环境变量 | — | LLM 模型名、API Key、Embedding 模型 |
 
 ---

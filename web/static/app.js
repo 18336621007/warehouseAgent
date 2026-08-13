@@ -132,6 +132,7 @@ async function sendMsg() {
         var thinkingText = "";
     console.log("[sendMsg] user=" + msg.slice(0, 60) + " conversation=" + conversationId);
     var finalContent = "", finalSql = "", finalEval = null, finalDialogueId = 0;
+    var finalRequestId = "";
 
     try {
         var res = await fetch(API + "/chat", {
@@ -156,6 +157,7 @@ async function sendMsg() {
                 if (!line.startsWith("data: ")) continue;
                 try {
                     var event = JSON.parse(line.slice(6));
+                    if (event.request_id) finalRequestId = event.request_id;
                     if (event.type === "status" || event.type === "thinking") {
                         updateLoading(loadingId, event.text);
                         thinkingText += event.text + "\n";
@@ -185,11 +187,12 @@ async function sendMsg() {
 
     removeLoading(loadingId);
         console.log("[sendMsg] finalContent=" + (finalContent || "(empty)").slice(0, 100));
-    appendMessage("assistant", finalContent || "(无响应)", finalSql, thinkingText, finalEval, finalDialogueId);
+    appendMessage("assistant", finalContent || "(无响应)", finalSql, thinkingText, finalEval, finalDialogueId, finalRequestId);
     if (conv) {
         conv.messages.push({
             role: "assistant", content: finalContent, sql: finalSql,
             thinking: thinkingText, evaluator: finalEval, dialogue_id: finalDialogueId,
+            request_id: finalRequestId,
         });
     }
     refreshConvList();
@@ -202,7 +205,7 @@ function updateLoading(id, text) {
     if (el) el.innerHTML = '<span class="spinner"></span> ' + text;
 }
 
-function appendMessage(role, content, sql, thinking, evaluator, dialogueId) {
+function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requestId) {
     var area = $("chatArea"); if (!area) return;
     var wrapper = document.createElement("div"); wrapper.className = "msg " + role;
 
@@ -234,6 +237,14 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId) {
             btn2.classList.toggle("open"); btn2.querySelector(".arrow").textContent = open ? "▶" : "▼";
         };
         c2.appendChild(btn2); c2.appendChild(cc2); bubble.appendChild(c2);
+    }
+
+    if (role === "assistant" && requestId) {
+        var rid = document.createElement("div");
+        rid.className = "request-id";
+        rid.textContent = "request_id: " + requestId;
+        rid.title = "复制该编号到 trace_view.py 查看本次查询日志";
+        bubble.appendChild(rid);
     }
 
     if (role === "assistant" && evaluator) {

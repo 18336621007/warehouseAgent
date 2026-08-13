@@ -9,12 +9,12 @@ from agentTest.config.advisor import (
     EXAMPLE_FIELD_BOOST,
     MAX_AMBIGUITY_CANDIDATES,
     MIN_CANDIDATE_SCORE,
-    PER_TABLE_COLUMN_QUOTA,
     RERANK_MIN_CANDIDATES,
 )
 from agentTest.config.planner import (
     COLUMN_SEARCH_K,
     TABLE_SEARCH_K,
+    PER_TABLE_COLUMN_QUOTA,
 )
 from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 
@@ -426,7 +426,7 @@ class MetricAmbiguityValidator:
             "semantic_type": metadata.get("fields_type", ""),
             "comment": page_content,
             "aliases": self._extract_aliases(page_content),
-            "score": float(round(1 - float(distance) / 2, 4)),
+            "score": float(round(float(distance), 4)),
             "table_hit": table_hit,
         }
 

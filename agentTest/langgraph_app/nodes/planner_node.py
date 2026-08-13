@@ -22,11 +22,14 @@ from agentTest.langgraph_app.runtime.graph_logger import log_example_retrieved
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
+from agentTest.langgraph_app.runtime.graph_logger import log_search_scores
+from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
+from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
-from agentTest.config.advisor import PER_TABLE_COLUMN_QUOTA
 from agentTest.config.planner import (
     TABLE_SEARCH_K,
     COLUMN_SEARCH_K,
+    PER_TABLE_COLUMN_QUOTA,
     HIGH_SIMILARITY_THRESHOLD,
     MAX_HIGH_SIMILARITY_COUNT
 )
@@ -234,12 +237,14 @@ def build_planner_node(runtime):
     column_vector_store = runtime["column_vector_store"]
 
     # ChatOpenAI：LangChain 标准的 OpenAI 兼容客户端
+    # 挂载 LLM 日志回调：记录 prompt/输出/耗时，便于 trace 回放
     chat_openai = ChatOpenAI(
         api_key=get_openai_api_key(),
         base_url=get_openai_base_url(),
         model=get_model_name(),
         temperature=0,                   # 判定任务不需要随机性
         extra_body=get_model_extra_body(),
+        callbacks=[build_llm_logging_handler("planner")],
     )
     # with_structured_output：告诉 LLM 按 PlannerOutput 的格式返回 JSON
     structured_llm = chat_openai.with_structured_output(PlannerOutput)
@@ -341,7 +346,7 @@ def build_planner_node(runtime):
             for doc, score in table_docs_with_scores:
                 content = doc.page_content[:500]
                 table_name = doc.metadata.get("table", "")
-                metadata_lines.append(f"[表 {table_name}, 距离: {score:.4f}]\n{content}")
+                metadata_lines.append(f"[表 {table_name}, 相似度: {score:.4f}]\n{content}")
             for doc, score in column_docs_with_scores:
                 content = doc.page_content[:300]
                 metadata_lines.append(f"[字段]\n{content}")
@@ -352,7 +357,7 @@ def build_planner_node(runtime):
             for doc, score in table_docs_with_scores:
                 table_candidates.append({
                     "table": doc.metadata.get("table", ""),
-                    "score": float(round(1 - float(score) / 2, 4)),
+                    "score": float(round(float(score), 4)),
                     "comment": (doc.page_content or "")[:200]
                 })
             column_candidates = []
@@ -360,7 +365,7 @@ def build_planner_node(runtime):
                 column_candidates.append({
                     "table": doc.metadata.get("table", ""),
                     "field": doc.metadata.get("field", doc.metadata.get("column", "")),
-                    "score": float(round(1 - float(score) / 2, 4)),
+                    "score": float(round(float(score), 4)),
                     "comment": (doc.page_content or "")[:200]
                 })
 
@@ -442,25 +447,26 @@ def build_planner_node(runtime):
 
 
             # ── 收集 top-k 分数，用于辅助日志 ──
-            table_scores = []
-            for doc, score in table_docs_with_scores:
-                similarity = round(1 - score / 2, 3)
-                name = doc.metadata.get("table", "?")
-                short_name = name if len(name) <= 40 else "..." + name[-37:]
-                table_scores.append(f"{short_name}({similarity})")
-            table_scores_str = " | ".join(table_scores)
+            table_scores = [
+                {
+                    "name": doc.metadata.get("table", "?"),
+                    "score": round(float(score), 3),
+                }
+                for doc, score in table_docs_with_scores
+            ]
 
-            column_scores = []
-            for doc, score in column_docs_with_scores:
-                similarity = round(1 - score / 2, 3)
-                name = doc.metadata.get("column", "?")
-                column_scores.append(f"{name}({similarity})")
-            column_scores_str = " | ".join(column_scores)
+            column_scores = [
+                {
+                    "name": doc.metadata.get("column", "?"),
+                    "score": round(float(score), 3),
+                }
+                for doc, score in column_docs_with_scores
+            ]
 
             # ── 步骤③：基于完整有效需求统计各层高相似度候选数量 ──
             high_similarity_table_count = 0
             for doc, score in ambiguity_table_docs_with_scores:
-                similarity = 1 - score / 2
+                similarity = float(score)
                 if similarity > HIGH_SIMILARITY_THRESHOLD:
                     high_similarity_table_count += 1
 
@@ -473,7 +479,7 @@ def build_planner_node(runtime):
                 if selected_tables and document_table not in selected_tables:
                     continue
 
-                similarity = 1 - score / 2
+                similarity = float(score)
                 if similarity > HIGH_SIMILARITY_THRESHOLD:
                     high_similarity_column_count += 1
 
@@ -545,9 +551,8 @@ def build_planner_node(runtime):
                 reason=planner_reason,
                 ms=elapsed_ms(timer),
             )
-            log_sub_info(f"有效需求: {effective_query}", node_name="planner")
-            log_sub_info(f"表: {table_scores_str}", node_name="planner")
-            log_sub_info(f"字段: {column_scores_str}", node_name="planner")
+            log_search_scores("planner", "table", table_scores)
+            log_search_scores("planner", "column", column_scores)
 
             # Planner 路由结果决定 Topic 下一阶段
             if route == "seeker":
@@ -715,6 +720,9 @@ def build_planner_node(runtime):
                     node_name="planner",
                 )
             log_sub_info(f"follow_up_mode: {planner_output.follow_up_mode}", node_name="planner")
+
+            # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
+            log_state_snapshot("planner", {**state, **return_value})
 
             return return_value
 

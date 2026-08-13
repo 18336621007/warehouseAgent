@@ -13,7 +13,17 @@ class SchemaVectorStore():
 
     def build(self, documents):
         """从文档列表构建 FAISS 向量库（不落盘），采用余弦相似度，更适合语义检索"""
-        return FAISS.from_documents(documents, self.embeddings, distance_strategy=DistanceStrategy.COSINE)
+        # 真正余弦：IP 索引 + 向量归一化，similarity_search_with_score 返回余弦相似度
+        import warnings
+        with warnings.catch_warnings():
+            # 该版本对 MAX_INNER_PRODUCT + normalize_L2 会误报警告，实际行为正确
+            warnings.filterwarnings("ignore", message="Normalizing L2 is not applicable.*")
+            return FAISS.from_documents(
+                documents,
+                self.embeddings,
+                distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
+                normalize_L2=True,
+            )
 
     # 简要注释：保存向量库到本地磁盘目录。
     def save(self, vector_store, path: str):
@@ -79,7 +89,11 @@ class SchemaVectorStore():
         # 加载已有缓存，对比新文档
         try:
             from agentTest.langgraph_app.runtime.graph_logger import log_node_event
-            vs = FAISS.load_local(path, self.embeddings, allow_dangerous_deserialization=True)
+            import warnings
+            with warnings.catch_warnings():
+                # 加载时同样抑制误导警告，不影响行为
+                warnings.filterwarnings("ignore", message="Normalizing L2 is not applicable.*")
+                vs = FAISS.load_local(path, self.embeddings, allow_dangerous_deserialization=True)
         except Exception:
             from agentTest.langgraph_app.runtime.graph_logger import log_node_event
             log_node_event("vector_store", f"加载失败（旧缓存），重建: {path}")
@@ -90,6 +104,12 @@ class SchemaVectorStore():
             if return_stats:
                 return vector_store, stats
             return vector_store
+
+        if not documents:
+            # 空文档列表时跳过同步，避免把已有向量误删（历史 bug：空列表会清空索引）
+            if return_stats:
+                return vs, stats
+            return vs
 
         existing = self._existing_key_to_ids(vs)
         new_docs = [d for d in documents if self._doc_key(d) not in existing]

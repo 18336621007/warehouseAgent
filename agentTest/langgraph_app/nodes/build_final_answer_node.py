@@ -9,6 +9,8 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
+from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
+from agentTest.llm import set_llm_caller
 from agentTest.langgraph_app.prompts.final_answer_prompt import (
     FINAL_ANSWER_HUMAN_TEMPLATE,
     FINAL_ANSWER_SYSTEM_PROMPT,
@@ -84,6 +86,8 @@ def build_build_final_answer_node(runtime):
     llm = runtime["llm"]
 
     def build_final_answer_node(state: AgentState):
+        # 标记调用方，LLM 日志按业务方归类（结果整理）
+        set_llm_caller("build_final_answer")
 
         sql_valid = state.get("sql_valid", False)
         # 回答基准使用当前有效需求，避免多轮追问后仍按话题首轮原文判断完整性
@@ -106,11 +110,13 @@ def build_build_final_answer_node(runtime):
                     ms=elapsed_ms(timer),
                 )
 
-                return _build_answer_update(
+                update = _build_answer_update(
                     state,
                     f"本次未执行 SQL 查询，因为生成的 SQL 未通过校验。原因：{sql_error}",
                     "failed",
                 )
+                log_state_snapshot("build_final_answer", {**state, **update})
+                return update
 
             # sql 校验成功
             sql_result = state.get("sql_result", {})
@@ -134,12 +140,14 @@ def build_build_final_answer_node(runtime):
                     ms=elapsed_ms(timer),
                 )
 
-                return _build_answer_update(
+                update = _build_answer_update(
                     state,
                     "SQL 已成功执行，但没有查询到符合条件的数据。",
                     "completed",
                     extra_update=result_update,
                 )
+                log_state_snapshot("build_final_answer", {**state, **update})
+                return update
 
             prompt = ChatPromptTemplate.from_messages([
                 ("system", FINAL_ANSWER_SYSTEM_PROMPT),
@@ -184,12 +192,14 @@ def build_build_final_answer_node(runtime):
                 answer_preview=answer_preview,
                 ms=elapsed_ms(timer),
             )
-            return _build_answer_update(
+            update = _build_answer_update(
                 state,
                 final_answer,
                 "completed",
                 extra_update=result_update,
             )
+            log_state_snapshot("build_final_answer", {**state, **update})
+            return update
         except Exception as error:
             # 记录节点异常日志
             log_node_error(

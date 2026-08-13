@@ -1,6 +1,6 @@
 # Planner 检索阈值与观测指标校准指南
 
-> 最后更新：2026-08-12
+> 最后更新：2026-08-13
 > 设计状态：候选数量仅作观测指标，已取消强制路由  
 > [返回文档索引](../文档索引.md)
 
@@ -83,8 +83,9 @@ Seeker 精确执行
 
 | 配置 | 当前值 | 调整后用途 |
 |---|---:|---|
-| `TABLE_SEARCH_K` | 5 | 提供给 Planner 的表级候选数量 |
-| `COLUMN_SEARCH_K` | 7 | 提供给 Planner 的字段级候选数量 |
+| `TABLE_SEARCH_K` | 10 | 提供给 Planner 的表级候选数量（先召回表） |
+| `COLUMN_SEARCH_K` | 15 | 单表内字段检索 k 与全局兜底检索 k |
+| `PER_TABLE_COLUMN_QUOTA` | 4 | 每张召回表最多进入候选的字段数 |
 | `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 统计高相似候选的观测阈值 |
 | `MAX_HIGH_SIMILARITY_COUNT` | 3 | 历史告警基线，用于识别候选过宽场景 |
 | `EXAMPLE_SIMILARITY_THRESHOLD` | 0.7 | 历史优质示例最低采用相似度 |

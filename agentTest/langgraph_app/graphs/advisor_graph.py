@@ -12,6 +12,8 @@ from agentTest.langgraph_app.state.advisor_state import AdvisorState
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_timer, log_node_start, elapsed_ms, log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import log_tools_called, log_example_retrieved, log_plan_locked, log_advisor_mode
+from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
+from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
 from agentTest.langgraph_app.prompts.advisor_prompt import ADVISOR_SYSTEM_PROMPT
 from agentTest.config.advisor import (
@@ -275,12 +277,14 @@ def _lookup_semantic_labels(runtime, plan: dict) -> dict:
 
 def build_advisor_subgraph(runtime):
     """构建 Advisor ReAct Agent 子图 —— 一问一答，含方案提交合规校验。"""
+    # 挂载 LLM 日志回调：记录 prompt/输出/耗时，便于 trace 回放
     llm = ChatOpenAI(
         api_key=get_openai_api_key(),
         base_url=get_openai_base_url(),
         model=get_model_name(),
         temperature=0,
         extra_body=get_model_extra_body(),
+        callbacks=[build_llm_logging_handler("advisor")],
     )
 
     tools = build_advisor_tools(
@@ -980,6 +984,9 @@ def build_advisor_subgraph(runtime):
                 effective_result,
             )
 
+
+        # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
+        log_state_snapshot("advisor", {**state, **return_value})
 
         return return_value
 

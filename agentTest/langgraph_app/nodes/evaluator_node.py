@@ -20,6 +20,8 @@ from agentTest.langgraph_app.message_utils import build_advisor_dialogue_context
 from agentTest.langgraph_app.runtime.graph_logger import (
     log_node_start, log_node_end, log_node_degraded, elapsed_ms, start_timer,
 )
+from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
+from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 from agentTest.langchain_app.vectorstores.example_vector_store import example_hash_id
 from agentTest.metadata.mysql_store import save_evaluated_dialogue, load_enriched_tables
 
@@ -78,6 +80,7 @@ def build_evaluator_node(runtime):
         model=get_model_name(),
         temperature=0,
         extra_body=get_model_extra_body(),
+        callbacks=[build_llm_logging_handler("evaluator")],
     )
     structured_llm = llm.with_structured_output(EvaluatorSelfScore)
 
@@ -220,6 +223,13 @@ def build_evaluator_node(runtime):
                 expected_time_ms=round(expected_time_ms, 1),
                 ms=elapsed_ms(timer),
             )
+
+            # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
+            log_state_snapshot("evaluator", {**state, **{
+                "evaluator_score": comprehensive,
+                "evaluator_self_score": round(llm_self_avg, 1),
+                "evaluator_dialogue_id": dialogue_id or 0,
+            }})
 
             return {
                 "evaluator_score": comprehensive,

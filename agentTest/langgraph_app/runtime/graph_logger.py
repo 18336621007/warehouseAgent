@@ -1,12 +1,14 @@
 # Graph结构化日志工具，统一记录请求、节点和路由事件
 import json
 import logging
+import threading
 import traceback
 from contextvars import ContextVar
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from time import perf_counter
+from agentTest.config import log_config
 
 
 LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
@@ -14,6 +16,42 @@ LOG_FILE = LOG_DIR / "langgraph_app.jsonl"
 
 # 单条文本字段的最大长度，避免SQL和模型输出撑爆日志文件
 _MAX_TEXT_LENGTH = 2000
+
+# 事件分类：每类日志挂稳定的 category，便于 trace_view 按类别过滤
+_EVENT_CATEGORY = {
+    "request.started": "lifecycle",
+    "request.completed": "lifecycle",
+    "request.failed": "lifecycle",
+    "request.user_input": "lifecycle",
+    "cli.round.started": "lifecycle",
+    "node.started": "lifecycle",
+    "node.completed": "lifecycle",
+    "node.failed": "lifecycle",
+    "node.degraded": "lifecycle",
+    "node.event": "lifecycle",
+    "node.detail": "lifecycle",
+    "state.changed": "state",
+    "state.snapshot": "state",
+    "llm.call": "llm",
+    "llm.response": "llm",
+    "llm.error": "llm",
+    "route.decided": "plan",
+    "plan.locked": "plan",
+    "advisor.mode": "plan",
+    "metric_ambiguity.detected": "metric",
+    "metric_resolution.user_required": "metric",
+    "metric_resolution.completed": "metric",
+    "candidate_recall": "metric",
+    "candidate_rerank.selected": "metric",
+    "example.retrieved": "search",
+    "tools.called": "search",
+    "search.scores": "search",
+}
+
+# 当前请求内的 LLM 调用计数（跨线程共享）：LLM 调用可能在子线程执行，
+# 请求结束时在主线程读取，因此按 request_id 聚合而不是用线程局部变量
+_LLM_CALL_COUNTS: dict = {}
+_LLM_CALL_LOCK = threading.Lock()
 
 # 保存当前请求的日志身份，不同并发请求之间相互隔离
 _LOG_CONTEXT = ContextVar(
@@ -102,6 +140,14 @@ def _short_text(value, max_length=_MAX_TEXT_LENGTH):
     return text[:max_length] + "..."
 
 
+def _clip_text(value, max_length=0):
+    # 保留换行的文本裁剪，max_length<=0 表示不裁剪
+    text = str(value)
+    if max_length and len(text) > max_length:
+        return text[:max_length] + "..."
+    return text
+
+
 def _normalize_value(value):
     # 保留数字和布尔类型，并安全转换复杂对象
     if value is None or isinstance(value, (bool, int, float)):
@@ -161,6 +207,7 @@ def _write_log(level, event, node_name="", **kwargs):
         "level": logging.getLevelName(level),
         "event": event,
         "seq": seq,
+        "category": kwargs.pop("category", "") or _EVENT_CATEGORY.get(event, "other"),
     }
 
     log_context = _LOG_CONTEXT.get()
@@ -189,8 +236,13 @@ def _write_log(level, event, node_name="", **kwargs):
             continue
 
         # 异常堆栈保留完整内容，不使用普通文本截断规则
-        if key == "stack_trace":
-            payload[key] = str(value)
+        if key in ("stack_trace", "prompt", "output"):
+            max_length = (
+                log_config.LOG_LLM_MAX_LENGTH
+                if key in ("prompt", "output")
+                else 0
+            )
+            payload[key] = _clip_text(value, max_length)
         else:
             payload[key] = _normalize_value(value)
 
@@ -335,12 +387,16 @@ def log_request_start(**kwargs):
 
 def log_request_end(**kwargs):
     # 请求完成：清空 Span 栈，避免残留影响下一请求
-    _SPAN_STACK.set([])
+    # 请求级摘要：调用方补充节点数等统计，LLM 调用次数由日志层自动统计
+    summary = dict(kwargs.pop("summary", {}) or {})
+    summary.setdefault("llm_calls", get_llm_call_count())
+    clear_llm_call_count()
     _write_log(
         logging.INFO,
         "request.completed",
         span_id="request#0",
         parent_span_id="",
+        summary=summary,
         **kwargs,
     )
 
@@ -432,6 +488,7 @@ def log_metric_event(event, **kwargs):
         logging.INFO,
         event,
         node_name="metric_ambiguity",
+        category="metric",
         **kwargs,
     )
 
@@ -485,4 +542,235 @@ def log_advisor_mode(node_name, mode, completeness):
         node_name=node_name,
         mode=mode,
         completeness=completeness,
+    )
+
+def _current_request_id():
+    # 返回当前日志上下文的 request_id，无上下文返回空串
+    return _LOG_CONTEXT.get().get("request_id", "") or _LOG_CONTEXT.get().get("conversation_id", "")
+
+
+def get_llm_call_count():
+    # 返回当前请求内的 LLM 调用次数（由 llm 日志回调跨线程递增）
+    request_id = _current_request_id()
+    if not request_id:
+        return 0
+    with _LLM_CALL_LOCK:
+        return _LLM_CALL_COUNTS.get(request_id, 0)
+
+
+def incr_llm_call_count():
+    # LLM 日志回调每次调用时递增（按 request_id 聚合，跨线程安全）
+    request_id = _current_request_id()
+    if not request_id:
+        return
+    with _LLM_CALL_LOCK:
+        _LLM_CALL_COUNTS[request_id] = _LLM_CALL_COUNTS.get(request_id, 0) + 1
+
+
+def clear_llm_call_count():
+    # 请求结束后清理计数，避免内存增长
+    request_id = _current_request_id()
+    if not request_id:
+        return
+    with _LLM_CALL_LOCK:
+        _LLM_CALL_COUNTS.pop(request_id, None)
+
+
+def _plan_summary(plan):
+    # 查询方案摘要：只保留结构化关键字段，避免大对象写入日志
+    if not plan:
+        return {}
+    return {
+        "status": plan.get("status", ""),
+        "table": plan.get("table", ""),
+        "tables": plan.get("tables") or [],
+        "measures": plan.get("measures") or [],
+        "dimensions": plan.get("dimensions") or [],
+        "time_field": plan.get("time_field", ""),
+        "time_range": plan.get("time_range", ""),
+        "filters": plan.get("filters", ""),
+    }
+
+
+def _resolution_summary(resolutions):
+    # 指标/维度解析证据摘要，只保留状态、命中字段与候选数量
+    top_n = log_config.LOG_STATE_TOP_N
+    summary = []
+    for item in (resolutions or [])[:top_n]:
+        summary.append({
+            "mention": item.get("mention", ""),
+            "status": item.get("status", ""),
+            "selected_field": item.get("selected_field", ""),
+            "selected_table": item.get("selected_table", ""),
+            "source": item.get("resolution_source", ""),
+            "candidate_count": len(item.get("candidates") or []),
+        })
+    return summary
+
+
+def _spec_summary(spec):
+    # AnalysisSpec 摘要：业务概念与解析证据只保留 Top-N
+    if not spec:
+        return {}
+    return {
+        "analysis_type": spec.get("analysis_type", ""),
+        "metric_mentions": spec.get("metric_mentions") or [],
+        "dimension_mentions": spec.get("dimension_mentions") or [],
+        "time_range": spec.get("time_range", ""),
+        "time_grain": spec.get("time_grain", ""),
+        "order_by": spec.get("order_by") or [],
+        "metric_resolutions": _resolution_summary(spec.get("metric_resolutions")),
+        "dimension_resolutions": _resolution_summary(spec.get("dimension_resolutions")),
+    }
+
+
+def build_state_snapshot(state, node_name=""):
+    # 从共享 State 提取分层摘要：共享层（route/topic/方案/分析意图）+ Agent 层关键字段
+    snapshot = {}
+    snapshot["route"] = state.get("route", "")
+    snapshot["topic_status"] = state.get("topic_status", "")
+    snapshot["follow_up_mode"] = state.get("follow_up_mode", "")
+    snapshot["advisor_turns"] = state.get("advisor_turns", 0)
+    snapshot["effective_query"] = _short_text(
+        state.get("effective_query", ""),
+        max_length=300,
+    )
+    snapshot["original_question"] = _short_text(
+        state.get("original_question", ""),
+        max_length=150,
+    )
+    snapshot["confirmed_plan"] = _plan_summary(state.get("confirmed_plan") or {})
+    snapshot["analysis_spec"] = _spec_summary(state.get("analysis_spec") or {})
+
+    # Agent 层：Planner 实体与原因
+    entities = state.get("planner_entities") or {}
+    if entities:
+        snapshot["planner_entities"] = {
+            "table": entities.get("table", ""),
+            "tables": entities.get("tables") or [],
+            "fields": entities.get("fields") or [],
+            "completeness": entities.get("completeness", ""),
+        }
+    if state.get("planner_reason"):
+        snapshot["planner_reason"] = _short_text(
+            state.get("planner_reason", ""),
+            max_length=300,
+        )
+
+    # Agent 层：Advisor/Seeker/Evaluator 关键输出
+    if state.get("final_answer"):
+        snapshot["final_answer"] = _short_text(
+            state.get("final_answer", ""),
+            max_length=300,
+        )
+    if state.get("generated_sql"):
+        snapshot["generated_sql"] = _short_text(
+            state.get("generated_sql", ""),
+            max_length=500,
+        )
+    if state.get("sql_valid") is not None:
+        snapshot["sql_valid"] = state.get("sql_valid")
+    if state.get("sql_error"):
+        snapshot["sql_error"] = _short_text(
+            state.get("sql_error", ""),
+            max_length=300,
+        )
+    last_result = state.get("last_query_result") or {}
+    if last_result:
+        snapshot["last_query_result"] = {
+            "row_count": last_result.get("row_count", 0),
+            "columns": (last_result.get("columns") or [])[:5],
+            "result_summary": _short_text(
+                last_result.get("result_summary", ""),
+                max_length=200,
+            ),
+        }
+    if state.get("evaluator_score") is not None:
+        snapshot["evaluator_score"] = state.get("evaluator_score")
+    return snapshot
+
+
+def log_state_snapshot(node_name, state, **extra):
+    # 记录 Agent 节点执行后的 State 分层摘要（共享层 + Agent 层）
+    snapshot = build_state_snapshot(state, node_name)
+    _write_log(
+        logging.INFO,
+        "state.snapshot",
+        node_name=node_name,
+        category="state",
+        state=snapshot,
+        **extra,
+    )
+
+
+def log_llm_call(caller, model, prompts, call_id="", **extra):
+    # 记录 LLM 调用开始（含 prompt 摘要），供 trace 回放模型输入
+    if not log_config.LOG_LLM_ENABLED:
+        return
+    incr_llm_call_count()
+    _write_log(
+        logging.INFO,
+        "llm.call",
+        node_name=caller,
+        category="llm",
+        model=model,
+        call_id=call_id,
+        prompt=_clip_text(
+            "\n".join(str(item) for item in (prompts or [])),
+            log_config.LOG_LLM_MAX_LENGTH,
+        ),
+        **extra,
+    )
+
+
+def log_llm_response(caller, model, output, ms, tokens=None, call_id="", **extra):
+    # 记录 LLM 返回结果：输出、耗时与 token 用量
+    if not log_config.LOG_LLM_ENABLED:
+        return
+    _write_log(
+        logging.INFO,
+        "llm.response",
+        node_name=caller,
+        category="llm",
+        model=model,
+        call_id=call_id,
+        output=_clip_text(output or "", log_config.LOG_LLM_MAX_LENGTH),
+        ms=ms,
+        tokens=tokens or {},
+        **extra,
+    )
+
+
+def log_llm_error(caller, model, error, ms, call_id="", **extra):
+    # 记录 LLM 调用失败，不影响主流程继续执行
+    if not log_config.LOG_LLM_ENABLED:
+        return
+    _write_log(
+        logging.WARNING,
+        "llm.error",
+        node_name=caller,
+        category="llm",
+        model=model,
+        call_id=call_id,
+        error_message=_short_text(error, max_length=1000),
+        ms=ms,
+        **extra,
+    )
+
+
+def log_search_scores(node_name, layer, scores):
+    # 记录检索评分列表（结构化），替代原来的自由文本表/字段评分
+    _write_log(
+        logging.INFO,
+        "search.scores",
+        node_name=node_name,
+        category="search",
+        layer=layer,
+        scores=[
+            {
+                "name": _short_text(item.get("name", ""), max_length=80),
+                "score": item.get("score", 0),
+            }
+            for item in (scores or [])
+        ],
     )

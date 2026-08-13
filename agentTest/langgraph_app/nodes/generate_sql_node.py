@@ -11,6 +11,8 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
+from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
+from agentTest.llm import set_llm_caller
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
@@ -412,6 +414,8 @@ def build_generate_sql_node(runtime):
     default_prompt = runtime["prompt"]
 
     def generate_sql_node(state: AgentState) -> dict:
+        # 标记调用方，LLM 日志按业务方归类（生成 / 修复 / 一致性校验）
+        set_llm_caller("generate_sql")
         confirmed_plan = state.get("confirmed_plan") or {}
         # 企业级规则：走到 generate_sql 的请求必须有 confirmed_plan
         if not confirmed_plan.get("table") and not confirmed_plan.get("tables"):
@@ -621,6 +625,12 @@ def build_generate_sql_node(runtime):
                 ctx_len=len(schema_context),
                 ms=elapsed_ms(timer),
             )
+            # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
+            log_state_snapshot("generate_sql", {**state, **{
+                "generated_sql": generated_sql,
+                "topic_status": "validating_sql",
+            }})
+
             return {
                 "generated_sql": generated_sql,
 
