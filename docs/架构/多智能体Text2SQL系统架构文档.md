@@ -1,6 +1,6 @@
 # 多智能体 Text2SQL 系统架构文档
 
-> 最后更新：2026-08-13 | 全局单一共享查询方案（Planner 改选落草稿、门禁只信 explicit_user）；Evaluator 复杂度预算评分；日志 call_id 配对与 LLM 输入去重
+> 最后更新：2026-08-13 | Web 前端流式输出（思考过程/最终回答逐字、输入框即时解锁）；全局单一共享查询方案（Planner 改选落草稿、门禁只信 explicit_user）；Evaluator 复杂度预算评分；日志 call_id 配对与 LLM 输入去重
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -330,6 +330,37 @@ http://localhost:5000
 | `PUT/DELETE` | `/api/conversations/{conversation_id}` | 重命名或删除对话 |
 | `POST` | `/api/chat` | 传入 `conversation_id + message`，返回 SSE 流式结果 |
 | `POST` | `/api/score` | 传入 `conversation_id` 提交用户评分（1-5） |
+
+### 流式输出与输入框解锁
+
+Web 端采用 SSE（Server-Sent Events）实现 ChatGPT 式逐字输出：LangGraph 在后台线程执行，节点事件与 LLM token 实时写入请求级 `StreamBus`（`runtime/stream_bus.py`），SSE 线程只负责转发，前端按事件类型增量渲染。
+
+**SSE 事件协议**
+
+| 事件 | 携带字段 | 说明 |
+|------|---------|------|
+| `status` | `text` | 节点状态文案（如"正在识别意图..."） |
+| `thinking` | `node, text` | 思考过程段落（节点标签、命中表/字段、评分等） |
+| `token` | `scope, text, live, stream_id` | LLM 增量输出；`scope=thinking` 为思考过程、`scope=answer` 为最终回答；`live=true` 为实时流、`live=false` 为整段重放流；`stream_id` 用于段落归属 |
+| `thinking_retract` | `stream_id` | Advisor 最终回复从思考面板回收，改由回答区展示 |
+| `done` | `content, sql, thinking, evaluator, topic_status` | 业务正常结束，携带最终回答与展示元数据 |
+| `error` | `text, error_id` | 业务失败，前端只展示安全文案与错误编号 |
+
+**逐字输出机制**
+
+- 思考过程：所有非最终回答的 LLM 输出（Planner/Advisor 工具调用步等）通过 `token(scope=thinking)` 实时推送，前端按 `stream_id` 累积为段落，思考面板默认展开且自动滚动到底部。
+- 最终回答分两类：
+  - 查询结果回答（`build_final_answer` 节点）：真实实时流（`live=true`），逐 token 直接追加。
+  - Advisor 澄清/确认回复：LLM 结束后整段重放（`live=false`），前端进入打字机队列逐字展示，实现"先思考后回答"的视觉效果。
+- 工具调用只展示"调用工具: 名称"，不展开完整参数，避免思考过程过长。
+
+**输入框解锁机制**
+
+- 输入框只在"当前会话存在未结束请求（尚未收到 `done`/`error`）"时锁定（`updateInputLock` 基于 `doneReceived` 判断）。
+- `done`/`error` 一收到即标记 `doneReceived=true`，输入框立即解锁，不等待打字机播完。
+- 打字机继续逐字播放，播完才把占位消息固化为正式消息；期间用户直接发新消息时，程序先完整固化上一条、再发起新请求，保证消息顺序。
+- 打字机动态调速：剩余 token 尽量在约 3 秒内播完；另有 5 秒硬上限兜底，任何异常都不会让输入框长期锁定。
+- 请求结束/出错/删除会话时统一清理打字机定时器，避免悬挂。
 
 ---
 
