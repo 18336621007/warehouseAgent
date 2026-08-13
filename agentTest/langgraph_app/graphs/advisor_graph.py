@@ -21,6 +21,7 @@ from agentTest.config.advisor import (
     MAX_COLUMN_CHECK_RETRIES,
 )
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.callbacks import BaseCallbackHandler
 from agentTest.langgraph_app.services.query_plan_service import (
     lock_query_plan,
     merge_draft_plan,
@@ -34,6 +35,27 @@ from agentTest.langgraph_app.services.candidate_reranker import (
     complete_selection,
 )
 
+
+
+class _AdvisorThinkingCollector(BaseCallbackHandler):
+    """收集 Advisor ReAct 每步 LLM 输出（文本 + 工具调用），供前端思考过程展示。"""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def on_llm_end(self, response, **kwargs):
+        # 提取本次 LLM 输出的文本；若输出的是工具调用，则转成可读的“调用工具: ...”
+        text = ""
+        for generation_list in (response.generations or []):
+            for generation in generation_list:
+                text += generation.text or ""
+                message = getattr(generation, "message", None)
+                if message is not None:
+                    for tc in (getattr(message, "tool_calls", None) or []):
+                        # 工具调用只显示工具名，不输出完整参数，避免思考过程过长
+                        text += "\n调用工具: " + tc.get("name", "?")
+        if text.strip():
+            self.lines.append(text.strip())
 
 
 def _get_tool_call_args(messages, tool_name):
@@ -568,13 +590,16 @@ def build_advisor_subgraph(runtime):
         new_history = None
         retries = 0
         submission_blocked = False
+        # 收集 Advisor ReAct 每步 LLM 输出，供前端思考过程展示
+        thinking_collector = _AdvisorThinkingCollector()
 
 
         # 校验字段是不是真实的
         while retries <= MAX_COLUMN_CHECK_RETRIES:
-            result = agent.invoke({
-                "messages": agent_history,
-            })
+            result = agent.invoke(
+                {"messages": agent_history},
+                config={"callbacks": [thinking_collector]},
+            )
             new_history = result["messages"]
 
             # submit_query_plan 必须来自本轮，目标表字段检索允许复用当前 Topic 历史
@@ -632,6 +657,7 @@ def build_advisor_subgraph(runtime):
             error_answer = "系统处理异常，请重试"
             return {
                 "final_answer": error_answer,
+                "advisor_thinking": thinking_collector.lines,
                 "messages": [
                     AIMessage(
                         content=error_answer,
@@ -964,6 +990,8 @@ def build_advisor_subgraph(runtime):
             # Advisor 每执行一次，澄清轮次增加一次
             "advisor_turns": state.get("advisor_turns", 0) + 1,
             "final_answer": final_answer,
+            # ReAct 每步 LLM 输出，供前端思考过程展示
+            "advisor_thinking": thinking_collector.lines,
 
             # Advisor 返回后都需要等待用户继续补充或确认
             "topic_status": "clarifying",

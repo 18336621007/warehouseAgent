@@ -29,7 +29,7 @@ function loadConversation(conversationIdToLoad) {
     var area = $("chatArea");
     area.innerHTML = "";
     if (conv && conv.messages && conv.messages.length > 0) {
-        conv.messages.forEach(function (m) { appendMessage(m.role, m.content, m.sql, m.thinking, m.evaluator, m.dialogue_id, m.request_id); });
+        conv.messages.forEach(function (m) { appendMessage(m.role, m.content, m.sql, m.thinking, m.evaluator, m.dialogue_id, m.request_id, m.thinkingOpen, m); });
     } else {
         area.innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
     }
@@ -144,6 +144,7 @@ async function sendMsg() {
     pendingRequests[reqConv] = {
         thinking: "", status: "AI 正在思考...",
         content: "", sql: "", evaluator: null, dialogue_id: 0, request_id: "",
+        thinkingOpen: true,  // 思考面板默认展开，用户折叠/展开后保持
     };
     lockInput(true);
     hideEmpty();
@@ -211,19 +212,19 @@ async function sendMsg() {
     var pend = pendingRequests[reqConv];
     if (pend) {
         // 无论当前是否仍显示该会话，先写入内存消息（切换回来后可见）
-        if (conv) {
-            conv.messages.push({
-                role: "assistant", content: pend.content || "(无响应)", sql: pend.sql,
-                thinking: pend.thinking, evaluator: pend.evaluator, dialogue_id: pend.dialogue_id,
-                request_id: pend.request_id,
-            });
-        }
+        // 保存最终回复消息（含思考面板展开状态），切会话再切回仍保持一致
+        var savedMsg = {
+            role: "assistant", content: pend.content || "(无响应)", sql: pend.sql,
+            thinking: pend.thinking, evaluator: pend.evaluator, dialogue_id: pend.dialogue_id,
+            request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
+        };
+        if (conv) conv.messages.push(savedMsg);
         delete pendingRequests[reqConv];
         // 只有当前仍显示发起请求的会话时才更新 DOM 与焦点
         if (conversationId === reqConv) {
             removePendingMessage(reqConv);
             console.log("[sendMsg] finalContent=" + (pend.content || "(empty)").slice(0, 100));
-            appendMessage("assistant", pend.content || "(无响应)", pend.sql, pend.thinking, pend.evaluator, pend.dialogue_id, pend.request_id);
+            appendMessage("assistant", pend.content || "(无响应)", pend.sql, pend.thinking, pend.evaluator, pend.dialogue_id, pend.request_id, pend.thinkingOpen, savedMsg);
             input.focus();
         }
     }
@@ -248,20 +249,24 @@ function appendPendingMessage(convId) {
     statusSpan.textContent = pend.status;
     bubble.appendChild(spinner); bubble.appendChild(statusSpan);
 
-    // 可展开的思考过程面板，实时累积 LLM 输出
-    var collapse = document.createElement("div"); collapse.className = "collapse";
+    // 思考过程面板：置于气泡最上方（ChatGPT 风格），默认展开，用户折叠/展开状态实时记录
+    var collapse = document.createElement("div"); collapse.className = "collapse thinking-panel";
     var btn = document.createElement("button"); btn.className = "collapse-btn";
-    btn.innerHTML = '<span class="arrow">▶</span> 查看思考过程';
     var content = document.createElement("div"); content.className = "collapse-content pending-thinking";
     content.textContent = pend.thinking;
+    var open = pend.thinkingOpen !== false;
+    content.classList.toggle("show", open);
+    btn.classList.toggle("open", open);
+    btn.innerHTML = '<span class="arrow">' + (open ? "▼" : "▶") + '</span> 查看思考过程';
     btn.onclick = function () {
-        var open = content.classList.contains("show");
+        var wasOpen = content.classList.contains("show");
         content.classList.toggle("show");
         btn.classList.toggle("open");
-        btn.querySelector(".arrow").textContent = open ? "▶" : "▼";
+        btn.querySelector(".arrow").textContent = wasOpen ? "▶" : "▼";
+        pend.thinkingOpen = !wasOpen;
     };
     collapse.appendChild(btn); collapse.appendChild(content);
-    bubble.appendChild(collapse);
+    bubble.insertBefore(collapse, bubble.firstChild);
 
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
     area.appendChild(wrapper); area.scrollTop = area.scrollHeight;
@@ -285,7 +290,7 @@ function removePendingMessage(convId) {
     if (wrapper) wrapper.remove();
 }
 
-function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requestId) {
+function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requestId, thinkingOpen, msgObj) {
     var area = $("chatArea"); if (!area) return;
     var wrapper = document.createElement("div"); wrapper.className = "msg " + role;
 
@@ -295,16 +300,21 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
     var bubble = document.createElement("div"); bubble.className = "bubble";
     bubble.innerHTML = formatContent(content);
 
+    // 思考过程面板：置于回复内容上方，默认展开，用户折叠/展开状态回写消息记录
     if (thinking && thinking.trim()) {
-        var c1 = document.createElement("div"); c1.className = "collapse";
+        var c1 = document.createElement("div"); c1.className = "collapse thinking-panel";
         var btn1 = document.createElement("button"); btn1.className = "collapse-btn";
-        btn1.innerHTML = '<span class="arrow">▶</span> 查看思考过程';
         var cc1 = document.createElement("div"); cc1.className = "collapse-content"; cc1.textContent = thinking;
+        var open1 = thinkingOpen !== false;
+        cc1.classList.toggle("show", open1);
+        btn1.classList.toggle("open", open1);
+        btn1.innerHTML = '<span class="arrow">' + (open1 ? "▼" : "▶") + '</span> 查看思考过程';
         btn1.onclick = function () {
-            var open = cc1.classList.contains("show"); cc1.classList.toggle("show");
-            btn1.classList.toggle("open"); btn1.querySelector(".arrow").textContent = open ? "▶" : "▼";
+            var wasOpen = cc1.classList.contains("show"); cc1.classList.toggle("show");
+            btn1.classList.toggle("open"); btn1.querySelector(".arrow").textContent = wasOpen ? "▶" : "▼";
+            if (msgObj) msgObj.thinkingOpen = !wasOpen;
         };
-        c1.appendChild(btn1); c1.appendChild(cc1); bubble.appendChild(c1);
+        c1.appendChild(btn1); c1.appendChild(cc1); bubble.insertBefore(c1, bubble.firstChild);
     }
 
     if (sql && sql.trim()) {

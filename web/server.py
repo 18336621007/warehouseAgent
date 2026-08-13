@@ -34,6 +34,7 @@ NODE_LABELS = {
     "capture_user_message": "正在记录本轮问题...",
     "planner": "正在分析查询需求...",
     "advisor": "需求不够明确，正在检索相关信息...",
+    "advisor_agent": "正在核验元数据并确认口径...",
     "retrieve_schema": "正在检索数据表结构...",
     "enrich_schema_context": "正在补充字段信息...",
     "generate_sql": "正在生成 SQL...",
@@ -67,8 +68,11 @@ def _extract_node_detail(node_name, node_update):
             parts.append("路由: " + str(node_update.get("route")))
         if node_update.get("effective_query"):
             parts.append("有效需求: " + str(node_update.get("effective_query")))
-    elif node_name == "advisor":
-        if node_update.get("final_answer"):
+    elif node_name in ("advisor", "advisor_agent"):
+        # ReAct 每步 LLM 输出优先展示，final_answer 是最终回复文本
+        for line in (node_update.get("advisor_thinking") or []):
+            parts.append(str(line))
+        if not parts and node_update.get("final_answer"):
             parts.append(str(node_update.get("final_answer")))
     elif node_name == "generate_sql":
         if node_update.get("generated_sql"):
@@ -207,6 +211,8 @@ def chat():
 
         thinking_parts = ["[intent] query"]
         seen = set()
+        # Advisor 子图节点与父图节点各携带一份 thinking，只输出首次，避免重复
+        advisor_thinking_emitted = False
 
         for chunk in APP.stream(state_input, config, subgraphs=True):
             node_dict = chunk[1] if isinstance(chunk, tuple) else chunk
@@ -233,7 +239,14 @@ def chat():
                 if not node_name or node_name in seen: continue
                 seen.add(node_name)
                 label = NODE_LABELS.get(node_name, node_name)
-                detail = _extract_node_detail(node_name, node_update)
+                detail = ""
+                if node_name in ("advisor", "advisor_agent"):
+                    # Advisor 的 thinking 由子图与父图节点各携带一份，只输出首次
+                    if not advisor_thinking_emitted:
+                        advisor_thinking_emitted = True
+                        detail = _extract_node_detail(node_name, node_update)
+                else:
+                    detail = _extract_node_detail(node_name, node_update)
                 display_text = label + ("\n" + detail if detail else "")
                 thinking_parts.append("[" + node_name + "] " + display_text)
                 yield _sse_req({"type": "thinking", "node": node_name, "text": display_text})
