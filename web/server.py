@@ -51,6 +51,30 @@ QUERY_SAFE_ERROR_MESSAGE = "系统暂时无法完成本次查询，请稍后重�
 def _sse(data_dict):
     return "data: " + json.dumps(data_dict, ensure_ascii=False) + "\n\n"
 
+
+def _extract_node_detail(node_name, node_update):
+    """从节点写入 State 的增量中提取可展示的 LLM 输出，作为前端思考过程内容。
+
+    只取确定性的结构化输出字段，避免把整个 State 塞给前端。
+    """
+    if not isinstance(node_update, dict):
+        return ""
+    parts = []
+    if node_name == "planner":
+        if node_update.get("planner_reason"):
+            parts.append("决策理由: " + str(node_update.get("planner_reason")))
+        if node_update.get("route"):
+            parts.append("路由: " + str(node_update.get("route")))
+        if node_update.get("effective_query"):
+            parts.append("有效需求: " + str(node_update.get("effective_query")))
+    elif node_name == "advisor":
+        if node_update.get("final_answer"):
+            parts.append(str(node_update.get("final_answer")))
+    elif node_name == "generate_sql":
+        if node_update.get("generated_sql"):
+            parts.append("SQL: " + str(node_update.get("generated_sql")))
+    return "\n".join(parts)
+
 @app.before_request
 def log_request():
     if request.path.startswith("/api/chat"):
@@ -209,8 +233,10 @@ def chat():
                 if not node_name or node_name in seen: continue
                 seen.add(node_name)
                 label = NODE_LABELS.get(node_name, node_name)
-                thinking_parts.append("[" + node_name + "] " + label)
-                yield _sse_req({"type": "thinking", "node": node_name, "text": label})
+                detail = _extract_node_detail(node_name, node_update)
+                display_text = label + ("\n" + detail if detail else "")
+                thinking_parts.append("[" + node_name + "] " + display_text)
+                yield _sse_req({"type": "thinking", "node": node_name, "text": display_text})
 
         final_state = APP.get_state(config)
         result = (final_state and final_state.values) or {}

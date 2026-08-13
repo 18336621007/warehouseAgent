@@ -3,6 +3,9 @@ var API = "/api";
 // 当前选中的完整前端对话标识
 var conversationId = null;
 var conversations = {};
+// 每个会话的进行中请求状态（conversationId -> {thinking,status,content,...}），
+// 切换会话后占位消息与会话绑定，不共享同一个进度条
+var pendingRequests = {};
 
 function $(id) { return document.getElementById(id); }
 function hideEmpty() { var el = $("emptyState"); if (el) el.style.display = "none"; }
@@ -15,6 +18,7 @@ async function newChat() {
         conversations[conversationId] = { title: "新对话", messages: [] };
         $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         refreshConvList();
+        updateInputLock();
         return true;
     } catch (e) { return false; }
 }
@@ -25,11 +29,14 @@ function loadConversation(conversationIdToLoad) {
     var area = $("chatArea");
     area.innerHTML = "";
     if (conv && conv.messages && conv.messages.length > 0) {
-        conv.messages.forEach(function (m) { appendMessage(m.role, m.content, m.sql, m.thinking, m.evaluator, m.dialogue_id); });
+        conv.messages.forEach(function (m) { appendMessage(m.role, m.content, m.sql, m.thinking, m.evaluator, m.dialogue_id, m.request_id); });
     } else {
         area.innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
     }
+    // 该会话仍有进行中请求时恢复占位消息（思考内容从状态对象读取）
+    if (pendingRequests[conversationIdToLoad]) appendPendingMessage(conversationIdToLoad);
     refreshConvList();
+    updateInputLock();
 }
 
 async function renameConv(conversationIdToRename, event) {
@@ -52,12 +59,14 @@ async function deleteConv(conversationIdToDelete, event) {
     if (!confirm("确定删除此对话？")) return;
     try {
         await fetch(API + "/conversations/" + conversationIdToDelete, { method: "DELETE" });
+        delete pendingRequests[conversationIdToDelete];
         delete conversations[conversationIdToDelete];
         if (conversationId === conversationIdToDelete) {
             conversationId = null;
             $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         }
         refreshConvList();
+        updateInputLock();
     } catch (e) {}
 }
 
@@ -109,6 +118,11 @@ function lockInput(disabled) {
     if (btn) btn.disabled = disabled;
 }
 
+function updateInputLock() {
+    // 只有当前显示会话存在进行中请求时才锁定输入，切换会话后新会话可正常输入
+    lockInput(!!pendingRequests[conversationId]);
+}
+
 async function sendMsg() {
     var input = $("msgInput"); if (!input) return;
     var msg = input.value.trim(); if (!msg) return;
@@ -116,29 +130,34 @@ async function sendMsg() {
     if (!conversationId) {
         lockInput(true);
         var ok = await newChat();
-        if (!ok) { appendMessage("assistant", "无法连接服务器，请确认已启动: python web/server.py"); lockInput(false); return; }
+        if (!ok) { appendMessage("assistant", "无法连接服务器，请确认已启动: python web/server.py"); updateInputLock(); return; }
     }
 
-    var conv = conversations[conversationId];
+    var reqConv = conversationId;  // 绑定发起请求的会话，异步期间切换会话不会串台
+    if (pendingRequests[reqConv]) return;  // 该会话已有进行中请求，不重复发送
+
+    var conv = conversations[reqConv];
     if (conv && (!conv.title || conv.title === "新对话")) conv.title = msg.slice(0, 40);
 
     input.value = "";
+    // 占位消息状态：思考文本/状态/最终回复字段，切走再切回也能恢复
+    pendingRequests[reqConv] = {
+        thinking: "", status: "AI 正在思考...",
+        content: "", sql: "", evaluator: null, dialogue_id: 0, request_id: "",
+    };
     lockInput(true);
     hideEmpty();
     appendMessage("user", msg);
     if (conv) conv.messages.push({ role: "user", content: msg });
+    appendPendingMessage(reqConv);
 
-    var loadingId = showLoading();
-        var thinkingText = "";
-    console.log("[sendMsg] user=" + msg.slice(0, 60) + " conversation=" + conversationId);
-    var finalContent = "", finalSql = "", finalEval = null, finalDialogueId = 0;
-    var finalRequestId = "";
+    console.log("[sendMsg] user=" + msg.slice(0, 60) + " conversation=" + reqConv);
 
     try {
         var res = await fetch(API + "/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ conversation_id: conversationId, message: msg }),
+            body: JSON.stringify({ conversation_id: reqConv, message: msg }),
         });
 
         var reader = res.body.getReader();
@@ -152,27 +171,30 @@ async function sendMsg() {
 
             var lines = buffer.split("\n");
             buffer = lines.pop() || "";
-            for (var i = 0; i < lines.length; i++) {
-                var line = lines[i];
+            for (var k = 0; k < lines.length; k++) {
+                var line = lines[k];
                 if (!line.startsWith("data: ")) continue;
                 try {
                     var event = JSON.parse(line.slice(6));
-                    if (event.request_id) finalRequestId = event.request_id;
+                    var pend = pendingRequests[reqConv]; if (!pend) continue;
+                    if (event.request_id) pend.request_id = event.request_id;
                     if (event.type === "status" || event.type === "thinking") {
-                        updateLoading(loadingId, event.text);
-                        thinkingText += event.text + "\n";
+                        // 状态显示第一行（节点标签），思考面板累积完整 LLM 输出
+                        var firstLine = String(event.text || "").split("\n")[0];
+                        if (firstLine) pend.status = firstLine;
+                        if (event.text) pend.thinking += event.text + "\n";
+                        updatePendingMessage(reqConv);
                     } else if (event.type === "done") {
-                                                finalContent = event.content;
-                        console.log("[sendMsg] done: content=" + (finalContent || "").slice(0, 80));
-                        finalSql = event.sql;
-                        finalEval = event.evaluator;
-                        finalDialogueId = event.dialogue_id || 0;
+                        pend.content = event.content;
+                        console.log("[sendMsg] done: content=" + (pend.content || "").slice(0, 80));
+                        pend.sql = event.sql;
+                        pend.evaluator = event.evaluator;
+                        pend.dialogue_id = event.dialogue_id || 0;
                     } else if (event.type === "error") {
                         var errorIdText = event.error_id
                             ? "\n错误编号：" + event.error_id
                             : "";
-
-                        finalContent = event.text + errorIdText;
+                        pend.content = event.text + errorIdText;
                         console.log(
                             "[sendMsg] request failed, error_id="
                             + (event.error_id || "")
@@ -182,27 +204,85 @@ async function sendMsg() {
             }
         }
     } catch (e) {
-        finalContent = "连接失败，请确认服务已启动。";
+        var pend = pendingRequests[reqConv];
+        if (pend) pend.content = "连接失败，请确认服务已启动。";
     }
 
-    removeLoading(loadingId);
-        console.log("[sendMsg] finalContent=" + (finalContent || "(empty)").slice(0, 100));
-    appendMessage("assistant", finalContent || "(无响应)", finalSql, thinkingText, finalEval, finalDialogueId, finalRequestId);
-    if (conv) {
-        conv.messages.push({
-            role: "assistant", content: finalContent, sql: finalSql,
-            thinking: thinkingText, evaluator: finalEval, dialogue_id: finalDialogueId,
-            request_id: finalRequestId,
-        });
+    var pend = pendingRequests[reqConv];
+    if (pend) {
+        // 无论当前是否仍显示该会话，先写入内存消息（切换回来后可见）
+        if (conv) {
+            conv.messages.push({
+                role: "assistant", content: pend.content || "(无响应)", sql: pend.sql,
+                thinking: pend.thinking, evaluator: pend.evaluator, dialogue_id: pend.dialogue_id,
+                request_id: pend.request_id,
+            });
+        }
+        delete pendingRequests[reqConv];
+        // 只有当前仍显示发起请求的会话时才更新 DOM 与焦点
+        if (conversationId === reqConv) {
+            removePendingMessage(reqConv);
+            console.log("[sendMsg] finalContent=" + (pend.content || "(empty)").slice(0, 100));
+            appendMessage("assistant", pend.content || "(无响应)", pend.sql, pend.thinking, pend.evaluator, pend.dialogue_id, pend.request_id);
+            input.focus();
+        }
     }
+    updateInputLock();
     refreshConvList();
-    lockInput(false);
-    input.focus();
 }
 
-function updateLoading(id, text) {
-    var el = document.getElementById(id);
-    if (el) el.innerHTML = '<span class="spinner"></span> ' + text;
+function appendPendingMessage(convId) {
+    // 在当前会话消息流内追加“AI 正在思考”占位消息（ChatGPT 形式）
+    var area = $("chatArea"); if (!area) return;
+    var pend = pendingRequests[convId]; if (!pend) return;
+
+    var wrapper = document.createElement("div"); wrapper.className = "msg assistant";
+    wrapper.id = "pending-msg-" + convId;
+
+    var avatar = document.createElement("div"); avatar.className = "avatar";
+    avatar.textContent = "AI";
+
+    var bubble = document.createElement("div"); bubble.className = "bubble";
+    var spinner = document.createElement("span"); spinner.className = "spinner";
+    var statusSpan = document.createElement("span"); statusSpan.className = "pending-status";
+    statusSpan.textContent = pend.status;
+    bubble.appendChild(spinner); bubble.appendChild(statusSpan);
+
+    // 可展开的思考过程面板，实时累积 LLM 输出
+    var collapse = document.createElement("div"); collapse.className = "collapse";
+    var btn = document.createElement("button"); btn.className = "collapse-btn";
+    btn.innerHTML = '<span class="arrow">▶</span> 查看思考过程';
+    var content = document.createElement("div"); content.className = "collapse-content pending-thinking";
+    content.textContent = pend.thinking;
+    btn.onclick = function () {
+        var open = content.classList.contains("show");
+        content.classList.toggle("show");
+        btn.classList.toggle("open");
+        btn.querySelector(".arrow").textContent = open ? "▶" : "▼";
+    };
+    collapse.appendChild(btn); collapse.appendChild(content);
+    bubble.appendChild(collapse);
+
+    wrapper.appendChild(avatar); wrapper.appendChild(bubble);
+    area.appendChild(wrapper); area.scrollTop = area.scrollHeight;
+}
+
+function updatePendingMessage(convId) {
+    // 实时更新当前会话占位消息的状态文案与思考内容
+    if (conversationId !== convId) return;
+    var pend = pendingRequests[convId]; if (!pend) return;
+    var wrapper = document.getElementById("pending-msg-" + convId);
+    if (!wrapper) return;
+    var statusEl = wrapper.querySelector(".pending-status");
+    if (statusEl) statusEl.textContent = pend.status;
+    var thinkEl = wrapper.querySelector(".pending-thinking");
+    if (thinkEl) thinkEl.textContent = pend.thinking;
+}
+
+function removePendingMessage(convId) {
+    // 请求完成后移除占位消息，由最终回复消息替换
+    var wrapper = document.getElementById("pending-msg-" + convId);
+    if (wrapper) wrapper.remove();
 }
 
 function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requestId) {
@@ -251,14 +331,14 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         var scoreArea = document.createElement("div"); scoreArea.className = "score-area";
         scoreArea.innerHTML = "评分: ";
         var did = dialogueId || 0;
-        for (var i = 1; i <= 5; i++) {
+        for (var s = 1; s <= 5; s++) {
             (function (idx) {
                 var star = document.createElement("button");
                 star.className = "star" + (evaluator.user_score && idx <= evaluator.user_score ? " active" : "");
                 star.textContent = "★";
                 star.onclick = async function () {
                     var stars = scoreArea.querySelectorAll(".star");
-                    stars.forEach(function (s, j) { s.classList.toggle("active", j < idx); });
+                    stars.forEach(function (st, t) { st.classList.toggle("active", t < idx); });
                     try {
                         await fetch(API + "/score", {
                             method: "POST", headers: { "Content-Type": "application/json" },
@@ -270,7 +350,7 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
                     } catch (e3) {}
                 };
                 scoreArea.appendChild(star);
-            })(i);
+            })(s);
         }
         if (evaluator.score) {
             var info = document.createElement("span");
@@ -284,16 +364,6 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
     area.appendChild(wrapper); area.scrollTop = area.scrollHeight;
 }
-
-function showLoading() {
-    var area = $("chatArea"); if (!area) return "";
-    var div = document.createElement("div"); div.className = "loading";
-    div.id = "load-" + Date.now(); div.innerHTML = '<span class="spinner"></span> AI 正在思考...';
-    area.appendChild(div); area.scrollTop = area.scrollHeight;
-    return div.id;
-}
-
-function removeLoading(id) { var el = document.getElementById(id); if (el) el.remove(); }
 
 function formatContent(text) {
     if (!text) return "";
