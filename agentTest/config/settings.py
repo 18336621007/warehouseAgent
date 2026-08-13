@@ -50,3 +50,8 @@ def get_model_extra_body() -> dict:
     if enable_thinking is None:
         return None
     return {"enable_thinking": enable_thinking}
+
+
+# 简要注释：是否启用 LLM 输出逐字流式（思考过程/最终回答），默认开启，可通过 .env 关闭回退非流式。
+def get_stream_output_enabled() -> bool:
+    return os.getenv("STREAM_OUTPUT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")

@@ -3,7 +3,7 @@ ChatGPT UI backend - Flask API (streaming + scoring + rename/delete)
 """
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
-import uuid, os, sys, json
+import uuid, os, sys, json, threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentTest.langgraph_app.runtime.graph_logger import bind_log_context
@@ -17,6 +17,8 @@ from agentTest.langgraph_app.runtime.graph_logger import log_state_change
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
+from agentTest.langgraph_app.runtime.stream_bus import StreamBus, bind_stream_bus
+from agentTest.config.settings import get_stream_output_enabled
 from web.intent_classifier import classify_intent
 from agentTest.metadata.mysql_store import update_user_score
 
@@ -209,115 +211,205 @@ def chat():
             # Topic业务记忆由Checkpoint自动恢复
         }
 
+        # 查询链路移到后台线程执行：LLM token 在节点内部实时推送到总线，
+        # SSE 线程只负责转发，前端才能逐字展示思考过程与最终回答
+        bus = StreamBus()
+        worker = threading.Thread(
+            target=_run_query_worker,
+            args=(bus, state_input, observed_topic_status, request_timer),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            for event in bus.iter_events():
+                yield _sse_req(event)
+        finally:
+            # 客户端断开或异常时通知后台线程停止推送，避免事件堆积
+            bus.close()
+
+    def _run_query_worker(bus, state_input, observed_topic_status, request_timer):
+        """后台执行查询链路：节点事件与 LLM token 写入总线，由 SSE 线程转发。"""
+        # 后台线程重新绑定日志上下文与流式总线，节点日志与 token 回调才能正确工作
+        worker_token = bind_log_context(
+            conversation_id=conversation_id,
+            topic_id=topic_id,
+            request_id=request_id,
+            graph_thread_id=graph_thread_id,
+        )
+        bind_stream_bus(bus)
         thinking_parts = ["[intent] query"]
         seen = set()
-        # Advisor 子图节点与父图节点各携带一份 thinking，只输出首次，避免重复
-        advisor_thinking_emitted = False
-
-        for chunk in APP.stream(state_input, config, subgraphs=True):
-            node_dict = chunk[1] if isinstance(chunk, tuple) else chunk
-            for node_name, node_update in node_dict.items():
-                # 从LangGraph节点增量更新中统一观察Topic状态变化
-                if isinstance(node_update, dict):
-                    next_topic_status = node_update.get(
-                        "topic_status",
-                        "",
-                    )
-
-                    if (
-                            next_topic_status
-                            and next_topic_status != observed_topic_status
-                    ):
-                        log_state_change(
-                            node_name=node_name,
-                            field_name="topic_status",
-                            previous_value=observed_topic_status,
-                            current_value=next_topic_status,
+        advisor_history_recorded = False
+        try:
+            for chunk in APP.stream(state_input, config, subgraphs=True):
+                node_dict = chunk[1] if isinstance(chunk, tuple) else chunk
+                for node_name, node_update in node_dict.items():
+                    # 从LangGraph节点增量更新中统一观察Topic状态变化
+                    if isinstance(node_update, dict):
+                        next_topic_status = node_update.get(
+                            "topic_status",
+                            "",
                         )
-                        observed_topic_status = next_topic_status
 
-                if not node_name or node_name in seen: continue
-                seen.add(node_name)
-                label = NODE_LABELS.get(node_name, node_name)
-                detail = ""
-                if node_name in ("advisor", "advisor_agent"):
-                    # Advisor 的 thinking 由子图与父图节点各携带一份，只输出首次
-                    if not advisor_thinking_emitted:
-                        advisor_thinking_emitted = True
+                        if (
+                                next_topic_status
+                                and next_topic_status != observed_topic_status
+                        ):
+                            log_state_change(
+                                node_name=node_name,
+                                field_name="topic_status",
+                                previous_value=observed_topic_status,
+                                current_value=next_topic_status,
+                            )
+                            observed_topic_status = next_topic_status
+
+                    if not node_name or node_name in seen:
+                        continue
+                    seen.add(node_name)
+                    label = NODE_LABELS.get(node_name, node_name)
+                    if node_name in ("advisor", "advisor_agent"):
+                        # Advisor 思考内容已由 token 流逐字展示（标签在首个 token 前发出），
+                        # 开启流式时实时节点事件跳过避免重复；关闭流式时整段发送保证可读
+                        if not advisor_history_recorded:
+                            advisor_history_recorded = True
+                            detail = _extract_node_detail(node_name, node_update)
+                            thinking_parts.append(
+                                "[" + node_name + "] " + label
+                                + ("\n" + detail if detail else "")
+                            )
+                            # 非流式时整段发送，避免关闭流式后 advisor 无内容可见
+                            if not get_stream_output_enabled():
+                                display_text = label + ("\n" + detail if detail else "")
+                                bus.emit({"type": "thinking", "node": node_name, "text": display_text})
+                        else:
+                            thinking_parts.append("[" + node_name + "] " + label)
+                    else:
                         detail = _extract_node_detail(node_name, node_update)
-                else:
-                    detail = _extract_node_detail(node_name, node_update)
-                display_text = label + ("\n" + detail if detail else "")
-                thinking_parts.append("[" + node_name + "] " + display_text)
-                yield _sse_req({"type": "thinking", "node": node_name, "text": display_text})
+                        display_text = label + ("\n" + detail if detail else "")
+                        thinking_parts.append("[" + node_name + "] " + display_text)
+                        bus.emit({"type": "thinking", "node": node_name, "text": display_text})
 
-        final_state = APP.get_state(config)
-        result = (final_state and final_state.values) or {}
+            final_state = APP.get_state(config)
+            result = (final_state and final_state.values) or {}
 
-        route = result.get("route", "seeker")
-        topic_status = result.get("topic_status", "")
-        final_answer = result.get("final_answer", "")
-        generated_sql = result.get("generated_sql", "")
-        ev_score = result.get("evaluator_score", 0)
-        ev_self = result.get("evaluator_self_score", 0)
-        dialogue_id = result.get("evaluator_dialogue_id", 0)
-        # 评分只属于本轮真正执行过 Evaluator 的查询；Evaluator 输出持久化在
-        # AgentState 中会跨轮残留，必须按本轮执行节点判断，避免澄清/追问轮重复展示评分
-        has_evaluator = "evaluator" in seen
-        # generated_sql 同样持久化在 AgentState 中会跨轮残留，只有本轮真正
-        # 执行过 Seeker 查询链路时才透传，避免澄清/追问轮展示上一轮的旧 SQL
-        sql_query_nodes = {
-            "retrieve_schema",
-            "generate_sql",
-            "validate_sql",
-            "prepare_sql_fix",
-            "execute_sql",
-            "prepare_sql_exec_fix",
-            "build_final_answer",
-        }
-        has_sql_query = bool(seen & sql_query_nodes)
-        display_sql = generated_sql if has_sql_query else ""
-        evaluator_payload = (
-            {"score": ev_score, "self_score": ev_self}
-            if (has_evaluator and ev_score)
-            else None
-        )
+            route = result.get("route", "seeker")
+            topic_status = result.get("topic_status", "")
+            final_answer = result.get("final_answer", "")
+            generated_sql = result.get("generated_sql", "")
+            ev_score = result.get("evaluator_score", 0)
+            ev_self = result.get("evaluator_self_score", 0)
+            dialogue_id = result.get("evaluator_dialogue_id", 0)
+            # 评分只属于本轮真正执行过 Evaluator 的查询；Evaluator 输出持久化在
+            # AgentState 中会跨轮残留，必须按本轮执行节点判断，避免澄清/追问轮重复展示评分
+            has_evaluator = "evaluator" in seen
+            # generated_sql 同样持久化在 AgentState 中会跨轮残留，只有本轮真正
+            # 执行过 Seeker 查询链路时才透传，避免漄清/追问轮展示上一轮的旧 SQL
+            sql_query_nodes = {
+                "retrieve_schema",
+                "generate_sql",
+                "validate_sql",
+                "prepare_sql_fix",
+                "execute_sql",
+                "prepare_sql_exec_fix",
+                "build_final_answer",
+            }
+            has_sql_query = bool(seen & sql_query_nodes)
+            display_sql = generated_sql if has_sql_query else ""
+            evaluator_payload = (
+                {"score": ev_score, "self_score": ev_self}
+                if (has_evaluator and ev_score)
+                else None
+            )
 
-        session["messages"].append({"role": "user", "content": message})
-        session["messages"].append({
-            "role": "assistant", "content": final_answer, "sql": display_sql,
-            "thinking": "\n".join(thinking_parts),
-            "dialogue_id": dialogue_id if has_evaluator else 0,
-            "evaluator": evaluator_payload,
-        })
+            session["messages"].append({"role": "user", "content": message})
+            session["messages"].append({
+                "role": "assistant", "content": final_answer, "sql": display_sql,
+                "thinking": "\n".join(thinking_parts),
+                "dialogue_id": dialogue_id if has_evaluator else 0,
+                "evaluator": evaluator_payload,
+            })
 
-        # ── 根据本轮语义决定下一次查数任务 ──
-        # 追问类（plan_refinement / result_follow_up / clarification_explanation）沿用同一 Topic，
-        # 保留 confirmed_plan 与历史供下一轮识别；只有真正换话题(new_query)或异常终态才切 Topic。
-        follow_up_mode = result.get("follow_up_mode", "")
-        if topic_status in ("failed", "cancelled") or (
-                topic_status == "completed" and follow_up_mode == "new_query"
-        ):
-            # 当前Topic已结束或用户已换话题，下一条消息创建独立Topic
+            # ── 根据本轮语义决定下一次查数任务 ──
+            # 追问类（plan_refinement / result_follow_up / clarification_explanation）沿用同一 Topic，
+            # 保留 confirmed_plan 与历史供下一轮识别；只有真正换话题(new_query)或异常终态才切 Topic。
+            follow_up_mode = result.get("follow_up_mode", "")
+            if topic_status in ("failed", "cancelled") or (
+                    topic_status == "completed" and follow_up_mode == "new_query"
+            ):
+                # 当前Topic已结束或用户已换话题，下一条消息创建独立Topic
+                session["_new_topic"] = True
+
+            log_request_end(
+                result_type="query",
+                route=route,
+                topic_status=topic_status,
+                summary={"nodes": len(seen), "route": route, "topic_status": topic_status},
+                ms=elapsed_ms(request_timer),
+            )
+
+            bus.emit({
+                "type": "done",
+                "content": final_answer,
+                "sql": display_sql,
+                "topic_status": topic_status,
+                "thinking": "\n".join(thinking_parts),
+                "evaluator": evaluator_payload,
+                "dialogue_id": dialogue_id if has_evaluator else 0,
+            })
+        except Exception as error:
+            error_id = uuid.uuid4().hex
+            previous_topic_status = observed_topic_status
+            try:
+                # 异常可能发生在部分节点已经完成后，重新读取最新状态
+                latest_snapshot = APP.get_state(config)
+                latest_state = (latest_snapshot and latest_snapshot.values) or {}
+                previous_topic_status = latest_state.get(
+                    "topic_status",
+                    previous_topic_status,
+                )
+                # State只保存安全错误编号，不保存内部异常文本
+                APP.update_state(
+                    config,
+                    {
+                        "topic_status": "failed",
+                        "error_message": f"{QUERY_ERROR_CODE}:{error_id}",
+                    },
+                )
+                if previous_topic_status != "failed":
+                    log_state_change(
+                        node_name="request_boundary",
+                        field_name="topic_status",
+                        previous_value=previous_topic_status,
+                        current_value="failed",
+                    )
+            except Exception as state_error:
+                # Checkpoint写入失败不能覆盖最初的业务异常
+                log_node_degraded(
+                    "request_boundary",
+                    state_error,
+                    error_code="FAILED_STATE_PERSIST_DEGRADED",
+                    related_error_id=error_id,
+                    stage="persist_failed_state",
+                )
+            # failed是Topic终态，下一条消息创建新的Topic
             session["_new_topic"] = True
+            log_request_error(
+                error=error,
+                error_id=error_id,
+                error_code=QUERY_ERROR_CODE,
+                topic_status="failed",
+                ms=elapsed_ms(request_timer),
+            )
+            bus.emit({
+                "type": "error",
+                "text": QUERY_SAFE_ERROR_MESSAGE,
+                "error_code": QUERY_ERROR_CODE,
+                "error_id": error_id,
+            })
+        finally:
+            reset_log_context(worker_token)
+            bus.close()
 
-        log_request_end(
-            result_type="query",
-            route=route,
-            topic_status=topic_status,
-            summary={"nodes": len(seen), "route": route, "topic_status": topic_status},
-            ms=elapsed_ms(request_timer),
-        )
-
-        yield _sse_req({
-            "type": "done",
-            "content": final_answer,
-            "sql": display_sql,
-            "topic_status": topic_status,
-            "thinking": "\n".join(thinking_parts),
-            "evaluator": evaluator_payload,
-            "dialogue_id": dialogue_id if has_evaluator else 0,
-        })
 
     def generate_with_log_context():
         # 为本次流式请求绑定独立日志上下文，避免并发日志相互混淆

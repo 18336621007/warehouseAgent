@@ -59,6 +59,8 @@ async function deleteConv(conversationIdToDelete, event) {
     if (!confirm("确定删除此对话？")) return;
     try {
         await fetch(API + "/conversations/" + conversationIdToDelete, { method: "DELETE" });
+        var pendToDelete = pendingRequests[conversationIdToDelete];
+        if (pendToDelete) flushAnswerTypewriter(pendToDelete);
         delete pendingRequests[conversationIdToDelete];
         delete conversations[conversationIdToDelete];
         if (conversationId === conversationIdToDelete) {
@@ -119,8 +121,9 @@ function lockInput(disabled) {
 }
 
 function updateInputLock() {
-    // 只有当前显示会话存在进行中请求时才锁定输入，切换会话后新会话可正常输入
-    lockInput(!!pendingRequests[conversationId]);
+    // 只有当前显示会话存在未结束请求（done/error 未收）时才锁定输入
+    var pend = pendingRequests[conversationId];
+    lockInput(!!(pend && !pend.doneReceived));
 }
 
 async function sendMsg() {
@@ -134,6 +137,12 @@ async function sendMsg() {
     }
 
     var reqConv = conversationId;  // 绑定发起请求的会话，异步期间切换会话不会串台
+    var pendOld = pendingRequests[reqConv];
+    if (pendOld && pendOld.doneReceived) {
+        // 上一条业务已结束（done 已收）但消息未固化：先固化旧消息，再发起新请求
+        flushAnswerTypewriter(pendOld);
+        finalizePendingRequest(reqConv, pendOld);
+    }
     if (pendingRequests[reqConv]) return;  // 该会话已有进行中请求，不重复发送
 
     var conv = conversations[reqConv];
@@ -145,6 +154,14 @@ async function sendMsg() {
         thinking: "", status: "AI 正在思考...",
         content: "", sql: "", evaluator: null, dialogue_id: 0, request_id: "",
         thinkingOpen: true,  // 思考面板默认展开，用户折叠/展开后保持
+        thinkingParts: [],  // 思考按流式段落存储（sid -> 文本），支持最终回复回收
+        answerQueue: [],  // 最终回答重放 token 的打字机队列
+        answerTimer: null,  // 打字机定时器句柄
+        answerStartAt: 0,  // 打字机启动时间，用于动态调速
+        answerHardTimer: null,  // 硬上限兜底定时器，避免输入框长期锁定
+        pendingFinalContent: null,  // done 提前到达时暂存的最终内容
+        finalizeAfterTypewriter: false,  // 请求结束后等待打字机播完再保存消息
+        doneReceived: false,  // 本轮业务已结束（收到 done/error），输入框可解锁
     };
     lockInput(true);
     hideEmpty();
@@ -180,18 +197,67 @@ async function sendMsg() {
                     var pend = pendingRequests[reqConv]; if (!pend) continue;
                     if (event.request_id) pend.request_id = event.request_id;
                     if (event.type === "status" || event.type === "thinking") {
-                        // 状态显示第一行（节点标签），思考面板累积完整 LLM 输出
+                        // 状态显示第一行（节点标签），思考面板按段落累积
                         var firstLine = String(event.text || "").split("\n")[0];
                         if (firstLine) pend.status = firstLine;
-                        if (event.text) pend.thinking += event.text + "\n";
+                        if (event.text) {
+                            pend.thinkingParts.push({ sid: null, text: event.text });
+                            rebuildThinking(pend);
+                        }
+                        updatePendingMessage(reqConv);
+                    } else if (event.type === "token") {
+                        // 思考/回答逐字流式增量：思考按流式段落追加，回答追加到预览区
+                        if (event.scope === "answer") {
+                            if (event.live === true) {
+                                // 实时 token：直接追加
+                                pend.content += event.text;
+                            } else {
+                                // 重放 token：进入打字机队列逐字展示
+                                pend.answerQueue.push(event.text);
+                                startAnswerTypewriter(pend, reqConv);
+                            }
+                        } else {
+                            var sid = event.stream_id || "";
+                            var part = null;
+                            for (var pi = pend.thinkingParts.length - 1; pi >= 0; pi--) {
+                                if (pend.thinkingParts[pi].sid === sid) {
+                                    part = pend.thinkingParts[pi];
+                                    break;
+                                }
+                            }
+                            if (part) {
+                                part.text += event.text;
+                            } else {
+                                pend.thinkingParts.push({ sid: sid, text: event.text });
+                            }
+                            rebuildThinking(pend);
+                        }
+                        updatePendingMessage(reqConv);
+                    } else if (event.type === "thinking_retract") {
+                        // 最终回复从思考面板移除，改由回答区逐字展示
+                        var rsid = event.stream_id || "";
+                        pend.thinkingParts = pend.thinkingParts.filter(function (p) { return p.sid !== rsid; });
+                        rebuildThinking(pend);
                         updatePendingMessage(reqConv);
                     } else if (event.type === "done") {
-                        pend.content = event.content;
+                        pend.doneReceived = true;
+                        if (pend.answerTimer) {
+                            // 打字机未播完：暂存最终内容，并设 5 秒硬上限兜底固化消息
+                            pend.pendingFinalContent = event.content;
+                            pend.answerHardTimer = setTimeout(function () {
+                                flushAnswerTypewriter(pend);
+                                finalizePendingRequest(reqConv, pend);
+                            }, 5000);
+                        } else {
+                            pend.content = event.content;
+                        }
                         console.log("[sendMsg] done: content=" + (pend.content || "").slice(0, 80));
                         pend.sql = event.sql;
                         pend.evaluator = event.evaluator;
                         pend.dialogue_id = event.dialogue_id || 0;
                     } else if (event.type === "error") {
+                        pend.doneReceived = true;
+                        flushAnswerTypewriter(pend);
                         var errorIdText = event.error_id
                             ? "\n错误编号：" + event.error_id
                             : "";
@@ -206,30 +272,105 @@ async function sendMsg() {
         }
     } catch (e) {
         var pend = pendingRequests[reqConv];
-        if (pend) pend.content = "连接失败，请确认服务已启动。";
+        if (pend) {
+            pend.doneReceived = true;
+            flushAnswerTypewriter(pend);
+            pend.content = "连接失败，请确认服务已启动。";
+        }
     }
 
     var pend = pendingRequests[reqConv];
-    if (pend) {
-        // 无论当前是否仍显示该会话，先写入内存消息（切换回来后可见）
-        // 保存最终回复消息（含思考面板展开状态），切会话再切回仍保持一致
-        var savedMsg = {
-            role: "assistant", content: pend.content || "(无响应)", sql: pend.sql,
-            thinking: pend.thinking, evaluator: pend.evaluator, dialogue_id: pend.dialogue_id,
-            request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
-        };
-        if (conv) conv.messages.push(savedMsg);
-        delete pendingRequests[reqConv];
-        // 只有当前仍显示发起请求的会话时才更新 DOM 与焦点
-        if (conversationId === reqConv) {
-            removePendingMessage(reqConv);
-            console.log("[sendMsg] finalContent=" + (pend.content || "(empty)").slice(0, 100));
-            appendMessage("assistant", pend.content || "(无响应)", pend.sql, pend.thinking, pend.evaluator, pend.dialogue_id, pend.request_id, pend.thinkingOpen, savedMsg);
-            input.focus();
-        }
+    if (pend && pend.answerTimer) {
+        // 打字机仍在播放：等队列耗尽后由 drain 完成收尾，避免截断逐字效果
+        pend.finalizeAfterTypewriter = true;
+        // done 已收时先解锁输入框，消息固化仍等打字机播完
+        updateInputLock();
+    } else {
+        if (pend) finalizePendingRequest(reqConv, pend);
+        updateInputLock();
+        refreshConvList();
+    }
+}
+
+function finalizePendingRequest(convId, pend) {
+    // 请求结束时保存最终消息并清理占位（打字机播完后调用）
+    var conv = conversations[convId];
+    var savedMsg = {
+        role: "assistant", content: pend.content || "(无响应)", sql: pend.sql,
+        thinking: pend.thinking, evaluator: pend.evaluator, dialogue_id: pend.dialogue_id,
+        request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
+    };
+    if (conv) conv.messages.push(savedMsg);
+    delete pendingRequests[convId];
+    // 只有当前仍显示发起请求的会话时才更新 DOM 与焦点
+    if (conversationId === convId) {
+        removePendingMessage(convId);
+        console.log("[sendMsg] finalContent=" + (pend.content || "(empty)").slice(0, 100));
+        appendMessage("assistant", pend.content || "(无响应)", pend.sql, pend.thinking, pend.evaluator, pend.dialogue_id, pend.request_id, pend.thinkingOpen, savedMsg);
+        var inputEl = $("msgInput");
+        if (inputEl) inputEl.focus();
     }
     updateInputLock();
     refreshConvList();
+}
+
+function rebuildThinking(pend) {
+    // 按段落顺序拼接思考面板完整文本
+    pend.thinking = pend.thinkingParts.map(function (p) { return p.text; }).join("\n");
+}
+
+function startAnswerTypewriter(pend, convId) {
+    // 最终回答为整段重放流：递归 setTimeout 逐字追加，模拟逐字输出效果
+    if (pend.answerTimer) return;
+    pend.answerStartAt = Date.now();
+    var tick = function () {
+        if (pend.answerQueue.length > 0) {
+            pend.content += pend.answerQueue.shift();
+            updatePendingMessage(convId);
+            // 动态调速：剩余 token 尽量在约 3 秒内播完，避免输入框长期锁定
+            var remaining = pend.answerQueue.length;
+            var elapsed = Date.now() - pend.answerStartAt;
+            var budget = Math.max(0, 3000 - elapsed);
+            var delay = remaining > 0 ? Math.max(5, Math.min(40, Math.floor(budget / remaining))) : 40;
+            pend.answerTimer = setTimeout(tick, delay);
+        } else {
+            clearTimeout(pend.answerTimer);
+            pend.answerTimer = null;
+            if (pend.answerHardTimer) {
+                clearTimeout(pend.answerHardTimer);
+                pend.answerHardTimer = null;
+            }
+            // done 提前到达时，队列耗尽后补齐最终内容
+            if (pend.pendingFinalContent !== null && pend.pendingFinalContent !== undefined) {
+                pend.content = pend.pendingFinalContent;
+                pend.pendingFinalContent = null;
+                updatePendingMessage(convId);
+            }
+            // 请求已结束（done 已收）时，由这里完成消息保存
+            if (pend.finalizeAfterTypewriter) {
+                finalizePendingRequest(convId, pend);
+            }
+        }
+    };
+    pend.answerTimer = setTimeout(tick, 25);
+}
+
+function flushAnswerTypewriter(pend) {
+    // 请求结束/出错时终止打字机与硬上限定时器，避免悬挂
+    if (pend.answerTimer) {
+        clearTimeout(pend.answerTimer);
+        pend.answerTimer = null;
+    }
+    if (pend.answerHardTimer) {
+        clearTimeout(pend.answerHardTimer);
+        pend.answerHardTimer = null;
+    }
+    pend.answerQueue = [];
+    // 最终内容已到达时一次性补齐，避免保存截断内容
+    if (pend.pendingFinalContent !== null && pend.pendingFinalContent !== undefined) {
+        pend.content = pend.pendingFinalContent;
+        pend.pendingFinalContent = null;
+    }
 }
 
 function appendPendingMessage(convId) {
@@ -254,6 +395,10 @@ function appendPendingMessage(convId) {
     var btn = document.createElement("button"); btn.className = "collapse-btn";
     var content = document.createElement("div"); content.className = "collapse-content pending-thinking";
     content.textContent = pend.thinking;
+    // 用户主动上翻查看历史时暂停自动滚动，滚回底部后恢复跟随
+    content.addEventListener("scroll", function () {
+        content._userScrolledUp = content.scrollTop + content.clientHeight < content.scrollHeight - 40;
+    });
     var open = pend.thinkingOpen !== false;
     content.classList.toggle("show", open);
     btn.classList.toggle("open", open);
@@ -268,6 +413,19 @@ function appendPendingMessage(convId) {
     collapse.appendChild(btn); collapse.appendChild(content);
     bubble.insertBefore(collapse, bubble.firstChild);
 
+    // 最终回答逐字预览区：build_final_answer 的 token 实时显示，done 后由完整回复替换
+    var answerPreview = document.createElement("div");
+    answerPreview.className = "pending-answer";
+    answerPreview.style.display = "none";
+    bubble.appendChild(answerPreview);
+
+    // 消息区滚动监听只绑定一次：用户上翻历史时暂停自动滚动
+    if (!area._scrollBound) {
+        area._scrollBound = true;
+        area.addEventListener("scroll", function () {
+            area._userScrolledUp = area.scrollTop + area.clientHeight < area.scrollHeight - 40;
+        });
+    }
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
     area.appendChild(wrapper); area.scrollTop = area.scrollHeight;
 }
@@ -278,10 +436,22 @@ function updatePendingMessage(convId) {
     var pend = pendingRequests[convId]; if (!pend) return;
     var wrapper = document.getElementById("pending-msg-" + convId);
     if (!wrapper) return;
+    var area = $("chatArea");
     var statusEl = wrapper.querySelector(".pending-status");
     if (statusEl) statusEl.textContent = pend.status;
     var thinkEl = wrapper.querySelector(".pending-thinking");
-    if (thinkEl) thinkEl.textContent = pend.thinking;
+    if (thinkEl) {
+        thinkEl.textContent = pend.thinking;
+        // 思考面板：用户未主动上翻时自动滚动到底部，保证始终看到最新内容
+        if (!thinkEl._userScrolledUp) thinkEl.scrollTop = thinkEl.scrollHeight;
+    }
+    var answerEl = wrapper.querySelector(".pending-answer");
+    if (answerEl) {
+        answerEl.textContent = pend.content;
+        answerEl.style.display = pend.content ? "block" : "none";
+    }
+    // 消息区：随内容增长自动滚动，用户上翻历史时保持不动
+    if (area && !area._userScrolledUp) area.scrollTop = area.scrollHeight;
 }
 
 function removePendingMessage(convId) {

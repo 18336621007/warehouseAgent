@@ -9,7 +9,8 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from agentTest.langgraph_app.state.advisor_state import AdvisorState
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body, get_stream_output_enabled
+from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_timer, log_node_start, elapsed_ms, log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import log_tools_called, log_example_retrieved, log_plan_locked, log_advisor_mode
 from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
@@ -46,6 +47,7 @@ class _AdvisorThinkingCollector(BaseCallbackHandler):
     def on_llm_end(self, response, **kwargs):
         # 提取本次 LLM 输出的文本；若输出的是工具调用，则转成可读的“调用工具: ...”
         text = ""
+        tool_lines = []
         for generation_list in (response.generations or []):
             for generation in generation_list:
                 text += generation.text or ""
@@ -53,9 +55,64 @@ class _AdvisorThinkingCollector(BaseCallbackHandler):
                 if message is not None:
                     for tc in (getattr(message, "tool_calls", None) or []):
                         # 工具调用只显示工具名，不输出完整参数，避免思考过程过长
-                        text += "\n调用工具: " + tc.get("name", "?")
+                        tool_lines.append("调用工具: " + tc.get("name", "?"))
+        if tool_lines:
+            text += "\n" + "\n".join(tool_lines)
         if text.strip():
             self.lines.append(text.strip())
+            # 工具名在调用结束时才完整，无法逐字，随思考流实时追加一行（带 run_id 方便前端归属段落）
+            bus = get_stream_bus()
+            if bus is not None:
+                bus.emit_token(
+                    "thinking",
+                    "\n" + "\n".join(tool_lines),
+                    stream_id=str(kwargs.get("run_id", "")),
+                )
+
+
+class _AdvisorTokenHandler(BaseCallbackHandler):
+    """把 Advisor 每步 LLM 输出的 token 实时转发给前端思考过程。
+    无工具调用的输出是最终回复：从思考面板移除，并在回答区逐字重放。
+    该 handler 挂在全局复用的 LLM 上，状态放在请求级的 StreamBus 上。"""
+
+    def __init__(self):
+        # run_id -> 本次 LLM 调用的 token 缓冲，供最终回复判定后重放
+        self._buffers: dict = {}
+
+    def on_llm_new_token(self, token: str, **kwargs):
+        bus = get_stream_bus()
+        if bus is None or not token:
+            return
+        run_id = str(kwargs.get("run_id", ""))
+        if not bus.advisor_label_sent:
+            bus.advisor_label_sent = True
+            # 首个 token 前先发节点标签，让“正在核验...”提示出现在内容之前
+            bus.emit({"type": "thinking", "node": "advisor_agent", "text": "正在核验元数据并确认口径..."})
+        # 实时推送思考（保持逐字），同时缓冲供最终回复判定
+        bus.emit_token("thinking", token, stream_id=run_id)
+        self._buffers.setdefault(run_id, []).append(token)
+
+    def on_llm_end(self, response, **kwargs):
+        run_id = str(kwargs.get("run_id", ""))
+        tokens = self._buffers.pop(run_id, None)
+        if not tokens:
+            return
+        # 判断本次输出是否携带工具调用：无工具调用即为最终回复
+        has_tool_calls = False
+        for generation_list in (response.generations or []):
+            for generation in generation_list:
+                message = getattr(generation, "message", None)
+                if message is not None and getattr(message, "tool_calls", None):
+                    has_tool_calls = True
+        if has_tool_calls:
+            return
+        # 最终回复：思考面板移除该段，回答区逐字重放
+        bus = get_stream_bus()
+        if bus is None:
+            return
+        bus.emit({"type": "thinking_retract", "stream_id": run_id})
+        for token in tokens:
+            bus.emit_token("answer", token, live=False)
 
 
 def _get_tool_call_args(messages, tool_name):
@@ -306,7 +363,11 @@ def build_advisor_subgraph(runtime):
         model=get_model_name(),
         temperature=0,
         extra_body=get_model_extra_body(),
-        callbacks=[build_llm_logging_handler("advisor")],
+        streaming=get_stream_output_enabled(),
+        callbacks=[
+            build_llm_logging_handler("advisor"),
+            _AdvisorTokenHandler(),
+        ],
     )
 
     tools = build_advisor_tools(
@@ -321,7 +382,8 @@ def build_advisor_subgraph(runtime):
     )
 
     # 模型受限精选：程序召回真实候选后，由模型按用户意图挑选展示候选（程序白名单兜底）
-    reranker = build_candidate_reranker(llm)
+    # 候选精选使用独立非流式 LLM，避免其 JSON 输出混入思考过程流式展示
+    reranker = build_candidate_reranker(None)
 
     # 方案模式允许提交完整方案
     plan_agent = create_agent(

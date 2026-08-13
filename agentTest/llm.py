@@ -4,7 +4,8 @@ import contextvars
 import os
 import dotenv
 
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_enable_thinking
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_enable_thinking, get_stream_output_enabled
+from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_llm_call
 from agentTest.langgraph_app.runtime.graph_logger import log_llm_error
@@ -55,13 +56,34 @@ class LLM:
         log_llm_call(caller, self.model, prompt_lines)
         timer = start_timer()
         try:
-            response = self.client.chat.completions.create(**request_kwargs)
-            content = response.choices[0].message.content or ""
+            content = self._chat_once(request_kwargs, caller)
             log_llm_response(caller, self.model, content, ms=elapsed_ms(timer))
             return content
         except Exception as error:
             log_llm_error(caller, self.model, str(error), ms=elapsed_ms(timer))
             raise
+
+    def _chat_once(self, request_kwargs, caller):
+        # 简要注释：开启逐字流式时逐 chunk 推送前端；关闭时整段返回
+        if not get_stream_output_enabled():
+            response = self.client.chat.completions.create(**request_kwargs)
+            return response.choices[0].message.content or ""
+        bus = get_stream_bus()
+        # 简要注释：最终回答（build_final_answer）逐字展示，其余 LLM 输出作为思考过程展示
+        scope = "answer" if caller == "build_final_answer" else "thinking"
+        stream_kwargs = dict(request_kwargs)
+        stream_kwargs["stream"] = True
+        response = self.client.chat.completions.create(**stream_kwargs)
+        parts = []
+        for chunk in response:
+            delta = ""
+            if chunk.choices:
+                delta = chunk.choices[0].delta.content or ""
+            if delta:
+                parts.append(delta)
+                if bus is not None:
+                    bus.emit_token(scope, delta)
+        return "".join(parts)
 
 
 
