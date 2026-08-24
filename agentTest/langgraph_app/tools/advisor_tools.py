@@ -1,12 +1,15 @@
 # Advisor 的分层检索工具与方案提交工具，k 值从 config/advisor.py 读取
 from langchain.tools import tool
-from agentTest.config.advisor import SEARCH_DB_K, SEARCH_TABLE_K, SEARCH_COLUMN_K
+from agentTest.config.advisor import SEARCH_DB_K, SEARCH_TABLE_K, SEARCH_COLUMN_K, BM25_ALPHA
 from agentTest.langgraph_app.tools.submit_query_plan import submit_query_plan  # 完整方案提交工具
+from agentTest.langchain_app.rag.hybrid_retriever import HybridRetriever
 
-# 全局变量，由 build_advisor_tools() 注入 FAISS 实例
+# 全局变量，由 build_advisor_tools() 注入 FAISS 实例和 BM25 实例
 _db_vector_store = None
 _table_vector_store = None
 _column_vector_store = None
+_bm25_retriever = None
+_hybrid_retriever = None
 
 # 增强元数据枚举缓存：{table_name: {column_name: [枚举值]}} 与 {column_name: [跨表枚举参考]}
 _ENRICHED_ENUM_INDEX = None
@@ -86,23 +89,46 @@ def search_column_candidates(question: str, table: str = "", k: int = None) -> l
     top_k = k or SEARCH_COLUMN_K
     question = str(question or "").strip()
     if not question:
-        # 空查询无法生成向量，直接返回空候选，避免 embedding 接口 400
         return []
-    if table:
+
+    # 指定表时：直接从该表精确召回字段，避免向量检索 fetch_k 截断导致目标表字段漏召
+    if table and _column_vector_store is not None:
+        table_docs = _column_vector_store.documents_by_table(table)
+        if not table_docs:
+            return []
+        candidates = []
+        for doc in table_docs[:top_k]:
+            metadata = doc.metadata or {}
+            page_content = doc.page_content or ""
+            field = metadata.get("column", metadata.get("field", ""))
+            candidates.append({
+                "table": metadata.get("table", ""),
+                "field": field,
+                "semantic_type": metadata.get("fields_type", ""),
+                "comment": page_content,
+                "aliases": _extract_aliases_from_content(page_content),
+                "enum_hint": _build_enum_hint(field, metadata.get("table", "")),
+                "score": 1.0,
+            })
+        return candidates
+
+    # 使用混合检索
+    if _hybrid_retriever:
+        docs_with_scores = _hybrid_retriever._search(
+            query=question,
+            k=top_k,
+            vector_store_key="column",
+        )
+    elif _column_vector_store:
         docs_with_scores = _column_vector_store.similarity_search_with_score(
             question,
             k=top_k,
-            filter={"table": table},
-            fetch_k=max(top_k * 5, 50),
         )
     else:
-        docs_with_scores = _column_vector_store.similarity_search_with_score(
-            question,
-            k=top_k,
-        )
+        return []
 
     candidates = []
-    for doc, distance in docs_with_scores:
+    for doc, score in docs_with_scores:
         metadata = doc.metadata or {}
         page_content = doc.page_content or ""
         field = metadata.get("column", metadata.get("field", ""))
@@ -113,7 +139,7 @@ def search_column_candidates(question: str, table: str = "", k: int = None) -> l
             "comment": page_content,
             "aliases": _extract_aliases_from_content(page_content),
             "enum_hint": _build_enum_hint(field, metadata.get("table", "")),
-            "score": float(round(float(distance), 4)),
+            "score": float(round(float(score), 4)),
         })
     return candidates
 
@@ -135,7 +161,15 @@ def search_databases(question: str) -> str:
     question = str(question or "").strip()
     if not question:
         return "未找到匹配结果。"
-    docs = _db_vector_store.similarity_search(question, k=SEARCH_DB_K)
+
+    # 使用混合检索
+    if _hybrid_retriever:
+        docs = _hybrid_retriever.search_databases(question, k=SEARCH_DB_K)
+    elif _db_vector_store:
+        docs = _db_vector_store.similarity_search(question, k=SEARCH_DB_K)
+    else:
+        docs = []
+
     return _format_docs(docs)
 
 
@@ -145,18 +179,25 @@ def search_tables(question: str, database: str = "") -> str:
     question = str(question or "").strip()
     if not question:
         return "未找到匹配结果。"
-    if database:
-        docs = _table_vector_store.similarity_search(
-            question,
-            k=SEARCH_TABLE_K,
-            filter={"database": database},
-            fetch_k=max(SEARCH_TABLE_K * 5, 50),
-        )
+
+    # 使用混合检索
+    if _hybrid_retriever:
+        docs = _hybrid_retriever.search_tables(question, k=SEARCH_TABLE_K)
+    elif _table_vector_store:
+        if database:
+            docs = _table_vector_store.similarity_search(
+                question,
+                k=SEARCH_TABLE_K,
+                filter={"database": database},
+                fetch_k=max(SEARCH_TABLE_K * 5, 50),
+            )
+        else:
+            docs = _table_vector_store.similarity_search(
+                question,
+                k=SEARCH_TABLE_K,
+            )
     else:
-        docs = _table_vector_store.similarity_search(
-            question,
-            k=SEARCH_TABLE_K,
-        )
+        docs = []
 
     return _format_docs(docs)
 
@@ -221,12 +262,45 @@ def update_draft_plan(
         f"过滤={filters or '无'}"
     )
 
-def build_advisor_tools(db_vector_store, table_vector_store, column_vector_store):
-    """注入三层 FAISS 实例，返回 Advisor 工具列表。"""
+def build_advisor_tools(
+    db_vector_store=None,
+    table_vector_store=None,
+    column_vector_store=None,
+    bm25_retriever=None,
+):
+    """注入 FAISS 实例和 BM25 实例，构建混合检索器，返回 Advisor 工具列表。
+
+    Args:
+        db_vector_store: 数据库层 FAISS 向量库
+        table_vector_store: 表层 FAISS 向量库
+        column_vector_store: 字段层 FAISS 向量库
+        bm25_retriever: BM25 倒排索引检索器
+    """
     global _db_vector_store, _table_vector_store, _column_vector_store
+    global _bm25_retriever, _hybrid_retriever
+
     _db_vector_store = db_vector_store
     _table_vector_store = table_vector_store
     _column_vector_store = column_vector_store
+    _bm25_retriever = bm25_retriever
+
+    # 构建混合检索器
+    if bm25_retriever and (db_vector_store or table_vector_store or column_vector_store):
+        vector_stores = {}
+        if db_vector_store:
+            vector_stores["db"] = db_vector_store
+        if table_vector_store:
+            vector_stores["table"] = table_vector_store
+        if column_vector_store:
+            vector_stores["column"] = column_vector_store
+
+        _hybrid_retriever = HybridRetriever(
+            bm25_retriever=bm25_retriever,
+            vector_stores=vector_stores,
+            alpha=BM25_ALPHA,
+        )
+    else:
+        _hybrid_retriever = None
 
     return [
         search_databases,

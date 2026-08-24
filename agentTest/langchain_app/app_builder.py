@@ -19,6 +19,8 @@ _CACHE_DB_DIR = os.path.join(_CACHE_BASE, "db_faiss_index")
 _CACHE_TABLE_DIR = os.path.join(_CACHE_BASE, "table_faiss_index")
 # 字段级 FAISS 落盘路径
 _CACHE_COLUMN_DIR = os.path.join(_CACHE_BASE, "column_faiss_index")
+# BM25 索引落盘路径
+_CACHE_BM25_DIR = os.path.join(_CACHE_BASE, "bm25_index")
 
 # 简要注释：创建 Schema RAG 链并统一返回相关对象（原始版）。
 def build_schema_rag_app(embedding):
@@ -156,4 +158,84 @@ def build_column_rag(embedding, force_rebuild=False, return_stats=False):
     result = {"vector_store": vector_store, "documents": documents}
     if sync_stats is not None:
         result["sync_stats"] = sync_stats
+    return result
+
+
+# 简要注释：构建 BM25 倒排索引（与 FAISS 共用 schema_documents）
+def build_bm25_rag(force_rebuild=False, return_stats=False):
+    """
+    构建 BM25 倒排索引
+
+    与 FAISS 向量库共用同一份 schema_documents：
+    - db 层: EnrichedDatabaseDocumentsBuilder
+    - table 层: EnrichedTableDocumentsBuilder
+    - column 层: EnrichedColumnDocumentsBuilder
+    - enriched 层: EnrichedSchemaDocumentsBuilder
+
+    Args:
+        force_rebuild: 是否强制重建（删除已有缓存）
+        return_stats: 是否返回统计信息
+
+    Returns:
+        {
+            "retriever": BM25Retriever 实例,
+            "documents": 所有文档列表,
+            "doc_sources": 各层级文档字典
+        }
+    """
+    from agentTest.langchain_app.rag.bm25_retriever import BM25Retriever
+    from agentTest.langchain_app.documents.enriched_db_documents import EnrichedDatabaseDocumentsBuilder
+    from agentTest.langchain_app.documents.enriched_table_documents import EnrichedTableDocumentsBuilder
+    from agentTest.langchain_app.documents.enriched_column_documents import EnrichedColumnDocumentsBuilder
+    from agentTest.langchain_app.documents.enriched_schema_documents import EnrichedSchemaDocumentsBuilder
+
+    # 文档构建器映射
+    document_builders = [
+        ("db", EnrichedDatabaseDocumentsBuilder),
+        ("table", EnrichedTableDocumentsBuilder),
+        ("column", EnrichedColumnDocumentsBuilder),
+        ("enriched", EnrichedSchemaDocumentsBuilder),
+    ]
+
+    all_docs = []
+    doc_sources = {}
+
+    # 收集所有层级的文档
+    for name, builder_cls in document_builders:
+        builder = builder_cls()
+        docs = builder.build_documents()
+        # 标记来源层级
+        for doc in docs:
+            if not hasattr(doc, "metadata"):
+                doc.metadata = {}
+            doc.metadata["_bm25_source"] = name
+        all_docs.extend(docs)
+        doc_sources[name] = docs
+
+    stats = {"total": len(all_docs), "sources": {}}
+    for name, docs in doc_sources.items():
+        stats["sources"][name] = len(docs)
+
+    # 构建/加载 BM25 索引
+    bm25_retriever = BM25Retriever()
+
+    if force_rebuild and os.path.exists(_CACHE_BM25_DIR):
+        shutil.rmtree(_CACHE_BM25_DIR)
+
+    if os.path.exists(_CACHE_BM25_DIR) and os.listdir(_CACHE_BM25_DIR):
+        bm25_retriever.load(_CACHE_BM25_DIR)
+        stats["rebuilt"] = False
+    else:
+        bm25_retriever.build_index(all_docs)
+        bm25_retriever.save(_CACHE_BM25_DIR)
+        stats["rebuilt"] = True
+
+    result = {
+        "retriever": bm25_retriever,
+        "documents": all_docs,
+        "doc_sources": doc_sources,
+    }
+    if return_stats:
+        result["sync_stats"] = stats
+
     return result

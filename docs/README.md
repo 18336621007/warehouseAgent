@@ -49,7 +49,7 @@ LOG_STATE_TOP_N=3           # State 快照中列表字段最多记录条数
 ### 4. 初始化元数据与向量索引（首次运行前）
 
 ```bash
-# 一键完成元数据采集、增强与向量索引同步（拆分命令见下方【常用操作】）
+# 一键完成：白名单多退少补 + 元数据采集增强 + FAISS/BM25 索引同步 + 优秀案例清理
 python -m agentTest.scripts.sync_metadata
 ```
 
@@ -164,14 +164,17 @@ Project/
 ### 一键同步元数据与向量索引（推荐）
 
 ```bash
-python -m agentTest.scripts.sync_metadata [--force-table] [--force] [--skip-vector] [--dry-run]
+python -m agentTest.scripts.sync_metadata [--force-table] [--force] [--skip-vector] [--skip-prune-examples] [--dry-run]
 ```
+
+一键完成：白名单多退少补（MySQL 残留清理）→ 指纹增量采集与增强 → FAISS + BM25 索引同步 → 优秀案例清理。
 
 | 参数 | 作用 |
 |---|---|
 | `--force-table` | 强制重跑表级/库级增强并同步向量库，字段级复用 MySQL 现有结果不重新采样 |
 | `--force` | 强制重建向量索引（删除缓存重新 embedding） |
 | `--skip-vector` | 只更新 MySQL，不同步向量库 |
+| `--skip-prune-examples` | 跳过优秀案例（MySQL + FAISS）白名单清理 |
 | `--dry-run` | 只打印将执行的步骤，不实际执行 |
 
 ### 仅采集与增强元数据（Hive → MySQL）
@@ -181,16 +184,35 @@ python -m agentTest.scripts.sync_metadata [--force-table] [--force] [--skip-vect
 python -m agentTest.metadata.metadata_enricher
 ```
 
-### 仅构建/同步向量索引（MySQL → FAISS）
+### 仅构建/同步向量索引（MySQL → FAISS + BM25）
 
 ```bash
-python -m agentTest.scripts.build_indexes [--force] [--target {db,table,column,enriched}]
+python -m agentTest.scripts.build_indexes [--force] [--target {db,table,column,enriched,bm25}]
 ```
+
+同步 FAISS（db/table/column/enriched）与 BM25 索引，按唯一键增量 upsert/delete；`--force` 全量重建。
 
 | 参数 | 作用 |
 |---|---|
 | `--force` | 强制重建（删除所有缓存重新构建） |
-| `--target` | 只同步指定索引，取值 db / table / column / enriched |
+| `--target` | 只同步指定索引，取值 db / table / column / enriched / bm25 |
+
+### 优秀案例清理（按白名单多退）
+
+```bash
+# 预览待清理清单（不删除）
+python -m agentTest.scripts.prune_examples_by_scope --dry-run
+# 实际清理
+python -m agentTest.scripts.prune_examples_by_scope
+```
+
+删除 MySQL `evaluated_dialogues` 与 `example_faiss_index` 中引用了白名单外表的记录/文档，保证优秀案例只包含当前可查询的表。
+
+| 参数 | 作用 |
+|---|---|
+| `--dry-run` | 只打印待清理清单，不实际删除 |
+
+> 说明：本脚本只清理优秀案例；MySQL 增强元数据与 FAISS/BM25 索引的完整"多退少补"请使用 `sync_metadata` 一键同步。
 
 ### 枚举采样刷新（内容变化才写库 + 更新 column 向量层）
 

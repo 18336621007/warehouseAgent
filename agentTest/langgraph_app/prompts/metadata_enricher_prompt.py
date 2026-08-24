@@ -26,7 +26,7 @@ class ColumnEnrichmentOutput(BaseModel):
 
     field_aliases: list[str] = Field(
         default_factory=list,
-        description="字段的中文同义词或业务别名，必须给出 3-5 个，禁止为空"
+        description="字段的中文同义词或业务别名，根据字段名推断给出 1-3 个，字段名本身可作为别名"
     )
 
 
@@ -77,9 +77,9 @@ COLUMN_ENRICH_SYSTEM_PROMPT = """你是数据仓库元数据专家，负责为�
 必须输出结构化字段：domain、fields_type、relations、field_aliases。
 要求：
 - fields_type 只能是 dimension 或 measure
-- field_aliases 必须给出 3-5 个中文同义词或业务别名，禁止为空
+- field_aliases 根据字段名推断 1-3 个中文同义词或业务别名，字段名本身可作为别名
 - relations 固定为空数组
-- 禁止编造采样值和原始注释中不存在的信息"""
+- 禁止编造字段名和原始注释中不存在的信息"""
 
 
 TABLE_ENRICH_SYSTEM_PROMPT = """你是数据仓库元数据专家，负责为 Hive 表生成表级增强元数据。

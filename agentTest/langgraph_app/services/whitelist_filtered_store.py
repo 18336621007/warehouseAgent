@@ -16,43 +16,22 @@ class WhitelistFilteredVectorStore:
         self._use_config_fallback = False  # Hive 不可用时退化为纯配置判定
 
     def _allowed_set(self):
-        """惰性构建当前白名单内可访问的标识集合（db.table 或 database）。"""
-        if self._allowed_identifiers is not None or self._use_config_fallback:
-            return self._allowed_identifiers
-        try:
-            if self._key == "database":
-                # 库级过滤只依赖配置，无需访问 Hive
-                self._allowed_identifiers = set(
-                    str(db).lower() for db in get_allowed_databases()
-                )
-            else:
-                tables = self._metadata_provider.list_tables()
-                self._allowed_identifiers = {
-                    f"{table.get('database_name', '')}.{table.get('table_name', '')}"
-                    for table in tables
-                }
-        except Exception:
-            # Hive 暂不可用时退化为配置级判定，避免整体召回不可用
-            self._use_config_fallback = True
-            self._allowed_identifiers = None
-        return self._allowed_identifiers
+        """返回 None：标识判定直接走 metadata_scope 配置（不依赖 Hive 表清单缓存）。"""
+        return None
 
     def _is_allowed_identifier(self, identifier: str) -> bool:
-        """判断表/库标识是否在当前接入范围内。"""
+        """判断表/库标识是否在当前接入范围内，直接按 metadata_scope 配置判定。"""
         identifier = str(identifier or "").strip()
         if not identifier:
             return True
-        allowed = self._allowed_set()
-        if allowed is not None:
-            return identifier.lower() in allowed
-        # 配置兜底：拆 db.table 后按 metadata_scope 判定
         if self._key == "database":
             return identifier.lower() in set(
                 str(db).lower() for db in get_allowed_databases()
             )
         db, _, table = identifier.rpartition(".")
         if not db or not table:
-            return True
+            # 无库名标识（历史数据/裸表名）：按裸表名配置判定
+            return is_allowed_table(table, "")
         return is_allowed_table(table, db)
 
     def _filter_docs(self, docs):
@@ -71,6 +50,37 @@ class WhitelistFilteredVectorStore:
             if self._is_allowed_identifier(
                 str((doc.metadata or {}).get(self._key, ""))
             )
+        ]
+
+    def _table_documents(self, table: str) -> list:
+        """精确返回某表的全部 Document（直接查 docstore，不经过向量相似度截断）。"""
+        docstore = getattr(getattr(self._inner_store, "docstore", None), "_dict", None)
+        if docstore is None:
+            return []
+        return [
+            doc for doc in docstore.values()
+            if str((doc.metadata or {}).get("table", "")) == table
+        ]
+
+    def columns_in_table(self, table: str) -> list[str]:
+        """精确返回某表在当前白名单内的字段名列表（供字段存在性判断，避免 fetch_k 截断漏检）。"""
+        table = str(table or "")
+        if not self._is_allowed_identifier(table):
+            return []
+        return [
+            str(doc.metadata.get("column", ""))
+            for doc in self._table_documents(table)
+            if doc.metadata.get("column")
+        ]
+
+    def documents_by_table(self, table: str) -> list:
+        """精确返回某表在当前白名单内的字段 Document 列表（供按表召回字段，避免向量检索漏召）。"""
+        table = str(table or "")
+        if not self._is_allowed_identifier(table):
+            return []
+        return [
+            doc for doc in self._table_documents(table)
+            if doc.metadata.get("column")
         ]
 
     def similarity_search(self, query, k=4, **kwargs):

@@ -5,6 +5,11 @@ SEARCH_DB_K = 3
 SEARCH_TABLE_K = 3
 SEARCH_COLUMN_K = 5
 
+# BM25 混合检索权重
+# - 0.0 = 只用向量检索（纯语义）
+# - 1.0 = 只用 BM25 检索（纯关键词）
+# - 0.3 = 30% BM25 + 70% 向量（默认，推荐）
+BM25_ALPHA = 0.3
 
 # Demo 层硬止损：同一话题 Advisor 最多追问轮数
 MAX_DEMO_ADVISOR_TURNS = 10

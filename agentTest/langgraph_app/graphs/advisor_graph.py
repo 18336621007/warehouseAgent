@@ -374,6 +374,7 @@ def build_advisor_subgraph(runtime):
         runtime["db_vector_store"],
         runtime["table_vector_store"],
         runtime["column_vector_store"],
+        runtime.get("bm25_retriever"),
     )
 
     # 指标歧义门禁：基于真实元数据候选和用户选择证据，拦截未确认口径的方案提交

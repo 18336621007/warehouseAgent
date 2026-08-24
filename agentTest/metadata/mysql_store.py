@@ -8,8 +8,11 @@ EVENT_COLUMN_MODIFIED = "column_modified"
 EVENT_COLUMN_REMOVED = "column_removed"
 EVENT_ENUM_REFRESHED = "enum_refreshed"
 EVENT_TABLE_RETIRED = "table_retired"
+EVENT_DATABASE_RETIRED = "database_retired"
 
 from agentTest.db.db_config import get_mysql_config
+from agentTest.db.metadata_scope import get_allowed_databases
+from agentTest.db.metadata_scope import is_allowed_table
 
 
 def _get_connection():
@@ -60,6 +63,31 @@ def delete_table_data(full_name: str):
         conn.commit()
     finally:
         conn.close()
+
+def list_enriched_database_names():
+    """返回 MySQL 中已有库级增强记录的库名集合，用于白名单清理"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT database_name FROM enriched_databases")
+            return {row[0] for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+
+def delete_database_data(database_name: str):
+    """删除某库的增强数据（库级 + 该库所有表/字段 + 指纹状态），用于库移出白名单时清理"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM enriched_databases WHERE database_name = %s", (database_name,))
+            cursor.execute("DELETE FROM enriched_tables WHERE full_name LIKE %s", (f"{database_name}.%",))
+            cursor.execute("DELETE FROM enriched_columns WHERE database_name = %s", (database_name,))
+            cursor.execute("DELETE FROM metadata_sync_state WHERE database_name = %s", (database_name,))
+        conn.commit()
+    finally:
+        conn.close()
+
 
 def init_metadata_tables():
     """建库建表，幂等执行（表不存在才建）"""
@@ -295,7 +323,12 @@ def load_enriched_tables():
 
         result = {}
         for row in rows:
-            result[row[0]] = {
+            full_name = row[0]
+            db_name, _, table_name = full_name.partition(".")
+            # 白名单过滤：已移出接入范围的表不进入运行时与索引
+            if not is_allowed_table(table_name, db_name):
+                continue
+            result[full_name] = {
                 "domain": row[1] or "",
                 "core_function": row[2] or "",
                 "key_entities": json.loads(row[3]) if row[3] else [],
@@ -316,9 +349,14 @@ def load_enriched_databases():
             )
             rows = cursor.fetchall()
 
+        allowed_dbs = set(get_allowed_databases())
         result = {}
         for row in rows:
-            result[row[0]] = {
+            db_name = row[0]
+            # 白名单过滤：已移出接入范围的库不进入运行时与索引
+            if db_name not in allowed_dbs:
+                continue
+            result[db_name] = {
                 "domain": row[1] or "",
                 "full_table_list": json.loads(row[2]) if row[2] else [],
                 "description": row[3] or "",
@@ -356,6 +394,9 @@ def load_enriched_columns():
             meta_source = (row[9] or "") if has_meta_source else ""
             if not meta_source:
                 meta_source = "ddl_comment" if (row[8] or "") else "llm_enhanced"
+            # 白名单过滤：已移出接入范围的表/字段不进入运行时与索引
+            if not is_allowed_table(row[2] or "", row[1] or ""):
+                continue
             result.append({
                 "full_key": row[0],
                 "database_name": row[1] or "",
@@ -528,6 +569,35 @@ def update_user_score(dialogue_id: int, user_score: float):
             "effective_query": old_effective,
             "score": comprehensive,
         }
+    finally:
+        conn.close()
+
+
+def list_evaluated_dialogues():
+    """读取全部评估对话记录（用于按白名单清理残留），返回 [{id, tables_used, example_hash}]"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, tables_used, example_hash FROM evaluated_dialogues")
+            result = []
+            for row in cursor.fetchall():
+                result.append({
+                    "id": row[0],
+                    "tables_used": row[1] or "",
+                    "example_hash": row[2] or "",
+                })
+            return result
+    finally:
+        conn.close()
+
+
+def delete_evaluated_dialogue(dialogue_id: int):
+    """按 id 删除评估对话记录（表已移出白名单等场景清理）"""
+    conn = _get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM evaluated_dialogues WHERE id = %s", (dialogue_id,))
+        conn.commit()
     finally:
         conn.close()
 

@@ -11,10 +11,12 @@ from agentTest.langchain_app.app_builder import build_column_rag
 from agentTest.langchain_app.app_builder import build_db_rag
 from agentTest.langchain_app.app_builder import build_langchain_tools
 from agentTest.langchain_app.app_builder import build_table_rag
+from agentTest.langchain_app.app_builder import build_bm25_rag
 from agentTest.langgraph_app.services.query_plan_schema_resolver import QueryPlanSchemaResolver
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.langgraph_app.services.whitelist_filtered_store import WhitelistFilteredVectorStore
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
+
 def build_graph_runtime():
     # 结构化日志由TimedRotatingFileHandler按天滚动，服务启动时保留历史日志
 
@@ -25,7 +27,9 @@ def build_graph_runtime():
     table_rag = build_table_rag(embedding)
     column_rag = build_column_rag(embedding)
 
-
+    # 新增：BM25 倒排索引（Advisor 混合检索用）
+    bm25_rag = build_bm25_rag()
+    bm25_retriever = bm25_rag.get("retriever")
 
     # Evaluator 示例向量库（高质量对话存储，供 Planner/Advisor/Seeker 检索）
     example_vector_store = ExampleVectorStore(embedding)
@@ -87,6 +91,8 @@ def build_graph_runtime():
         "table_vector_store": WhitelistFilteredVectorStore(table_rag["vector_store"], metadata_provider, key="table"),
         "column_vector_store": WhitelistFilteredVectorStore(column_rag["vector_store"], metadata_provider, key="table"),
         "example_vector_store": example_vector_store,  # Evaluator 示例向量库
+        # 新增：BM25 倒排索引检索器（混合检索用）
+        "bm25_retriever": bm25_retriever,
         "tools": tools,
         "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}
         "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}

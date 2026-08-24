@@ -36,7 +36,9 @@ from agentTest.metadata.mysql_store import (
     save_column, save_table, save_database,
     get_sync_state, save_sync_state, delete_sync_state, get_all_sync_states,
     delete_table_data, delete_enriched_column, log_metadata_changes,
+    list_enriched_table_names, list_enriched_database_names, delete_database_data,
     EVENT_COLUMN_ADDED, EVENT_COLUMN_MODIFIED, EVENT_COLUMN_REMOVED, EVENT_TABLE_RETIRED,
+    EVENT_DATABASE_RETIRED,
 )
 
 
@@ -66,20 +68,10 @@ def _invoke_structured(structured_llm, user_content, system_prompt, item_name):
         return {}
 
 
-# ── 辅助函数：字段采样 ──────────────────────────────────────────────
+# ── 辅助函数：字段采样（已禁用，改用字段名推断别名） ──────────────────────
 def _sample_column_values(datasource, database_name, table_name, column_name, limit=3):
-    """对单个字段采样 N 条去重非空真实值"""
-    sql = (
-        f"SELECT DISTINCT {column_name} "
-        f"FROM {database_name}.{table_name} "
-        f"WHERE {column_name} IS NOT NULL AND {column_name} != '' "
-        f"LIMIT {limit}"
-    )
-    try:
-        result = datasource.query(sql)
-        return [str(row[0]) for row in result["rows"]]
-    except Exception:
-        return []  # 采样失败不阻塞流程
+    """跳过采样，直接返回空列表。别名由 LLM 根据字段名推断"""
+    return []
 
 
 # ── Step 1: 字段级增强（含采样） ─────────────────────────────────────
@@ -98,8 +90,13 @@ def _enrich_columns(meta_provider, datasource, structured_llm):
         table_name = table_info["table_name"]
         database_name = table_info["database_name"]
         full_name = f"{database_name}.{table_name}"
-        schema = meta_provider.describe_table(full_name)
-        columns = schema.get("columns", [])
+        try:
+            schema = meta_provider.describe_table(full_name)
+            columns = schema.get("columns", [])
+        except Exception as exc:
+            # Hive 超时/异常时跳过该表，不中断整批（下次重跑断点补采）
+            print(f"  [{full_name}] 表结构读取失败（Hive 超时或异常），跳过该表: {exc}")
+            continue
         total_cols = len(columns)
 
         # 计算当前指纹（字段名/类型/注释 + 表注释）
@@ -160,8 +157,7 @@ def _enrich_columns(meta_provider, datasource, structured_llm):
             prompt = f"""表名：{full_name}
 字段名：{col_name}
 字段类型：{col_type}
-原始注释：{col_comment or "无"}
-采样值（来自真实数据）：{samples if samples else "无采样数据"}"""
+原始注释：{col_comment or "无"}"""
 
             parsed = _invoke_structured(
                 structured_llm, prompt, COLUMN_ENRICH_SYSTEM_PROMPT,
@@ -225,7 +221,12 @@ def _enrich_tables(meta_provider, structured_llm, enriched_columns, changed_tabl
         # 进度提示
         print(f"  [{idx+1}/{total_tables}] {full_name} 增强中...", end=" ")
 
-        schema = meta_provider.describe_table(full_name)
+        try:
+            schema = meta_provider.describe_table(full_name)
+        except Exception as exc:
+            # Hive 超时/异常时跳过该表，不中断整批
+            print(f"  [{full_name}] 表结构读取失败（Hive 超时或异常），跳过该表: {exc}")
+            continue
 
         # 构建包含字段增强信息的上下文（维度/度量标记 + 别名）
         column_details = []
@@ -326,7 +327,12 @@ def _retire_missing_tables(meta_provider):
     from agentTest.db.metadata_scope import get_auto_retire_missing
     if not get_auto_retire_missing():
         return
-    current = {(t["database_name"], t["table_name"]) for t in meta_provider.list_tables()}
+    try:
+        current = {(t["database_name"], t["table_name"]) for t in meta_provider.list_tables()}
+    except Exception as exc:
+        # Hive 故障时不执行废弃清理，避免误删
+        print(f"  [retire] 无法获取表清单（Hive 连接/查询失败），跳过废弃清理: {exc}")
+        return
     for full_name in get_all_sync_states():
         db_name, table_name = full_name.split(".", 1)
         if (db_name, table_name) not in current:
@@ -340,6 +346,64 @@ def _retire_missing_tables(meta_provider):
                 "detail": {"full_name": full_name},
             }])
             print(f"  [retire] {full_name} 已从 Hive 消失，清理增强数据与指纹状态")
+
+
+# ── 白名单驱动：清理已移出接入范围的表/库（多退） ──────────────────────
+def _prune_scope_excess(meta_provider):
+    """按当前白名单清理 MySQL 中已移出接入范围的表与库：
+    - enriched_tables / metadata_sync_state 中不在白名单的表 → 删除（含字段级数据）
+    - enriched_databases 中不在白名单库的库 → 删除（含该库全部表/字段/指纹状态）
+    解决"表从白名单移除但 Hive 仍存在时，残留数据进入索引"的问题。"""
+    try:
+        current = {(t["database_name"], t["table_name"]) for t in meta_provider.list_tables()}
+    except Exception as exc:
+        # 无法确认当前白名单范围时不执行任何删除，避免 Hive 故障导致误删 MySQL 数据
+        raise RuntimeError(
+            f"无法获取白名单内表清单（Hive 连接/查询失败），已中止白名单清理，请先检查 Hive 服务: {exc}"
+        ) from exc
+    removed_tables = 0
+    removed_dbs = 0
+
+    # 1. enriched_tables 中不在白名单的表（Hive 仍在，仅白名单移除）
+    for full_name in list_enriched_table_names():
+        db_name, _, table_name = full_name.partition(".")
+        if (db_name, table_name) not in current:
+            delete_table_data(full_name)
+            delete_sync_state(db_name, table_name)
+            log_metadata_changes([{
+                "event_type": EVENT_TABLE_RETIRED,
+                "database_name": db_name,
+                "table_name": table_name,
+                "column_name": "",
+                "detail": {"full_name": full_name, "reason": "out_of_scope"},
+            }])
+            print(f"  [prune] {full_name} 已移出白名单，清理增强数据与指纹状态")
+            removed_tables += 1
+
+    # 2. metadata_sync_state 中不在白名单的表（防指纹状态残留）
+    for full_name in get_all_sync_states():
+        db_name, _, table_name = full_name.partition(".")
+        if (db_name, table_name) not in current:
+            delete_sync_state(db_name, table_name)
+            print(f"  [prune] {full_name} 已移出白名单，清理指纹状态")
+
+    # 3. enriched_databases 中不在白名单的库
+    allowed_dbs = set(get_allowed_databases())
+    for db_name in list_enriched_database_names():
+        if db_name not in allowed_dbs:
+            delete_database_data(db_name)
+            log_metadata_changes([{
+                "event_type": EVENT_DATABASE_RETIRED,
+                "database_name": db_name,
+                "table_name": "",
+                "column_name": "",
+                "detail": {"database_name": db_name, "reason": "out_of_scope"},
+            }])
+            print(f"  [prune] 库 {db_name} 已移出白名单，清理库级/表级/字段级增强数据")
+            removed_dbs += 1
+
+    if removed_tables or removed_dbs:
+        print(f"  [prune] 完成：清理表 {removed_tables} 张，库 {removed_dbs} 个")
 
 
 # ── 主入口 ──────────────────────────────────────────────────────────
@@ -356,9 +420,10 @@ def build_enriched_metadata(output_path="metadata/enriched_metadata.json", force
     table_llm = _build_structured_llm(TableEnrichmentOutput)
     database_llm = _build_structured_llm(DatabaseEnrichmentOutput)
 
-    # Step 0: Hive 中已消失的表按配置治理（M3 table_retired）
-    print("Step 0/4: 检查并清理已消失的表...")
+    # Step 0: Hive 中已消失的表按配置治理 + 已移出白名单的表/库按配置清理（多退）
+    print("Step 0/4: 检查并清理已消失/已移出白名单的表与库...")
     _retire_missing_tables(meta_provider)
+    _prune_scope_excess(meta_provider)
 
     # Step 1: 字段级增强（含采样，schema 指纹增量）
     if force_tables:

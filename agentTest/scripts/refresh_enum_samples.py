@@ -29,6 +29,7 @@ from agentTest.metadata.mysql_store import (
     _get_connection, init_metadata_tables, save_column,
     log_metadata_changes, EVENT_ENUM_REFRESHED,
 )
+from agentTest.db.metadata_scope import is_allowed_table
 
 SAMPLE_LIMIT = 100  # 枚举采样上限
 
@@ -63,6 +64,9 @@ def _load_columns(only_empty: bool = True, table: str = "", column: str = "") ->
             for row in cursor.fetchall():
                 item = dict(zip(keys, row))
                 item["sample_values"] = json.loads(item["sample_values"]) if item["sample_values"] else []
+                # 白名单过滤：跳过已移出接入范围的表
+                if not is_allowed_table(item["table_name"], item["database_name"]):
+                    continue
                 result.append(item)
             return result
     finally:

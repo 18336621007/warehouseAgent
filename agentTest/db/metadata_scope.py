@@ -14,15 +14,25 @@ _DEFAULT_TABLES = [
     "dwm_exchange_order_addition_detail_hour",
     "ads_exchange_platform_operations_report_day",
     "dim_company_snapshot_day",
-    "ads_exchange_order_device_info_day",
 ]
 
 _scope_cache = None
+# 配置文件最后修改时间，变化时自动刷新缓存，感知运行期白名单变更
+_scope_mtime = None
 
 
 def load_metadata_scope(force_reload: bool = False) -> dict:
-    """加载接入范围配置；配置缺失或解析失败时回退默认白名单"""
-    global _scope_cache
+    """加载接入范围配置；配置缺失或解析失败时回退默认白名单
+    配置文件 mtime 变化时自动 force_reload，避免服务运行期间白名单变更不生效"""
+    global _scope_cache, _scope_mtime
+    # 配置文件 mtime 变化时强制刷新（白名单变更无需重启即可生效）
+    if not force_reload and _scope_cache is not None:
+        try:
+            current_mtime = os.path.getmtime(_CONFIG_PATH)
+        except OSError:
+            current_mtime = None
+        if current_mtime != _scope_mtime:
+            force_reload = True
     if _scope_cache is not None and not force_reload:
         return _scope_cache
 
@@ -51,6 +61,11 @@ def load_metadata_scope(force_reload: bool = False) -> dict:
         # 配置缺失/损坏时保持默认，安全边界不因配置错误而失效
         pass
     _scope_cache = scope
+    # 记录配置 mtime，供下次调用判断是否变化
+    try:
+        _scope_mtime = os.path.getmtime(_CONFIG_PATH)
+    except OSError:
+        _scope_mtime = None
     return _scope_cache
 
 

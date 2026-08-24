@@ -133,6 +133,34 @@ class ExampleVectorStore:
             self._vector_store.delete(ids_to_delete)
             self._save_to_disk()
 
+    def find_out_of_scope_doc_ids(self, is_allowed) -> list:
+        """返回 tables 中存在白名单外表的文档 docstore id 列表（供清理预览与删除）。
+        is_allowed: callable(db.table 或裸表名) -> bool"""
+        self._ensure_loaded()
+        if self._vector_store is None:
+            return []
+        ids = []
+        for doc_id, doc in self._vector_store.docstore._dict.items():
+            md = doc.metadata or {}
+            if md.get("_placeholder"):
+                continue
+            try:
+                tables = json.loads(md.get("tables", "[]") or "[]")
+            except Exception:
+                tables = []
+            if any(not is_allowed(t) for t in tables):
+                ids.append(doc_id)
+        return ids
+
+    def remove_doc_ids(self, doc_ids: list) -> int:
+        """按 docstore id 删除示例文档并落盘，返回删除条数。"""
+        self._ensure_loaded()
+        if self._vector_store is None or not doc_ids:
+            return 0
+        self._vector_store.delete(doc_ids)
+        self._save_to_disk()
+        return len(doc_ids)
+
     def sync_by_score(self, hash_id: str, question: str, sql: str, answer: str,
                       tables: list, fields: list, domain_tag: str,
                       score: float, is_high: bool, effective_query: str = ""):

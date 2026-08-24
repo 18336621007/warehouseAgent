@@ -25,11 +25,25 @@ class TableCoverageAnalyzer:
         primary_table = confirmed_plan.get("table", "")
         declared_sources = confirmed_plan.get("field_sources") or {}
 
+        # 确认方案涉及的表集合：未声明来源的字段只在方案内定位，禁止全域检索绑到方案外的表
+        plan_tables = set(confirmed_plan.get("tables") or [])
+        if primary_table:
+            plan_tables.add(primary_table)
+
         field_sources: dict[str, str] = {}
         uncovered: list[str] = []
 
-        for field_name in fields:
-            declared_table = declared_sources.get(field_name, "")
+        for field_ref in fields:
+            # 兼容完整路径 "db.table.field"：拆出裸字段名和字段自带来源表
+            if isinstance(field_ref, str) and field_ref.count(".") >= 2:
+                table_part, _, field_name = field_ref.rpartition(".")
+                implicit_table = table_part
+            else:
+                field_name = str(field_ref)
+                implicit_table = ""
+
+            # 来源优先级：field_sources 显式来源 > 字段自带表前缀 > 方案作用域内检索
+            declared_table = declared_sources.get(field_name, "") or implicit_table
             if declared_table:
                 # 已锁定的字段来源只能做精确校验，禁止执行阶段静默换表。
                 if self._field_exists_in_table(field_name, declared_table):
@@ -38,8 +52,8 @@ class TableCoverageAnalyzer:
                     uncovered.append(field_name)
                 continue
 
-            table_found = self._find_field_table(
-                field_name, primary_table=primary_table
+            table_found = self._find_field_table_in_scope(
+                field_name, plan_tables=plan_tables
             )
             if table_found:
                 field_sources[field_name] = table_found
@@ -57,38 +71,15 @@ class TableCoverageAnalyzer:
         )
 
     def _field_exists_in_table(self, field_name: str, table_name: str) -> bool:
-        """精确校验字段是否属于已锁定的物理表。"""
-        docs = self._column_vector_store.similarity_search(
-            field_name,
-            k=5,
-            filter={"table": table_name},
-        )
-        return any(
-            doc.metadata.get("column", "") == field_name
-            for doc in docs
-        )
+        """精确校验字段是否属于已锁定的物理表。
+        直接查 docstore 做 metadata 精确匹配，避免向量检索 fetch_k 截断导致漏检。"""
+        columns = self._column_vector_store.columns_in_table(table_name)
+        return field_name in columns
 
-    def _find_field_table(self, field_name: str, primary_table: str = "") -> str:
-        """通过列向量库定位字段所属的表，优先匹配主表内的字段"""
-        # 先尝试在主表范围内检索
-        if primary_table:
-            main_docs = self._column_vector_store.similarity_search(
-                field_name, k=3,
-                filter={"table": primary_table},
-            )
-            for doc in main_docs:
-                col = doc.metadata.get("column", "")
-                if col == field_name:
-                    return primary_table
-
-        # 全域检索
-        docs = self._column_vector_store.similarity_search(
-            field_name, k=5,
-        )
-        for doc in docs:
-            col = doc.metadata.get("column", "")
-            table = doc.metadata.get("table", "")
-            if col == field_name and table:
-                return table
-
+    def _find_field_table_in_scope(self, field_name: str, plan_tables: set) -> str:
+        """在确认方案涉及的表集合内按裸字段名精确检索来源表。
+        只允许绑定到方案内的表，避免全域检索把字段绑到方案外的表导致参与表被错误扩充。"""
+        for table_name in plan_tables:
+            if self._field_exists_in_table(field_name, table_name):
+                return table_name
         return ""

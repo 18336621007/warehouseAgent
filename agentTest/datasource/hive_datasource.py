@@ -1,5 +1,6 @@
 from agentTest.datasource.base_datasource import BaseDataSource
 from agentTest.db.hive_config import get_hive_config
+from agentTest.db.hive_config import apply_thrift_socket_timeout
 from pyhive import hive
 # Hive 数据源，负责真正执行 SQL 和底层超时控制
 class HiveDataSource(BaseDataSource):
@@ -9,18 +10,17 @@ class HiveDataSource(BaseDataSource):
         self.config = get_hive_config()
 
     def _get_connection(self, timeout_seconds=None):
-        return hive.Connection(
+        conn = hive.Connection(
             host=self.config["host"],
             port=self.config["port"],
             username=self.config["username"],
             password=self.config["password"],
             database=self.config["database"],
             auth=self.config["auth"],
-            # timeout=timeout_seconds,
-            # configuration={
-            #     "hive.query.timeout.seconds": str(timeout_seconds)
-            # } if timeout_seconds else None,
         )
+        # 设置 socket 超时，避免 Hive 无响应时无限等待（可配置 HIVE_TIMEOUT_SECONDS）
+        apply_thrift_socket_timeout(conn, timeout_seconds)
+        return conn
 
     def query(self, sql: str, timeout_seconds=None, max_rows=None):
         # 执行SQL，并支持超时和结果截断保护

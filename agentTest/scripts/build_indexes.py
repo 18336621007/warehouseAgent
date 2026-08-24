@@ -8,9 +8,9 @@ os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddings
 from agentTest.langchain_app.app_builder import (
     _CACHE_DB_DIR, _CACHE_TABLE_DIR, _CACHE_COLUMN_DIR,
-    _CACHE_ENRICHED_DIR, _CACHE_SCHEMA_DIR,
+    _CACHE_ENRICHED_DIR, _CACHE_SCHEMA_DIR, _CACHE_BM25_DIR,
     build_db_rag, build_table_rag, build_column_rag,
-    build_enriched_schema_rag_app,
+    build_enriched_schema_rag_app, build_bm25_rag,
 )
 
 CACHE_DIRS = {
@@ -19,6 +19,7 @@ CACHE_DIRS = {
     "column":   _CACHE_COLUMN_DIR,
     "enriched": _CACHE_ENRICHED_DIR,
     "schema":   _CACHE_SCHEMA_DIR,
+    "bm25":     _CACHE_BM25_DIR,
 }
 
 BUILDERS = {
@@ -26,13 +27,14 @@ BUILDERS = {
     "table":    build_table_rag,
     "column":   build_column_rag,
     "enriched": build_enriched_schema_rag_app,
+    "bm25":     build_bm25_rag,
 }
 
 
 def run_build_all(force: bool = False, target: str | None = None, embedding=None):
     """构建/同步全部或指定 FAISS 索引（供 CLI 与 sync_metadata.py 复用）"""
     print("=" * 60)
-    print("FAISS 向量索引同步器")
+    print("FAISS + BM25 索引同步器")
     print(f"模式: {'强制重建' if force else '增量同步（新增/更新/删除）'}")
     print("=" * 60)
 
@@ -50,7 +52,11 @@ def run_build_all(force: bool = False, target: str | None = None, embedding=None
 
         try:
             print(f"\n[{name}] 开始同步...")
-            result = builder(embedding, force_rebuild=force, return_stats=True)
+            # BM25 索引不需要 embedding 参数
+            if name == "bm25":
+                result = builder(force_rebuild=force, return_stats=True)
+            else:
+                result = builder(embedding, force_rebuild=force, return_stats=True)
             doc_count = len(result.get("documents", []))
             stats = result.get("sync_stats") or {}
             print(f"[{name}] 文档总数: {doc_count} 条 -> {cache_dir}")

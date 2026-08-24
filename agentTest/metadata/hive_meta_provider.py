@@ -2,8 +2,10 @@ import copy
 from collections import Counter
 
 from agentTest.db.hive_config import get_hive_config
+from agentTest.db.hive_config import apply_thrift_socket_timeout
 from agentTest.db.hive_guardrails import is_table_allowed
 from agentTest.db.metadata_scope import get_allowed_databases
+from agentTest.db.metadata_scope import load_metadata_scope
 from agentTest.db.metadata_scope import is_allowed_table as _scope_is_allowed_table
 from agentTest.metadata.base_metadata_provider import BaseMetadataProvider
 from pyhive import hive
@@ -15,6 +17,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
     def __init__(self):
         self.config = get_hive_config()
         self._tables_cache = None
+        self._tables_scope_signature = None  # 缓存时对应的白名单签名，变化则失效
         self._table_schema_cache = {}
 
         #测试cache用
@@ -22,7 +25,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
         self._describe_table_query_cnt = 0
 
     def _get_connection(self):
-        return hive.Connection(
+        conn = hive.Connection(
             host=self.config["host"],
             port=self.config["port"],
             username=self.config["username"],
@@ -30,12 +33,30 @@ class HiveMetadataProvider(BaseMetadataProvider):
             database=self.config["database"],
             auth=self.config["auth"]
         )
+        # 设置 socket 超时，避免 Hive 无响应时无限等待
+        apply_thrift_socket_timeout(conn)
+        return conn
 
     def _is_allowed_table(self, table_name: str, database_name: str = ""):
         # 统一接入范围判定：配置白名单（metadata_scope）
         return is_table_allowed(table_name, database_name)
 
+    def _scope_signature(self) -> str:
+        """当前白名单签名（库 + include 表），变化时 list_tables 缓存自动失效。"""
+        scope = load_metadata_scope()
+        return (
+            repr(sorted(scope.get("databases") or []))
+            + "|"
+            + repr(sorted(scope.get("include_tables") or []))
+        )
+
     def list_tables(self, with_comment: bool = False):
+        # 白名单变化时自动失效表清单缓存，避免运行期使用过期白名单
+        current_scope = self._scope_signature()
+        if current_scope != self._tables_scope_signature:
+            self._tables_cache = None
+            self._tables_scope_signature = current_scope
+
         if self._tables_cache is not None:
             # 缓存命中但请求表备注且缓存尚未填充时，补充表备注查询
             if with_comment and any(not table.get("table_comment") for table in self._tables_cache):
@@ -75,6 +96,7 @@ class HiveMetadataProvider(BaseMetadataProvider):
                 )
             ]
             self._tables_cache = result #缓存
+            self._tables_scope_signature = current_scope
 
             # 可选：逐表 DESCRIBE FORMATTED 拿表备注（表多时较慢，默认关闭）
             if with_comment:
