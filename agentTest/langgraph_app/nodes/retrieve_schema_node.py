@@ -17,12 +17,13 @@ def build_retrieve_schema_node(runtime):
         runtime["query_plan_schema_resolver"]
     )
     column_vector_store = runtime["column_vector_store"]
-    metadata_provider = runtime.get("metadata_provider")
+    # 字段归属判定必须使用 SemanticMetadataProvider（含 SemanticLayerProvider 权威 partition/fields），
+    # 不应使用 HiveMetadataProvider（仅返回 Hive 元数据，没有 partition 字段语义）
     semantic_provider = runtime["semantic_metadata_provider"]
 
     coverage_analyzer = TableCoverageAnalyzer(
         column_vector_store,
-        metadata_provider,
+        semantic_provider,
     )
     join_planner = JoinPlanner(semantic_provider)
 

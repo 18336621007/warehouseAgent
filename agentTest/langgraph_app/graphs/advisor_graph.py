@@ -31,6 +31,10 @@ from agentTest.langgraph_app.services.query_plan_service import (
 )
 from agentTest.langgraph_app.services.metric_ambiguity_validator import MetricAmbiguityValidator
 from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
+from agentTest.semantic_layer.metric_matcher import (
+    match_metrics_from_query,
+    format_metric_context,
+)
 from agentTest.langgraph_app.services.candidate_reranker import (
     build_candidate_reranker,
     complete_selection,
@@ -473,6 +477,14 @@ def build_advisor_subgraph(runtime):
             completeness=planner_completeness or "none",
         )
 
+        # ── 语义层权威口径注入：匹配候选指标供 Advisor 核验字段参考，不替代候选口径白名单 ──
+        metric_search_text = effective_query or "\n".join(
+            part for part in (original_question, current_user_input) if part and part.strip()
+        )
+        metric_context_text = format_metric_context(
+            match_metrics_from_query(metric_search_text, limit=5)
+        )
+
         # confirmed_plan 字段同时承载 locked 和 confirmed 两种完整方案状态
         current_plan = state.get("confirmed_plan") or {}
 
@@ -483,6 +495,10 @@ def build_advisor_subgraph(runtime):
             "【用户本轮原始输入】",
             current_user_input,
         ]
+
+        # 语义层权威口径插入在最前，紧接着 Planner 还原需求
+        if metric_context_text:
+            context_lines = [metric_context_text] + context_lines
 
         if planner_tables:
             context_lines.extend([

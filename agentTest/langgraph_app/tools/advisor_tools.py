@@ -91,13 +91,21 @@ def search_column_candidates(question: str, table: str = "", k: int = None) -> l
     if not question:
         return []
 
-    # 指定表时：直接从该表精确召回字段，避免向量检索 fetch_k 截断导致目标表字段漏召
+    # 指定表时：按问题相关度召回该表字段（先精确取字段数保证 fetch_k 覆盖全表，避免截断漏召）
     if table and _column_vector_store is not None:
-        table_docs = _column_vector_store.documents_by_table(table)
-        if not table_docs:
+        table_columns = _column_vector_store.columns_in_table(table)
+        if not table_columns:
             return []
+        # fetch_k 必须覆盖该表全部字段，否则目标字段可能因相似度排名靠后而被过滤掉
+        fetch_k = max(top_k * 5, len(table_columns) * 2, 50)
+        docs_with_scores = _column_vector_store.similarity_search_with_score(
+            question,
+            k=top_k,
+            filter={"table": table},
+            fetch_k=fetch_k,
+        )
         candidates = []
-        for doc in table_docs[:top_k]:
+        for doc, score in docs_with_scores:
             metadata = doc.metadata or {}
             page_content = doc.page_content or ""
             field = metadata.get("column", metadata.get("field", ""))
@@ -108,7 +116,7 @@ def search_column_candidates(question: str, table: str = "", k: int = None) -> l
                 "comment": page_content,
                 "aliases": _extract_aliases_from_content(page_content),
                 "enum_hint": _build_enum_hint(field, metadata.get("table", "")),
-                "score": 1.0,
+                "score": float(round(float(score), 4)),
             })
         return candidates
 

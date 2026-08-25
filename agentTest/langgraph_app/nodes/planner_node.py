@@ -14,6 +14,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage
 from agentTest.langgraph_app.services.query_plan_service import confirm_query_plan
 from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
+from agentTest.semantic_layer.metric_matcher import (
+    format_metric_context,
+    match_metrics_from_query,
+)
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
 from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
@@ -235,6 +239,7 @@ def build_planner_node(runtime):
     # 三层索引中的表层和字段层
     table_vector_store = runtime["table_vector_store"]
     column_vector_store = runtime["column_vector_store"]
+    bm25_retriever = runtime.get("bm25_retriever")
 
     # ChatOpenAI：LangChain 标准的 OpenAI 兼容客户端
     # 挂载 LLM 日志回调：记录 prompt/输出/耗时，便于 trace 回放
@@ -337,7 +342,22 @@ def build_planner_node(runtime):
             retrieval_question = "\n".join(retrieval_parts)
 
             # ── 步骤①：FAISS 检索增强元数据（先召回表，再在召回表内召回字段）──
+            # 表层检索：向量 + BM25 双路召回，合并去重后按向量分数排序
             table_docs_with_scores = table_vector_store.similarity_search_with_score(retrieval_question, k=TABLE_SEARCH_K)
+            seen_tables = {str(doc.metadata.get("table", "")).strip().lower() for doc, _ in table_docs_with_scores}
+            if bm25_retriever:
+                try:
+                    bm25_results = bm25_retriever.retrieve(retrieval_question, top_k=TABLE_SEARCH_K * 3)
+                    for doc, bm25_score in bm25_results:
+                        table_name = str(doc.metadata.get("table", "")).strip().lower()
+                        if table_name and table_name not in seen_tables:
+                            seen_tables.add(table_name)
+                            # BM25 分数归一化到与向量可比范围（向量余弦相似度约 0.3-1.0），乘以向量最高分作为锚点
+                            max_vec_score = table_docs_with_scores[0][1] if table_docs_with_scores else 1.0
+                            normalized_score = bm25_score / (bm25_score + 1.0) * max_vec_score
+                            table_docs_with_scores.append((doc, normalized_score))
+                except Exception:
+                    pass  # BM25 异常不影响主流程
             table_scope = _build_table_scope(table_docs_with_scores)
             column_docs_with_scores = _recall_columns(column_vector_store, retrieval_question, table_scope)
 
@@ -391,6 +411,16 @@ def build_planner_node(runtime):
 
 
             # ── 步骤②：LLM 结构化解析（含 current_user_input、confirmed_context、advisor_last_answer）──
+            # 语义层指标上下文：用 metric_matcher 从用户原始问题匹配候选指标，
+            # 让 LLM 优先参考权威 source_model / expression / aliases，而不是凭空猜测表/字段。
+            # 这里使用 original_question + current_user_input 拼接作为匹配源，
+            # 避免依赖后续 LLM 输出的 effective_query。
+            metric_search_text = "\n".join(
+                part for part in (original_question, current_user_input) if part and part.strip()
+            )
+            metric_context_text = format_metric_context(
+                match_metrics_from_query(metric_search_text, limit=5)
+            )
             prompt_value = prompt.invoke({
                 "question": original_question,
                 "current_user_input": current_user_input,
@@ -406,6 +436,7 @@ def build_planner_node(runtime):
                 "resolution_context": MetricClarificationService.build_resolution_context(
                     state.get("analysis_spec") or {}
                 ),
+                "metric_context": metric_context_text,
             })
             planner_output = structured_llm.invoke(prompt_value)
 

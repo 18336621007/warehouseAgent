@@ -1,7 +1,12 @@
 # 简要注释：SQL 清洗工具模块，负责清洗模型生成的 SQL 文本。
 import re
 
-from agentTest.semantic.semantic_rules import PARTITION_FIELD_FORMATS
+# 分区字段格式常量在此处独立定义，避免遗留依赖；新接入的语义层（SemanticLayerProvider）
+# 通过 physical/<schema>/<table>.yaml 的 partition 字段提供权威定义，
+# 这里仅作为 SQL 文本清洗的格式识别兜底。
+PARTITION_FIELD_FORMATS = {
+    "pt_dt": "yyyyMMdd",   # 如 20260719
+}
 
 def fix_partition_date_format(sql: str) -> str:
     # 只对 yyyyMMdd 格式的字段做清洗，yyyy-MM-dd 格式的字段不需要转换

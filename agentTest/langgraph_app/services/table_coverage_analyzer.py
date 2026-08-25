@@ -1,5 +1,8 @@
 # 表覆盖分析器：将 confirmed_plan 的字段映射到物理表，判断单表能否覆盖
-# 使用列向量库查找每个字段所属的表，返回 CoverageResult
+# 数据来源优先级：
+#   1) SemanticMetadataProvider（含 SemanticLayerProvider 语义层 YAML 权威 partition/fields）
+#   2) docstore 精确匹配（白名单过滤后的字段列表，避免向量检索 fetch_k 截断漏检）
+# 返回 CoverageResult
 from dataclasses import dataclass, field
 
 
@@ -13,7 +16,7 @@ class CoverageResult:
 
 
 class TableCoverageAnalyzer:
-    """字段覆盖分析器，通过列向量库查找字段所属的物理表"""
+    """字段覆盖分析器：通过 SemanticMetadataProvider 语义层 + docstore 联合判定字段归属"""
 
     def __init__(self, column_vector_store, metadata_provider):
         self._column_vector_store = column_vector_store
@@ -72,13 +75,31 @@ class TableCoverageAnalyzer:
 
     def _field_exists_in_table(self, field_name: str, table_name: str) -> bool:
         """精确校验字段是否属于已锁定的物理表。
-        直接查 docstore 做 metadata 精确匹配，避免向量检索 fetch_k 截断导致漏检。"""
+        优先级：
+        1) 语义层 YAML（权威 partition / fields 定义）
+        2) docstore 精确匹配（兜底，避免向量检索 fetch_k 截断漏检）"""
+        if self._metadata_provider and self._metadata_provider.is_field_in_table(
+            table_name, field_name
+        ):
+            return True
         columns = self._column_vector_store.columns_in_table(table_name)
         return field_name in columns
 
     def _find_field_table_in_scope(self, field_name: str, plan_tables: set) -> str:
         """在确认方案涉及的表集合内按裸字段名精确检索来源表。
-        只允许绑定到方案内的表，避免全域检索把字段绑到方案外的表导致参与表被错误扩充。"""
+        只允许绑定到方案内的表，避免全域检索把字段绑到方案外的表导致参与表被错误扩充。
+
+        优先级：
+        1) 语义层 YAML：partition 字段（pt_dt/pt_platform）→ 直接归主表
+           partition 在所有表都存在，向量库检索会随机命中，必须用语义层权威定义。
+        2) 语义层 YAML / docstore 精确匹配
+        """
+        for table_name in plan_tables:
+            # 优先用语义层权威定义判定字段归属（避免 partition 字段被绑错表）
+            if self._metadata_provider and self._metadata_provider.is_field_in_table(
+                table_name, field_name
+            ):
+                return table_name
         for table_name in plan_tables:
             if self._field_exists_in_table(field_name, table_name):
                 return table_name

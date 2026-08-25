@@ -62,3 +62,4 @@ tmp/
 agentTest/logs/
 /agentTest/langgraph_app/cache/
 /agentTest/metadata/semantic_metadata.json
+/agentTest/semantic_layer/

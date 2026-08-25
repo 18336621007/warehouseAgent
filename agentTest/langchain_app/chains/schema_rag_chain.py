@@ -2,8 +2,6 @@
 
 from typing import List, Any
 
-from agentTest.semantic.semantic_rules import match_semantic_entries, format_semantic_context
-
 
 class SchemaRagChain:
     # 简要注释：初始化 RAG 链。
@@ -29,9 +27,9 @@ class SchemaRagChain:
         documents = self.retriever.retrieve(question) # 先检索相关的schema文档
         schema_context = self.format_schema_context(documents) # 把检索到的 document 整理成可以拼接给prompt的context文本
 
-        # 匹配语义条目，生成语义指引
-        matched_entries = match_semantic_entries(question)
-        semantic_context = format_semantic_context(matched_entries)
+        # 语义层已迁移到 SemanticLayerProvider / planner_node 的 metric_context。
+        # 此处保留语义上下文键以便老 Prompt 模板兼容，值为空字符串不破坏既有调用。
+        semantic_context = ""
         prompt_value = self.prompt.invoke({
             "question": question,
             "schema_context": schema_context,

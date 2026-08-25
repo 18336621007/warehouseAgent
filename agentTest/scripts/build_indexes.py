@@ -1,4 +1,4 @@
-﻿# 构建/同步所有 FAISS 向量索引（M3：按唯一键 upsert/delete）
+# 构建/同步所有 FAISS 向量索引（M3：按唯一键 upsert/delete）
 # 用法: python -m agentTest.scripts.build_indexes
 # 选项: --force  强制重建（删除已有缓存）
 import os, sys, shutil, argparse

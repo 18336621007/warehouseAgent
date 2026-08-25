@@ -1,22 +1,25 @@
-﻿# Schema 上下文增强节点，负责结合 schema tool 补充精确表结构信息。
+# Schema 上下文增强节点，负责结合 schema tool 补充精确表结构信息。
+# 语义层已迁移到 SemanticLayerProvider / planner_node 的 metric_context，
+# 这里只负责"格式化 schema_documents + 补充 describe_table 精确表结构"职责，
+# 语义匹配不再在本节点执行。
 from agentTest.langchain_app.chains.schema_rag_chain import SchemaRagChain
 from agentTest.langgraph_app.state.agent_state import AgentState
-from agentTest.semantic.semantic_rules import match_semantic_entries, format_semantic_context
 
 
 def build_enrich_schema_context_node(runtime):
     tools = runtime["tools"]
     describe_table_tool = next(tool for tool in tools if tool.name == "describe_table")
+
     def enrich_schema_context_node(state: AgentState):
         schema_documents = state.get("schema_documents", [])
 
-        #复用chain里的format_schema_context，把documents 转为 context
+        # 复用 chain 里的 format_schema_context，把 documents 转为 context
         temp_chain = SchemaRagChain(
             retriever=None,
             prompt=None,
             llm=None,
         )
-        schema_context = temp_chain.format_schema_context(schema_documents)  #"表名: ods_order\n表说明: 订单表\n字段信息:\n- order_id | string | 订单id",
+        schema_context = temp_chain.format_schema_context(schema_documents)
 
         # 从首个检索文档中尝试提取表名，并补充精确表结构。
         if schema_documents:
@@ -33,25 +36,12 @@ def build_enrich_schema_context_node(runtime):
                 schema_context = (
                     schema_context
                     + "\n\n"
-                    +"【精确表结构补充】\n"
-                    +str(table_schema)
+                    + "【精确表结构补充】\n"
+                    + str(table_schema)
                 )
-                # "database_name": self.config["database"],
-                # "table_name": table_name,
-                # "table_comment": "",
-                # "table_type": "",
-                # "columns": columns,
-
-        # 匹配语义条目，拼接到上下文开头，让LLM优先参考
-        # 语义增强使用 Planner 改写后的完整有效需求（原文可能是短指代）
-        question = state.get("effective_query") or state.get("original_question", "")
-        matched_entries = match_semantic_entries(question)
-        if matched_entries:
-            semantic_context = format_semantic_context(matched_entries)
-            schema_context = semantic_context + "\n\n" + schema_context
-
 
         return {
-            "schema_context": schema_context
+            "schema_context": schema_context,
         }
+
     return enrich_schema_context_node

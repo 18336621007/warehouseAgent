@@ -1,4 +1,4 @@
-﻿from agentTest.langchain_app.chains.schema_rag_chain import SchemaRagChain
+from agentTest.langchain_app.chains.schema_rag_chain import SchemaRagChain
 from agentTest.langchain_app.documents.schema_documents import SchemaDocumentsBuilder
 from agentTest.langgraph_app.prompts.sql_prompts import build_sql_generation_prompt
 from agentTest.langchain_app.retrievers.schema_retriever import SchemaRetriever
