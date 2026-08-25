@@ -21,6 +21,7 @@ from agentTest.config.advisor import (
     MAX_AMBIGUITY_CANDIDATES,
     MAX_COLUMN_CHECK_RETRIES,
 )
+from agentTest.config.semantic import SEMANTIC_UNIQUE_GAP_THRESHOLD
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.callbacks import BaseCallbackHandler
 from agentTest.langgraph_app.services.query_plan_service import (
@@ -481,9 +482,24 @@ def build_advisor_subgraph(runtime):
         metric_search_text = effective_query or "\n".join(
             part for part in (original_question, current_user_input) if part and part.strip()
         )
-        metric_context_text = format_metric_context(
-            match_metrics_from_query(metric_search_text, limit=5)
-        )
+        semantic_matches = match_metrics_from_query(metric_search_text, limit=5)
+        metric_context_text = format_metric_context(semantic_matches)
+
+        # 语义层唯一命中短路：top1 得分远高于 top2（gap >= 阈值）时，
+        # 直接注入 resolved 结果到 previous_resolutions，跳过 validator 的候选发现和澄清
+        _semantic_previous_resolutions: list[dict] = []
+        if len(semantic_matches) >= 2:
+            top1_score = semantic_matches[0].get("score", 0)
+            top2_score = semantic_matches[1].get("score", 0)
+            if top1_score - top2_score >= SEMANTIC_UNIQUE_GAP_THRESHOLD:
+                winner = semantic_matches[0]
+                _semantic_previous_resolutions.append({
+                    "mention": winner.get("name", ""),
+                    "selected_field": winner.get("id", ""),
+                    "selected_table": winner.get("source_model", ""),
+                    "source": "semantic_layer",
+                    "status": "resolved",
+                })
 
         # confirmed_plan 字段同时承载 locked 和 confirmed 两种完整方案状态
         current_plan = state.get("confirmed_plan") or {}
@@ -579,15 +595,18 @@ def build_advisor_subgraph(runtime):
                     example_fields.extend(json.loads(raw_fields) or [])
                 except Exception:
                     continue
+            # 语义层唯一命中短路：gap >= 阈值时，注入 resolved 结果使 validator 直接通过
+            _prev_res = (
+                _semantic_previous_resolutions
+                + list(current_spec.get("metric_resolutions") or [])
+                + list(current_spec.get("dimension_resolutions") or [])
+            )
             pre_clarification_result = metric_validator.validate(
                 metric_mentions=metric_mentions,
                 dimension_mentions=dimension_mentions,
                 planner_candidates=planner_entities.get("column_candidates") or [],
                 table_candidates=planner_entities.get("table_candidates") or [],
-                previous_resolutions=(
-                    list(current_spec.get("metric_resolutions") or [])
-                    + list(current_spec.get("dimension_resolutions") or [])
-                ),
+                previous_resolutions=_prev_res,
                 target_tables=target_tables,
                 example_fields=example_fields,
                 truncate=False,
@@ -838,7 +857,8 @@ def build_advisor_subgraph(runtime):
                     planner_candidates=planner_entities.get("column_candidates") or [],
                     table_candidates=planner_entities.get("table_candidates") or [],
                     previous_resolutions=(
-                        list(current_spec.get("metric_resolutions") or [])
+                        _semantic_previous_resolutions
+                        + list(current_spec.get("metric_resolutions") or [])
                         + list(current_spec.get("dimension_resolutions") or [])
                     ),
                     target_tables=metric_target_tables,
@@ -970,7 +990,8 @@ def build_advisor_subgraph(runtime):
                 planner_candidates=planner_entities.get("column_candidates") or [],
                 table_candidates=planner_entities.get("table_candidates") or [],
                 previous_resolutions=(
-                    list(current_spec.get("metric_resolutions") or [])
+                    _semantic_previous_resolutions
+                    + list(current_spec.get("metric_resolutions") or [])
                     + list(current_spec.get("dimension_resolutions") or [])
                 ),
                 target_tables=metric_target_tables,

@@ -19,7 +19,7 @@ from agentTest.semantic_layer.metric_matcher import (
     match_metrics_from_query,
 )
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
-from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE
+from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE, METADATA_SECTION_TEMPLATE
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import log_example_retrieved
@@ -37,6 +37,7 @@ from agentTest.config.planner import (
     HIGH_SIMILARITY_THRESHOLD,
     MAX_HIGH_SIMILARITY_COUNT
 )
+from agentTest.config.semantic import SEMANTIC_UNIQUE_GAP_THRESHOLD
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 
 
@@ -341,53 +342,80 @@ def build_planner_node(runtime):
 
             retrieval_question = "\n".join(retrieval_parts)
 
-            # ── 步骤①：FAISS 检索增强元数据（先召回表，再在召回表内召回字段）──
-            # 表层检索：向量 + BM25 双路召回，合并去重后按向量分数排序
-            table_docs_with_scores = table_vector_store.similarity_search_with_score(retrieval_question, k=TABLE_SEARCH_K)
-            seen_tables = {str(doc.metadata.get("table", "")).strip().lower() for doc, _ in table_docs_with_scores}
-            if bm25_retriever:
-                try:
-                    bm25_results = bm25_retriever.retrieve(retrieval_question, top_k=TABLE_SEARCH_K * 3)
-                    for doc, bm25_score in bm25_results:
-                        table_name = str(doc.metadata.get("table", "")).strip().lower()
-                        if table_name and table_name not in seen_tables:
-                            seen_tables.add(table_name)
-                            # BM25 分数归一化到与向量可比范围（向量余弦相似度约 0.3-1.0），乘以向量最高分作为锚点
-                            max_vec_score = table_docs_with_scores[0][1] if table_docs_with_scores else 1.0
-                            normalized_score = bm25_score / (bm25_score + 1.0) * max_vec_score
-                            table_docs_with_scores.append((doc, normalized_score))
-                except Exception:
-                    pass  # BM25 异常不影响主流程
-            table_scope = _build_table_scope(table_docs_with_scores)
-            column_docs_with_scores = _recall_columns(column_vector_store, retrieval_question, table_scope)
+            # ── 语义层优先匹配：gap >= 阈值时跳过 FAISS 召回，直接使用语义层推荐的来源 ──
+            metric_search_text = "\n".join(
+                part for part in (original_question, current_user_input) if part and part.strip()
+            )
+            semantic_matches = match_metrics_from_query(metric_search_text, limit=5)
+            metric_context_text = format_metric_context(semantic_matches)
+            _semantic_unique = (
+                len(semantic_matches) >= 2
+                and (semantic_matches[0].get("score", 0) - semantic_matches[1].get("score", 0))
+                >= SEMANTIC_UNIQUE_GAP_THRESHOLD
+            )
 
-            # 拼接元数据上下文：表层在前，字段层在后
-            metadata_lines = []
-            for doc, score in table_docs_with_scores:
-                content = doc.page_content[:500]
-                table_name = doc.metadata.get("table", "")
-                metadata_lines.append(f"[表 {table_name}, 相似度: {score:.4f}]\n{content}")
-            for doc, score in column_docs_with_scores:
-                content = doc.page_content[:300]
-                metadata_lines.append(f"[字段]\n{content}")
-            metadata_context = "\n\n".join(metadata_lines)
+            # 语义层唯一命中时跳过 FAISS 双路召回，直接用语义层推荐的来源构建元数据
+            if _semantic_unique:
+                winner = semantic_matches[0]
+                winner_table = winner.get("source_model", "")
+                metadata_lines = [
+                    f"[表 {winner_table}, 相似度: 1.0000]\n语义层推荐口径：{winner.get('name', '')}，"
+                    f"来源表：{winner_table}，表达式：{winner.get('expression', winner.get('id', ''))}"
+                ]
+                metadata_context = "\n".join(metadata_lines)
+                table_candidates = [{
+                    "table": winner_table,
+                    "score": 1.0,
+                    "comment": f"语义层推荐：{winner.get('name', '')}"
+                }]
+                column_candidates = []
+            else:
+                # ── 步骤①：FAISS 检索增强元数据（先召回表，再在召回表内召回字段）──
+                # 表层检索：向量 + BM25 双路召回，合并去重后按向量分数排序
+                table_docs_with_scores = table_vector_store.similarity_search_with_score(retrieval_question, k=TABLE_SEARCH_K)
+                seen_tables = {str(doc.metadata.get("table", "")).strip().lower() for doc, _ in table_docs_with_scores}
+                if bm25_retriever:
+                    try:
+                        bm25_results = bm25_retriever.retrieve(retrieval_question, top_k=TABLE_SEARCH_K * 3)
+                        for doc, bm25_score in bm25_results:
+                            table_name = str(doc.metadata.get("table", "")).strip().lower()
+                            if table_name and table_name not in seen_tables:
+                                seen_tables.add(table_name)
+                                max_vec_score = table_docs_with_scores[0][1] if table_docs_with_scores else 1.0
+                                normalized_score = bm25_score / (bm25_score + 1.0) * max_vec_score
+                                table_docs_with_scores.append((doc, normalized_score))
+                    except Exception:
+                        pass
+                table_scope = _build_table_scope(table_docs_with_scores)
+                column_docs_with_scores = _recall_columns(column_vector_store, retrieval_question, table_scope)
 
-            # 构建候选池（带分数+注释），供 Advisor 精排使用
-            table_candidates = []
-            for doc, score in table_docs_with_scores:
-                table_candidates.append({
-                    "table": doc.metadata.get("table", ""),
-                    "score": float(round(float(score), 4)),
-                    "comment": (doc.page_content or "")[:200]
-                })
-            column_candidates = []
-            for doc, score in column_docs_with_scores:
-                column_candidates.append({
-                    "table": doc.metadata.get("table", ""),
-                    "field": doc.metadata.get("field", doc.metadata.get("column", "")),
-                    "score": float(round(float(score), 4)),
-                    "comment": (doc.page_content or "")[:200]
-                })
+                # 拼接元数据上下文：表层在前，字段层在后
+                metadata_lines = []
+                for doc, score in table_docs_with_scores:
+                    content = doc.page_content[:500]
+                    table_name = doc.metadata.get("table", "")
+                    metadata_lines.append(f"[表 {table_name}, 相似度: {score:.4f}]\n{content}")
+                for doc, score in column_docs_with_scores:
+                    content = doc.page_content[:300]
+                    metadata_lines.append(f"[字段]\n{content}")
+                metadata_context = "\n\n".join(metadata_lines)
+
+                # 构建候选池（带分数+注释），供 Advisor 精排使用
+                table_candidates = []
+                for doc, score in table_docs_with_scores:
+                    table_candidates.append({
+                        "table": doc.metadata.get("table", ""),
+                        "score": float(round(float(score), 4)),
+                        "comment": (doc.page_content or "")[:200]
+                    })
+                column_candidates = []
+                for doc, score in column_docs_with_scores:
+                    column_candidates.append({
+                        "table": doc.metadata.get("table", ""),
+                        "field": doc.metadata.get("field", doc.metadata.get("column", "")),
+                        "score": float(round(float(score), 4)),
+                        "comment": (doc.page_content or "")[:200]
+                    })
 
             # ── 新增：检索历史优质示例，辅助模糊度判定 ──
             example_vs = runtime.get("example_vector_store")
@@ -411,20 +439,10 @@ def build_planner_node(runtime):
 
 
             # ── 步骤②：LLM 结构化解析（含 current_user_input、confirmed_context、advisor_last_answer）──
-            # 语义层指标上下文：用 metric_matcher 从用户原始问题匹配候选指标，
-            # 让 LLM 优先参考权威 source_model / expression / aliases，而不是凭空猜测表/字段。
-            # 这里使用 original_question + current_user_input 拼接作为匹配源，
-            # 避免依赖后续 LLM 输出的 effective_query。
-            metric_search_text = "\n".join(
-                part for part in (original_question, current_user_input) if part and part.strip()
-            )
-            metric_context_text = format_metric_context(
-                match_metrics_from_query(metric_search_text, limit=5)
-            )
+            # metric_context_text 和 _semantic_unique 已在检索前提前计算
             prompt_value = prompt.invoke({
                 "question": original_question,
                 "current_user_input": current_user_input,
-                "metadata_context": metadata_context,
                 "example_context": example_context,
                 "confirmed_context": confirmed_context,
                 "history_context": _build_history_context(state.get("messages") or []),
@@ -437,6 +455,12 @@ def build_planner_node(runtime):
                     state.get("analysis_spec") or {}
                 ),
                 "metric_context": metric_context_text,
+                # 语义层唯一命中时跳过整个 section，metric_context 已承载全部权威口径
+                "metadata_section": (
+                    METADATA_SECTION_TEMPLATE.format(metadata_context=metadata_context)
+                    if metadata_context.strip() and not _semantic_unique
+                    else ""
+                ),
             })
             planner_output = structured_llm.invoke(prompt_value)
 
@@ -452,18 +476,24 @@ def build_planner_node(runtime):
             completeness = planner_output.completeness
 
             # 使用 LLM 还原后的完整需求重新探测候选数量，避免“1”“A”等短回答携带整组选项
-            ambiguity_table_docs_with_scores = (
-                table_vector_store.similarity_search_with_score(
-                    effective_query,
-                    k=TABLE_SEARCH_K,
+            # 语义层唯一命中时跳过，指标口径已由语义层确定
+            if not _semantic_unique:
+                ambiguity_table_docs_with_scores = (
+                    table_vector_store.similarity_search_with_score(
+                        effective_query,
+                        k=TABLE_SEARCH_K,
+                    )
                 )
-            )
-            ambiguity_table_scope = _build_table_scope(ambiguity_table_docs_with_scores)
-            ambiguity_column_docs_with_scores = _recall_columns(
-                column_vector_store,
-                effective_query,
-                ambiguity_table_scope,
-            )
+                ambiguity_table_scope = _build_table_scope(ambiguity_table_docs_with_scores)
+                ambiguity_column_docs_with_scores = _recall_columns(
+                    column_vector_store,
+                    effective_query,
+                    ambiguity_table_scope,
+                )
+            else:
+                ambiguity_table_docs_with_scores = []
+                ambiguity_table_scope = set()
+                ambiguity_column_docs_with_scores = []
 
 
 

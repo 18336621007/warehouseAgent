@@ -262,8 +262,11 @@ PLANNER_USER_TEMPLATE = """
 {resolution_context}
 
 【分层元数据检索结果】
-{metadata_context}
+{metadata_section}
 
 【历史相似问题】
 {example_context}
 """
+
+METADATA_SECTION_TEMPLATE = """【分层元数据检索结果】
+{metadata_context}"""
