@@ -1,4 +1,4 @@
-﻿# generate_sql_node.py —— SQL 生成节点
+# generate_sql_node.py —— SQL 生成节点
 # 新增 SQL 级全量校验：以 confirmed_plan 为基准，校验表名/度量/维度/时间/过滤条件
 # 新增降级 SQL 构造：LLM 重试仍不一致时，根据 confirmed_plan 直接构造标准 SQL
 import re
@@ -383,6 +383,12 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
                 f"{edge['right_table']}.{edge['right_key']} ({edge.get('join_type', 'LEFT')} JOIN)"
             )
         joins_desc = "\n".join(join_lines)
+    elif len(tables) > 1:
+        # 多表无关联关系：标记为 independent_aggregation 策略，避免校验器误判为"无 JOIN"
+        joins_desc = (
+            "independent_aggregation（多表无主外键约束，按各自粒度独立聚合，"
+            "用 CROSS JOIN 子查询 或 UNION ALL 合并，禁止 JOIN ON <字段>=<字段>）"
+        )
 
     # ── 程序化校验通过，再用 LLM 做语义校验 ──
     check_prompt = ChatPromptTemplate.from_messages([
@@ -397,7 +403,7 @@ def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer:
         "time_field": time_field,
         "table_plans": table_plans_desc or "无",
         "filters": filters or "无",
-        "joins": joins_desc or "无（单表查询）",
+        "joins": joins_desc or "单表查询（无需表关联）",
         "advisor_answer": advisor_last_answer[:1200],
         "sql": sql,
     })
@@ -470,6 +476,11 @@ def build_generate_sql_node(runtime):
                     for e in joins
                 ]
                 parts.append("- 表关联（严格按此JOIN，不得修改）:\n" + "\n".join(join_items))
+            elif len(tables) > 1:
+                # 多表无 join 关系：注入 independent_aggregation 策略提示，避免 LLM 误用 JOIN
+                parts.append(
+                    "- 表关联策略: independent_aggregation（多表无主外键约束，按各自粒度独立聚合后用 CROSS JOIN 子查询 或 UNION ALL 合并；禁止 JOIN ON <字段>=<字段>）"
+                )
 
             # AI 推断 Join 模式：部分表缺少预配置关联关系，LLM 需自行推断 JOIN 条件
             ai_inferred_join = confirmed_plan.get("ai_inferred_join", False)
@@ -580,6 +591,8 @@ def build_generate_sql_node(runtime):
             # ── 方案一致性校验 ──
             consistency_retry = 0
             enum_lookup_simple = runtime.get("sample_values_map_simple") or {}
+            pass_history = list(state.get("sql_pass_history") or [])
+            final_sql_for_history = ""
             if confirmed_plan.get("table") or confirmed_plan.get("tables"):
                 while consistency_retry < MAX_CONSISTENCY_RETRIES:
                     inconsistency = _check_plan_consistency(
@@ -587,6 +600,8 @@ def build_generate_sql_node(runtime):
                         enum_lookup_simple=enum_lookup_simple,
                     )
                     if not inconsistency:
+                        # 记录本次 PASS 的 SQL，供后续 exec_retry 时回灌给 LLM 参考
+                        final_sql_for_history = generated_sql
                         break
 
                     consistency_retry += 1
@@ -618,6 +633,14 @@ def build_generate_sql_node(runtime):
                                 f"降级 SQL 构造: LLM 重试 {MAX_CONSISTENCY_RETRIES} 次仍不一致，"
                                 f"使用 confirmed_plan 直接构造。剩余问题: {remaining_issues}")
                             generated_sql = fallback_sql
+                            # 降级构造的 SQL 也视作通过校验，加入 history
+                            final_sql_for_history = fallback_sql
+
+            # 把本次 PASS 的 SQL 写入 history（去重，最多保留最近 3 条）
+            if final_sql_for_history:
+                if final_sql_for_history not in pass_history:
+                    pass_history.append(final_sql_for_history)
+                pass_history = pass_history[-3:]
 
             log_node_end(
                 "generate_sql",
@@ -633,6 +656,7 @@ def build_generate_sql_node(runtime):
 
             return {
                 "generated_sql": generated_sql,
+                "sql_pass_history": pass_history,
 
                 # SQL 已生成，下一阶段进行安全和语法校验
                 "topic_status": "validating_sql",

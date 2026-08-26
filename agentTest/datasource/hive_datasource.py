@@ -24,7 +24,7 @@ class HiveDataSource(BaseDataSource):
 
     def query(self, sql: str, timeout_seconds=None, max_rows=None):
         # 执行SQL，并支持超时和结果截断保护
-        conn = self._get_connection()
+        conn = self._get_connection(timeout_seconds)
         cursor = conn.cursor()
 
         try:

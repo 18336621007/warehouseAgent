@@ -30,6 +30,23 @@ def build_sql_generation_prompt():
         - GROUP BY 包含哪些维度
         - 日期条件与分区过滤的 Hive 函数写法
         - 注意：示例仅作参考，当前 schema 和方案有不同约束时以当前为准
+    13. 关于"无关联（独立聚合）"场景的写法（重要）：
+        - 当方案中表关联为"无（单表查询 / 独立聚合 / 无关联）"时，说明多张表之间无主外键约束，不能用 JOIN ON <字段>=<字段> 这种方式拼接，否则会产出笛卡尔积导致结果严重虚高。
+        - 正确写法（任选其一）：
+          (a) 多个子查询各自聚合后 CROSS JOIN 组合成一行：
+              SELECT t1.x, t2.y, t3.z FROM
+                (SELECT SUM(...) AS x FROM tbl1 WHERE pt_dt=...) t1
+                CROSS JOIN (SELECT SUM(...) AS y FROM tbl2 WHERE pt_dt=...) t2
+                CROSS JOIN (SELECT SUM(...) AS z FROM tbl3 WHERE pt_dt=...) t3
+          (b) 多个子查询各自聚合后 UNION ALL 后聚合：
+              SELECT SUM(x) AS x, SUM(y) AS y, SUM(z) AS z FROM (
+                SELECT SUM(...) AS x, 0 AS y, 0 AS z FROM tbl1 WHERE pt_dt=...
+                UNION ALL
+                SELECT 0 AS x, SUM(...) AS y, 0 AS z FROM tbl2 WHERE pt_dt=...
+                UNION ALL
+                SELECT 0 AS x, 0 AS y, SUM(...) AS z FROM tbl3 WHERE pt_dt=...
+              ) sub
+        - 严禁：FROM tbl1 JOIN tbl2 ON tbl1.company_id = tbl2.company_id JOIN tbl3 ON ...
     """
 
     human_prompt = """
@@ -76,6 +93,15 @@ SQL_AUDIT_SYSTEM_PROMPT = """你是一个 SQL 审计助手。请对比已确认�
 - SQL 是否为每张参与表分别添加了方案要求的时间或业务过滤条件
 - SQL 的过滤条件是否覆盖了方案中提到的筛选条件
 - SQL 的聚合方式是否符合方案描述
+
+关于"无关联（独立聚合）"场景的特殊规则（重要）：
+- 当方案指定"表关联: 无（单表查询 / 独立聚合 / 无关联）"时，意味着各表无主外键约束，需独立按各自粒度聚合后再合并结果。
+- 以下实现方式均视为忠实实现，不应判 FAIL：
+  1. 每个指标各自 SELECT SUM/COUNT(...) FROM 各自表 WHERE 时间过滤，最后用 UNION ALL 合并
+  2. 每个指标作为子查询 SELECT SUM/COUNT(...) FROM 各自表 WHERE 时间过滤，外层用 CROSS JOIN（或逗号连接）将各子查询合并成一行（每个子查询只产 1 行）
+  3. SELECT a.x, b.y, c.z FROM (sub_a) a, (sub_b) b, (sub_c) c 这种隐式 CROSS JOIN
+- 不允许的写法：直接在 FROM 后挂多张表 + JOIN ON <字段>=<字段>（如 JOIN ON company_id）—— 这是笛卡尔积，会让聚合结果严重虚高。
+- 关键识别标志：方案中"表关联: 无"指的是表之间不需要按主外键 JOIN，但允许用 CROSS JOIN/UNION ALL 合并独立聚合的子查询。
 
 返回格式：
 - 如果一致，只返回一个词：PASS

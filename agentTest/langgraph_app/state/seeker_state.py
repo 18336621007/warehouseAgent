@@ -1,4 +1,4 @@
-﻿# ── state/seeker.py ──
+# ── state/seeker.py ──
 # Seeker 子图字段 + Evaluator 字段（同属一条执行链路）
 from typing import List, Any, TypedDict
 from agentTest.langgraph_app.state.base_state import BaseState
@@ -31,6 +31,9 @@ class SeekerState(BaseState, total=False):
     sql_exec_failed: bool         # SQL 执行是否失败
     sql_exec_error: str           # Hive 返回的错误信息
     exec_retry_count: int         # SQL 执行重试次数
+
+    # 一致性校验通过的 SQL 历史，exec_retry 时回灌给 LLM 参考，避免反复瞎试
+    sql_pass_history: List[str]
 
 
     # Evaluator 评估字段，advisor_turns从TopicState继承并由Graph自动累积

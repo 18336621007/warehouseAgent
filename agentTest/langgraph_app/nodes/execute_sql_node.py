@@ -1,10 +1,44 @@
-﻿# SQL 执行节点，负责调用标准 SQL Tool 执行生成的 SQL。
+# SQL 执行节点，负责调用标准 SQL Tool 执行生成的 SQL。
+import re
+
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
+from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.state.agent_state import AgentState
+
+
+# ── 独立聚合多表场景的扩展 timeout：默认 300s（与 Hive 手动执行实测对齐） ──
+CROSS_JOIN_AGG_TIMEOUT_SECONDS = 300
+
+
+def _is_cross_join_aggregation(sql: str, confirmed_plan: dict) -> bool:
+    """判断 SQL 是否属于'独立聚合多表 CROSS JOIN'场景：
+    - SQL 中包含 CROSS JOIN
+    - 同时不含字段级 JOIN ON <字段>=<字段>
+    - confirmed_plan 标记为 independent_aggregation 或 joins 为空
+    """
+    if not sql:
+        return False
+    sql_upper = sql.upper()
+    has_cross_join = "CROSS JOIN" in sql_upper
+    if not has_cross_join:
+        return False
+    # 字段级 JOIN ON tbl.a = tbl.b
+    field_join_pattern = re.compile(
+        r"JOIN\s+\w+(?:\s+\w+)?\s+ON\s+\w+\.\w+\s*=\s*\w+\.\w+",
+        re.IGNORECASE,
+    )
+    if field_join_pattern.search(sql):
+        return False
+    # confirmed_plan 必须是无 join 的多表场景
+    joins = confirmed_plan.get("joins") or []
+    tables = confirmed_plan.get("tables") or []
+    if joins:
+        return False
+    return len(tables) >= 2
 
 
 def build_execute_sql_node(runtime):
@@ -40,9 +74,25 @@ def build_execute_sql_node(runtime):
                 log_node_event("execute_sql", f"Safety check skipped: {safety_err}")
 
         try:
-            sql_result = sql_query_tool.invoke({
-                "sql": generated_sql
-            })
+            # ── 独立聚合多表 CROSS JOIN 场景：拉长 timeout 到 300s ──
+            invoke_kwargs = {"sql": generated_sql}
+            if _is_cross_join_aggregation(generated_sql, confirmed_plan):
+                log_node_event(
+                    "execute_sql",
+                    f"检测到独立聚合 CROSS JOIN 场景，使用扩展 timeout={CROSS_JOIN_AGG_TIMEOUT_SECONDS}s",
+                )
+                # 优先支持工具层 timeout 覆盖；如不支持则在 datasource 层兜底
+                if hasattr(sql_query_tool, "query_timeout_seconds"):
+                    sql_query_tool.query_timeout_seconds = CROSS_JOIN_AGG_TIMEOUT_SECONDS
+                # 部分工具支持在 invoke 时透传 timeout
+                try:
+                    sql_result = sql_query_tool.invoke(
+                        {**invoke_kwargs, "timeout_seconds": CROSS_JOIN_AGG_TIMEOUT_SECONDS}
+                    )
+                except TypeError:
+                    sql_result = sql_query_tool.invoke(invoke_kwargs)
+            else:
+                sql_result = sql_query_tool.invoke(invoke_kwargs)
             row_count = sql_result.get("row_count", 0) if isinstance(sql_result, dict) else 0
 
             # 记录节点结束日志

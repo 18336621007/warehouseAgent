@@ -172,7 +172,9 @@ class ExampleVectorStore:
             self.remove_example(hash_id)
 
     def search_similar(self, question: str, current_tables: list = None, k: int = 3, min_similarity: float = EXAMPLE_SIMILARITY_THRESHOLD) -> list:
-        """结构感知检索：语义相似 -> 按表/字段重叠度重排序"""
+        """结构感知检索：语义相似 -> 按表/字段重叠度重排序。
+        笛卡尔积黑名单：对包含 'JOIN ON <字段>=<字段>' + 多表 SUM 的错误示例降权 0.5，
+        避免 LLM 跟随错误范式（典型 case：3 表 SUM 各一张 JOIN ON company_id）。"""
         self._ensure_loaded()
         if self._vector_store is None:
             return []
@@ -182,6 +184,24 @@ class ExampleVectorStore:
                       and float(score) >= min_similarity]
         if not candidates:
             return []
+
+        # 笛卡尔积错误写法识别：多表 SUM + JOIN ON 字段=字段，且不是 CROSS JOIN
+        import re as _re
+        cartesian_pattern = _re.compile(
+            r"JOIN\s+\w+\s+\w*\s*ON\s+\w+\.\w+\s*=\s*\w+\.\w+",
+            _re.IGNORECASE,
+        )
+
+        def _is_cartesian_blacklist(doc) -> bool:
+            sql = doc.metadata.get("sql") or ""
+            sql_upper = sql.upper()
+            if "JOIN" not in sql_upper or "CROSS JOIN" in sql_upper:
+                return False
+            tables_in_sql = [t for t in (current_tables or []) if t and t.upper() in sql_upper]
+            if len(tables_in_sql) < 2 or "SUM(" not in sql_upper:
+                return False
+            return bool(cartesian_pattern.search(sql))
+
         if current_tables:
             scored = []
             for doc, score in candidates:
@@ -191,16 +211,21 @@ class ExampleVectorStore:
                 field_overlap = len(set(doc_fields)) / max(len(doc_fields), 1) if doc_fields else 0
                 structure_score = (table_overlap + field_overlap) / 2
                 combined = 0.3 * float(score) + 0.7 * structure_score
+                if _is_cartesian_blacklist(doc):
+                    combined *= 0.5
                 scored.append((doc, combined))
             scored.sort(key=lambda x: x[1], reverse=True)
-            # _similarity 已在 candidates 处理阶段写入，此处直接返回
             return [doc for doc, _ in scored[:k]]
-        # 余弦分数越大越相似，降序排列（IP 索引返回正则）
+
         candidates.sort(key=lambda x: x[1], reverse=True)
-        # 将相似度写入 metadata 供日志使用
-        for doc, score in candidates[:k]:
+        reranked = []
+        for doc, score in candidates:
+            if _is_cartesian_blacklist(doc):
+                score = float(score) * 0.5
+            reranked.append((doc, score))
+        for doc, score in reranked[:k]:
             doc.metadata["_similarity"] = round(float(score), 3)
-        return [doc for doc, _ in candidates[:k]]
+        return [doc for doc, _ in reranked[:k]]
 
     def _save_to_disk(self):
         """落盘到 cache/example_faiss_index"""
