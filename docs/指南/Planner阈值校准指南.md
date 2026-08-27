@@ -302,14 +302,14 @@ Planner 能结合上下文还原唯一字段时应返回 `full`。即使日志�
 ### 10.3 当前阈值定位
 
 向量相似度用于候选排序、日志分析和离线调参，不直接覆盖 LLM 与程序契约判断。调优时应优先分析误召回、字段注释质量和业务同义词，而不是通过提高阈值掩盖元数据缺陷。
-## 十二、pending 选择优先级（模型判断 + 白名单校验）
+## 十二、候选选择优先级（模型判断 + 白名单校验，去 pending 后）
 
-Planner 的相似度阈值、候选数量和 `completeness` 不能覆盖已保存的 pending 选择：
+Planner 的相似度阈值、候选数量和 `completeness` 不能覆盖当轮候选选择：
 
-1. 用户本轮输入与 `pending_clarifications` 一起进入 Planner LLM，由模型结合【对话历史】+【待澄清候选】判断 `user_selection`。
-2. 程序 `validate_user_selection` 白名单校验：`field` 逐字命中 options、`clarification_id` 对齐，通过后生成 `explicit_user`。
-3. 模型未选择（询问解释、闲聊、补充条件）时保持 open pending，不视为已选择。
+1. 用户本轮输入与【完整对话历史】一起进入 Planner LLM，由模型判断 `user_selection`；候选由当轮 `MetricClarificationService` 固化在澄清文案中。
+2. 程序 `validate_user_selection` 白名单校验：`field` 逐字命中候选集合，通过后生成 `explicit_user`。
+3. 模型未选择（询问解释、闲聊、补充条件）时不视为已选择，进入下一轮澄清。
 4. 后续召回顺序变化只能影响新候选，不能改变已展示 options 的编号语义。
-5. 多个 pending 同时存在时，短编号缺少唯一性，应进入澄清而不是用最高相似度猜测（第二阶段）。
+5. 去 pending 状态机后不再跨轮固化候选快照；隔数轮回复"第二个"由 Planner 结合对话历史还原，程序校验命中候选集合。
 
-该原则适用于所有 `PendingClarification` 类型。
+该原则适用于所有指标/维度候选类型。

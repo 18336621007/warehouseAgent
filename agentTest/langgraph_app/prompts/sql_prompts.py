@@ -20,10 +20,10 @@ def build_sql_generation_prompt():
     9. 涉及"各<…>""按<…>分组""分布""分别"等分组聚合场景时：
        - 维度字段放入 SELECT 和 GROUP BY
        - 度量字段用 SUM/COUNT/AVG 等聚合函数包裹，不得放入 GROUP BY
-    10. 分区字段 pt_dt 格式为 yyyyMMdd（8位数字字符串），时间条件必须用函数表达式，严禁写成字符串字面量：
-        - 昨天：pt_dt = date_format(date_sub(current_date(), 1), 'yyyyMMdd')
+    10. 分区字段 pt_dt 格式为 yyyyMMdd（8位数字字符串）。时间条件由你根据问题中的时间语义自动生成，但必须保证与 pt_dt 比较的值也是 yyyyMMdd 字符串：
+        - 昨天：pt_dt = date_format(date_sub(current_date(), 1), 'yyyyMMdd')（也可直接写 8 位字面量，如 pt_dt = '20260826'）
         - 今天：pt_dt = date_format(current_date(), 'yyyyMMdd')
-        - 禁止：pt_dt = 'current_date' 或 pt_dt = '昨天' 等字符串写法
+        - 近N天：pt_dt >= date_format(date_sub(current_date(), N), 'yyyyMMdd') AND pt_dt <= date_format(current_date(), 'yyyyMMdd')
     11. 所有查询必须包含 pt_dt 分区过滤条件
     12. 如果 {example_section} 不为空，请参考历史优质案例：
         - 字段的聚合方式（SUM/COUNT/AVG/窗口函数等模式）
@@ -32,13 +32,7 @@ def build_sql_generation_prompt():
         - 注意：示例仅作参考，当前 schema 和方案有不同约束时以当前为准
     13. 关于"无关联（独立聚合）"场景的写法（重要）：
         - 当方案中表关联为"无（单表查询 / 独立聚合 / 无关联）"时，说明多张表之间无主外键约束，不能用 JOIN ON <字段>=<字段> 这种方式拼接，否则会产出笛卡尔积导致结果严重虚高。
-        - 正确写法（任选其一）：
-          (a) 多个子查询各自聚合后 CROSS JOIN 组合成一行：
-              SELECT t1.x, t2.y, t3.z FROM
-                (SELECT SUM(...) AS x FROM tbl1 WHERE pt_dt=...) t1
-                CROSS JOIN (SELECT SUM(...) AS y FROM tbl2 WHERE pt_dt=...) t2
-                CROSS JOIN (SELECT SUM(...) AS z FROM tbl3 WHERE pt_dt=...) t3
-          (b) 多个子查询各自聚合后 UNION ALL 后聚合：
+        - 正确写法为多个子查询各自聚合后 UNION ALL 后聚合：
               SELECT SUM(x) AS x, SUM(y) AS y, SUM(z) AS z FROM (
                 SELECT SUM(...) AS x, 0 AS y, 0 AS z FROM tbl1 WHERE pt_dt=...
                 UNION ALL
@@ -55,7 +49,6 @@ def build_sql_generation_prompt():
         
         {confirmed_section}
         
-        可参考的历史优质案例：
         {example_section}
         
         相关 schema 信息：

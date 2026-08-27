@@ -229,6 +229,9 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
             def get_relations_for_table(self, table_identifier):
                 return []
 
+            def find_safe_join_path(self, models):
+                return []
+
             def get_table_grain(self, table_identifier):
                 return ""
 
@@ -248,13 +251,19 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
         self.assertTrue(ALLOW_AI_INFERRED_JOIN)
 
     def test_semantic_relation_uses_composite_business_key(self):
-        """当前运营日报与经销商维表按平台和经销商复合关联。"""
-        metadata_path = Path("agentTest/metadata/semantic_metadata.json")
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        relation = metadata["relations"][0]
-
-        self.assertEqual(relation["left_key"], ["pt_platform", "company_id"])
-        self.assertEqual(relation["right_key"], ["pt_platform", "company_id"])
+        """语义层 join_contracts 中事实表与经销商维表按复合键关联。"""
+        from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
+        provider = SemanticMetadataProvider()
+        contracts = provider.get_all_enabled_relations()
+        target = next(
+            (c for c in contracts
+             if c.get("right_model") == "dim_trip.dim_exchange_common_company_info_day"),
+            None,
+        )
+        self.assertIsNotNone(target)
+        # 复合键（pt_platform / pt_dt / company_id 等，至少 3 个）
+        on_list = target.get("on") or []
+        self.assertTrue(len(on_list) >= 3)
 
 
 if __name__ == "__main__":

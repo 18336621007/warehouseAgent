@@ -26,6 +26,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_example_retrieved
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
+from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 from agentTest.langgraph_app.runtime.graph_logger import log_search_scores
 from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
 from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
@@ -42,14 +43,27 @@ from agentTest.langgraph_app.message_utils import get_last_ai_content
 
 
 def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
-    """把最近几轮 Human/AI 消息组装成对话历史文本，排除工具消息。"""
+    """把最近几轮用户消息与最终回答组装成对话历史，过滤工具消息与 ReAct 中间步骤。"""
+    from langchain_core.messages import ToolMessage, AIMessage
     lines = []
     for msg in (messages or [])[-max_turns * 2:]:
         name = getattr(msg, "name", "") or ""
         if isinstance(msg, HumanMessage):
             role = "用户"
-        else:
+        elif isinstance(msg, ToolMessage):
+            # 工具结果不属于对话历史，跳过
+            continue
+        elif isinstance(msg, AIMessage):
+            # 只保留最终回答（id 以 :advisor/:seeker 结尾且无 tool_calls），
+            # 过滤 ReAct 中间步骤（含 tool_calls 或纯文本思考）
+            if getattr(msg, "tool_calls", None):
+                continue
+            msg_id = str(getattr(msg, "id", "") or "")
+            if not (msg_id.endswith(":advisor") or msg_id.endswith(":seeker")):
+                continue
             role = f"助手({name})" if name else "助手"
+        else:
+            continue
         content = str(msg.content or "")
         if len(content) > max_chars_per_msg:
             content = content[:max_chars_per_msg] + "..."
@@ -265,39 +279,14 @@ def build_planner_node(runtime):
         # 每次调用只要求传入本轮输入
         current_user_input = state["current_user_input"]
 
-        # Topic 首轮使用当前输入初始化原始问题，后续轮次读取 checkpoint
-        original_question = state.get("original_question") or current_user_input
+        # 去 Topic 化：不再使用 original_question 固定基线，
+        # 当前需求由 LLM 结合【完整对话历史】+【本轮输入】每轮判断（query 改写 effective_query）
 
 
-        # ── 读取共享方案 confirmed_plan（Advisor 写入草稿/locked；用户选择/改选时 Planner 改写草稿）──
+        # ── 去 Topic 化：不再向 prompt 注入【当前查询方案】（confirmed_context）──
+        # Planner 完全依赖【完整对话历史】判断当前需求（历史含 Advisor/Seeker 最终回答的方案信息），
+        # 避免上一轮遗留方案干扰新需求理解；confirmed_plan 仅作为状态供确认/执行链使用（不注入 prompt）
         confirmed_plan = state.get("confirmed_plan") or {}
-        has_plan = bool(
-            confirmed_plan.get("table")
-            or confirmed_plan.get("tables")
-        )
-        if has_plan:
-            plan_table = confirmed_plan.get("table", "")
-            plan_measures = confirmed_plan.get("measures") or []
-            plan_dimensions = confirmed_plan.get("dimensions") or []
-            plan_fields = confirmed_plan.get("fields") or []
-            plan_time_field = confirmed_plan.get("time_field", "")
-            plan_time_range = confirmed_plan.get("time_range", "")
-            plan_filters = confirmed_plan.get("filters", "")
-            plan_status = confirmed_plan.get("status", "")
-
-            confirmed_context = (
-                f"方案状态: {plan_status or '未设置'}\n"
-                f"数据表: {plan_table or '未设置'}\n"
-                f"度量字段: {', '.join(plan_measures) or '无'}\n"
-                f"维度字段: {', '.join(plan_dimensions) or '无'}\n"
-                f"全部字段: {', '.join(plan_fields) or '无'}\n"
-                f"时间字段: {plan_time_field or '未设置'}\n"
-                f"时间范围: {plan_time_range or '未设置'}\n"
-                f"过滤条件: {plan_filters or '无'}"
-            )
-        else:
-            confirmed_context = "当前尚未形成查询方案。"
-
 
         # Advisor 上轮回复既用于向量检索，也用于 LLM 理解简短选择
         advisor_last_answer = get_last_ai_content(
@@ -312,23 +301,13 @@ def build_planner_node(runtime):
 
         # ── FAISS + LLM 评估流程 ──
         timer = start_timer()
-        log_node_start("planner", question=original_question)
+        log_node_start("planner", question=current_user_input)
 
         try:
             # 将对话上下文组合成检索文本，使“1”“A”等简短回答具有候选语义
             retrieval_parts = [
-                f"原始查数需求：{original_question}",
+                f"当前需求：{current_user_input}",
             ]
-
-            if has_plan:
-                plan_table = confirmed_plan.get("table", "")
-                plan_fields = confirmed_plan.get("fields") or []
-
-                retrieval_parts.append(
-                    "当前方案："
-                    f"表={plan_table or '未确定'}，"
-                    f"字段={', '.join(plan_fields) or '未确定'}"
-                )
 
             if advisor_last_answer:
                 retrieval_parts.append(
@@ -343,19 +322,34 @@ def build_planner_node(runtime):
             retrieval_question = "\n".join(retrieval_parts)
 
             # ── 语义层优先匹配：gap >= 阈值时跳过 FAISS 召回，直接使用语义层推荐的来源 ──
-            metric_search_text = "\n".join(
-                part for part in (original_question, current_user_input) if part and part.strip()
-            )
+            # 去 Topic 化：语义层匹配用本轮输入（完整历史在 history_context 中）
+            metric_search_text = current_user_input
             semantic_matches = match_metrics_from_query(metric_search_text, limit=5)
+            # 语义层命中日志：便于排查"走了语义层还是召回"
+            log_metric_event(
+                "semantic.match",
+                node_name="planner",
+                mention=metric_search_text[:100],
+                hit_count=len(semantic_matches),
+                metric_ids=[m.get("id", "") for m in semantic_matches],
+                metric_names=[m.get("name", "") for m in semantic_matches],
+            )
             metric_context_text = format_metric_context(semantic_matches)
+            # 语义层唯一命中：命中 1 个，或 top1-top2 得分差达到阈值 → 跳过 FAISS 双路召回
             _semantic_unique = (
-                len(semantic_matches) >= 2
-                and (semantic_matches[0].get("score", 0) - semantic_matches[1].get("score", 0))
-                >= SEMANTIC_UNIQUE_GAP_THRESHOLD
+                len(semantic_matches) == 1
+                or (
+                    len(semantic_matches) >= 2
+                    and (semantic_matches[0].get("score", 0) - semantic_matches[1].get("score", 0))
+                    >= SEMANTIC_UNIQUE_GAP_THRESHOLD
+                )
             )
 
             # 语义层唯一命中时跳过 FAISS 双路召回，直接用语义层推荐的来源构建元数据
             if _semantic_unique:
+                # 未走检索：置空后续日志/统计引用的检索结果，避免引用未定义变量
+                table_docs_with_scores = []
+                column_docs_with_scores = []
                 winner = semantic_matches[0]
                 winner_table = winner.get("source_model", "")
                 metadata_lines = [
@@ -417,11 +411,12 @@ def build_planner_node(runtime):
                         "comment": (doc.page_content or "")[:200]
                     })
 
-            # ── 新增：检索历史优质示例，辅助模糊度判定 ──
+            # ── 检索历史优质示例（仅对话首轮注入，避免历史相似问题干扰当前需求）──
             example_vs = runtime.get("example_vector_store")
             example_context = ""
-            if example_vs:
-                examples = example_vs.search_similar(original_question, k=2)
+            is_first_turn = len(state.get("messages") or []) <= 1
+            if example_vs and is_first_turn:
+                examples = example_vs.search_similar(current_user_input, k=2)
                 if examples:
                     lines = []
                     for doc in examples:
@@ -438,35 +433,30 @@ def build_planner_node(runtime):
                     )
 
 
-            # ── 步骤②：LLM 结构化解析（含 current_user_input、confirmed_context、advisor_last_answer）──
-            # metric_context_text 和 _semantic_unique 已在检索前提前计算
-            prompt_value = prompt.invoke({
-                "question": original_question,
-                "current_user_input": current_user_input,
-                "example_context": example_context,
-                "confirmed_context": confirmed_context,
-                "history_context": _build_history_context(state.get("messages") or []),
-                "recent_candidates_text": _build_recent_candidates_text(
-                    (state.get("analysis_spec") or {}).get("recent_shown_candidates") or [],
-                    list((state.get("analysis_spec") or {}).get("metric_resolutions") or [])
-                    + list((state.get("analysis_spec") or {}).get("dimension_resolutions") or []),
-                ),
-                "resolution_context": MetricClarificationService.build_resolution_context(
-                    state.get("analysis_spec") or {}
-                ),
-                "metric_context": metric_context_text,
-                # 语义层唯一命中时跳过整个 section，metric_context 已承载全部权威口径
-                "metadata_section": (
-                    METADATA_SECTION_TEMPLATE.format(metadata_context=metadata_context)
-                    if metadata_context.strip() and not _semantic_unique
-                    else ""
-                ),
-            })
+            # ── 步骤②：LLM 结构化解析（含 current_user_input、advisor_last_answer）──
+            # 组装用户消息 sections：有内容的才带标题，避免空标题占用 token
+            history_context = _build_history_context(state.get("messages") or [])
+            metadata_section = (
+                METADATA_SECTION_TEMPLATE.format(metadata_context=metadata_context)
+                if metadata_context.strip() and not _semantic_unique
+                else ""
+            )
+            sections = [f"【当前需求基线】\n{current_user_input}"]
+            if metric_context_text:
+                sections.append(f"【语义层指标候选】\n{metric_context_text}")
+            if history_context:
+                sections.append(f"【对话历史（最近 N 轮）】\n{history_context}")
+            if metadata_section:
+                sections.append(metadata_section)
+            if example_context:
+                sections.append(f"【历史相似问题】\n{example_context}")
+            user_content = "\n\n".join(sections)
+            prompt_value = prompt.invoke({"sections": user_content})
             planner_output = structured_llm.invoke(prompt_value)
 
             effective_query = (
                     planner_output.effective_query.strip()
-                    or original_question
+                    or current_user_input
             )
             accept_locked_plan = planner_output.accept_locked_plan
 
@@ -492,6 +482,7 @@ def build_planner_node(runtime):
                 )
             else:
                 ambiguity_table_docs_with_scores = []
+                ambiguity_column_docs_with_scores = []
                 ambiguity_table_scope = set()
                 ambiguity_column_docs_with_scores = []
 
@@ -622,112 +613,18 @@ def build_planner_node(runtime):
                 next_topic_status = "clarifying"
 
 
-            # 以下这段代码让 AnalysisSpec 从“每轮被 LLM 覆盖重建”变成“增量更新”：
-            # 模型判断用户选择（PlannerOutput.user_selection），程序只做白名单校验（validate_user_selection），
-            # 再保留上轮 resolved 证据，只补新概念的 ambiguous 记录；最近展示候选由 Advisor 写回，
-            # 从状态层面消除“模型理解了、State 却还停在 ambiguous”导致的重复确认循环。
-            # ── 组装 AnalysisSpec：模型判断 + 程序白名单校验 + 最近展示候选快照 ──
-
-            # 1. 读取上轮状态，建立索引（指标与维度解析证据合并反查，支持维度改选）
+            # ── 去 pending 状态机：不再跨轮保存解析证据/候选快照 ──
+            # 澄清候选由 Advisor 写入历史消息，用户选择由 Planner 改写 effective_query 体现；
+            # 本轮的 analysis_spec 只保留当轮意图，字段最终过元数据校验（validate_field_table_bindings 等）。
             existing_spec = state.get("analysis_spec") or {}
-            existing_resolutions = (
-                list(existing_spec.get("metric_resolutions") or [])
-                + list(existing_spec.get("dimension_resolutions") or [])
-            )
-            resolution_by_mention = {
-                item.get("mention", ""): item
-                for item in existing_resolutions
-                if isinstance(item, dict) and item.get("mention")
-            }
-            recent_shown_candidates = list(existing_spec.get("recent_shown_candidates") or [])
 
-            # 2. 模型判断用户选择，程序白名单校验（判断归模型，校验归程序）
-            # 不要求存在最近展示候选：用户改选、补充选择时同样生效，
-            # 白名单 = 最近展示候选 ∪ 上轮已确认字段 ∪ 本轮召回候选字段
-            selected_resolution = None
-            user_selection = (
-                planner_output.user_selection.model_dump()
-                if planner_output.user_selection
-                else {}
-            )
-            if user_selection.get("selected"):
-                candidate_fields = [
-                    str(candidate.get("field") or "")
-                    for candidate in (new_entities.get("column_candidates") or [])
-                    if candidate.get("field")
-                ] + list(planner_output.fields or [])
-                selected_resolution = MetricClarificationService.validate_user_selection(
-                    user_selection,
-                    recent_shown_candidates,
-                    existing_resolutions,
-                    candidate_fields,
-                    list(planner_output.metric_mentions or []),
-                    list(planner_output.dimension_mentions or []),
-                    list(new_entities.get("column_candidates") or []),
-                )
-                if selected_resolution is None:
-                    # 模型判断了选择但程序白名单未命中：记录证据，便于排查改选失败
-                    log_sub_info(
-                        "user_selection未命中: "
-                        f"field={user_selection.get('field', '')} "
-                        f"mention={user_selection.get('mention', '')} "
-                        f"reasoning={str(user_selection.get('reasoning', ''))[:120]}",
-                        node_name="planner",
-                    )
-
-            # 3. 决定本轮的 metric_mentions / dimension_mentions
-            # 只保留 LLM 输出的当前需求概念：上轮 resolved 概念不再自动追加，
-            # 用户改选/放弃后旧概念从概念集消失，避免“纯新用户的新增订单”这类
-            # 旧口径因跨轮保留而复活；用户明确提到的概念由 LLM 自然输出。
             metric_mentions = list(planner_output.metric_mentions or [])
             if not metric_mentions:
                 metric_mentions = list(existing_spec.get("metric_mentions") or [])
             dimension_mentions = list(planner_output.dimension_mentions or [])
             if not dimension_mentions:
                 dimension_mentions = list(existing_spec.get("dimension_mentions") or [])
-            if selected_resolution is not None:
-                # 白名单校验通过：用户选定单一口径时确保该概念在对应类型集合中，
-                # 其余概念以 LLM 输出为准，不自动补回已放弃概念。
-                selected_mention = selected_resolution.get("mention", "")
-                resolution_by_mention[selected_mention] = selected_resolution
-                selected_concept_type = selected_resolution.get("concept_type") or "metric"
-                if selected_mention:
-                    if selected_concept_type == "dimension":
-                        if selected_mention not in dimension_mentions:
-                            dimension_mentions.append(selected_mention)
-                    elif selected_mention not in metric_mentions:
-                        metric_mentions.append(selected_mention)
 
-
-            # 4. 重建解析证据（指标/维度分别落盘，只保留程序可信的解析）
-            # llm_submitted 只是模型单轮解读，不跨轮保留，避免改选后旧口径残留；
-            # 用户明确选择(explicit_user)或元数据唯一(unique_metadata)的解析可保留。
-            def _rebuild_resolutions(mentions: list[str], concept_type: str) -> list[dict]:
-                rebuilt = []
-                for mention in mentions:
-                    existing = resolution_by_mention.get(mention)
-                    if (
-                        existing
-                        and existing.get("status") == "resolved"
-                        and existing.get("resolution_source") in ("explicit_user", "unique_metadata")
-                    ):
-                        rebuilt.append(existing)
-                    else:
-                        rebuilt.append({
-                            "mention": mention,
-                            "concept_type": concept_type,
-                            "status": "ambiguous",
-                            "selected_field": "",
-                            "selected_table": "",
-                            "resolution_source": "",
-                            "candidates": [],
-                        })
-                return rebuilt
-
-            new_metric_resolutions = _rebuild_resolutions(metric_mentions, "metric")
-            new_dimension_resolutions = _rebuild_resolutions(dimension_mentions, "dimension")
-
-            # 5. 组装新 AnalysisSpec：最近展示候选快照跨轮保留，由 Advisor 负责更新
             analysis_spec = dict(existing_spec)
             analysis_spec.update({
                 "analysis_type": planner_output.analysis_type,
@@ -739,12 +636,8 @@ def build_planner_node(runtime):
                 "order_by": [],
                 "limit": 0,
                 "comparison": {},
-                "metric_resolutions": new_metric_resolutions,
-                "dimension_resolutions": new_dimension_resolutions,
-                "recent_shown_candidates": recent_shown_candidates,
             })
 
-            # 6. 写回 State（首轮记录话题原文；每轮更新改写后的有效需求）
             return_value = {
                 "route": route,
                 "planner_reason": planner_reason,
@@ -752,37 +645,19 @@ def build_planner_node(runtime):
                 "planner_entities": new_entities,
                 "topic_status": next_topic_status,
                 "analysis_spec": analysis_spec,
-                "follow_up_mode": planner_output.follow_up_mode,  # 供 web 层决定是否切 Topic
+                "follow_up_mode": planner_output.follow_up_mode,  # 供 web 层决定后续处理
             }
-            # 首轮写入话题原始问题（后续轮保留原文，不覆盖）
-            if not state.get("original_question"):
-                return_value["original_question"] = current_user_input
+            # 去 Topic 化：不再写入 original_question（当前需求以 effective_query 为准）
             # 用户最终确认后，写回 status=confirmed 的查询方案
             if updated_plan is not None:
                 return_value["confirmed_plan"] = updated_plan
+            elif planner_output.follow_up_mode == "new_query":
+                # 新问数：清空历史遗留方案，避免旧方案干扰新需求理解
+                return_value["confirmed_plan"] = None
 
-            # 用户选择/改选口径后，Planner 将选择落到共享方案草稿
-            # （替换该概念旧字段，状态回到 draft；方案尚无该概念时交由 Advisor 重建）
-            if selected_resolution is not None:
-                selection_plan = _apply_user_selection_to_draft(
-                    state.get("confirmed_plan") or {},
-                    selected_resolution,
-                )
-                if selection_plan is not None:
-                    return_value["confirmed_plan"] = selection_plan
-                    log_sub_info(
-                        f"口径选择已落方案草稿: {selected_resolution.get('selected_field', '')}",
-                        node_name="planner",
-                    )
-
-            if selected_resolution is not None:
-                log_sub_info(
-                    f"用户选择校验: 命中 {selected_resolution.get('selected_field', '')}",
-                    node_name="planner",
-                )
             log_sub_info(f"follow_up_mode: {planner_output.follow_up_mode}", node_name="planner")
 
-            # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
+                        # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
             log_state_snapshot("planner", {**state, **return_value})
 
             return return_value

@@ -73,7 +73,7 @@ def build_retrieve_schema_node(runtime):
                             f"  - {rel}"
                             for rel in join_result.missing_relations
                         )
-                        + "\n请联系数据管理员补充 semantic_metadata.json 中的表关系配置。"
+                        + "\n请联系数据管理员补充语义层 join_contracts 中的表关系配置。"
                     )
                     log_node_error("retrieve_schema", error=error_msg, ms=elapsed_ms(timer))
                     raise ValueError(error_msg)

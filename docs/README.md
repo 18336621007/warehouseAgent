@@ -78,7 +78,7 @@ python web/server.py
 | 功能 | 说明 |
 |------|------|
 | 🧠 意图识别 | LLM 自动区分闲聊和查询，闲聊秒回、查数走完整管线 |
-| ➕ 新建对话 | 左侧栏按钮，每个 `conversation_id` 可包含多个独立 Topic |
+| ➕ 新建对话 | 左侧栏按钮，每个 `conversation_id` 为一个完整对话，全程共享一个 LangGraph Checkpoint |
 | 📋 对话列表 | 历史对话一键切换，支持删除和重命名 |
 | 🔍 思考过程 | 点击折叠面板查看意图识别、Planner 路由、命中表/字段、系统评分 |
 | 📊 查看 SQL | 点击折叠面板查看实际执行的 SQL |
@@ -119,7 +119,7 @@ flowchart TD
 | LLM 接口 | LangChain + OpenAI 兼容 API |
 | 意图识别 | LangChain `with_structured_output`（Pydantic 结构化分类） |
 | 向量检索 | FAISS（余弦相似度，三层索引：库/表/字段 + 示例库） |
-| 数据源 | PyHive（Hive） |
+| 数据源 | PyHive（Hive，主）+ Doris（三平台天数池，待接入） |
 | 元数据存储 | MySQL（增强后库/表/字段三级 + 评估记录表） |
 | Web 服务 | Flask |
 | 日志 | JSON Lines 结构化日志 `agentTest/logs/langgraph_app.jsonl`，按天滚动保留 14 天 |
@@ -143,13 +143,13 @@ Project/
 ## State 与记忆
 
 - `conversation_id` 表示一个前端完整对话。
-- `topic_id` 表示对话中的一次独立查数任务。
+- `topic_id` 仅为日志/状态标识（去 Topic 化后固定，不再按问数切换）。
 - `request_id` 表示一次 HTTP 或 CLI 图调用。
-- LangGraph checkpoint 使用 `conversation_id:topic_id` 隔离 Topic。
+- LangGraph checkpoint 使用 `conversation_id`（整个对话共享，跨问数完整保留历史）。
 - Web/CLI 每轮只传身份字段和 `current_user_input`，业务状态由 `AgentState` 管理。
 - `messages + add_messages` 统一保存用户、Advisor、工具和 Seeker 消息。
-- `AnalysisSpec.pending_clarifications` 固化上一轮指标候选（clarification_id + options），Planner LLM 结合历史对话判断 `user_selection`，程序白名单校验后生成 `explicit_user`。
-- `topic_status` 已覆盖 new/clarifying/confirmed/generating_sql/validating_sql/executing/completed/failed，Web/CLI 使用终态创建新 Topic。
+- 去 pending 状态机：`AnalysisSpec` 仅保留当轮意图（analysis_type/metric_mentions/dimension_mentions 等），不再跨轮保存解析证据与候选快照；用户改选/追问由 `effective_query` 每轮改写 + 完整对话历史还原。
+- `topic_status` 已覆盖 clarifying/confirmed/generating_sql/validating_sql/executing/completed/failed，作为当轮请求的阶段标识。
 - Planner 返回 `partial/none` 时，Advisor 先检索元数据并向用户追问；未确认口径由程序级指标歧义门禁在 `submit_query_plan → lock_query_plan` 之间拦截。
 - 需求完整或用户本轮解决歧义后，Advisor 直接调用 `submit_query_plan` 生成 `status=locked` 的完整方案。
 - Planner → Advisor 状态交接、同轮锁定和指标门禁已经进入主链路；已确认指标由程序收敛，不依赖 LLM 必须提交可选参数。
@@ -311,7 +311,7 @@ Web / CLI 请求
 ### 本轮架构强化
 
 - **单次确认协议**：未生成 `locked_plan` 时禁止展示最终确认话术；Advisor 在用户解决歧义的同一轮直接调用 `submit_query_plan`。
-- **跨轮指标状态闭环**：候选写入 pending，Planner 确定性解析“第二个”等短回答，Advisor 使用已确认字段覆盖 LLM 漏传或改写的 measures。
+- **去 pending 状态机**：候选不跨轮固化，用户改选/追问通过 `effective_query` 改写 + 完整对话历史还原，Advisor 按当轮意图工作。
 - **多表字段来源锁定**：执行阶段优先校验 QueryPlan 中已经锁定的 `field_sources`，禁止静默换表。
 - **复合 Join 键**：关系元数据支持字符串和字段列表，当前运营日报与经销商维表按 `pt_platform + company_id` 关联。
 - **Join 推测开关**：`ALLOW_AI_INFERRED_JOIN=True` 时允许缺少人工关系的场景进入 LLM 推测；关闭时安全拒绝。
@@ -323,7 +323,7 @@ Web / CLI 请求
 ### 当前能力边界
 
 - 当前一次只澄清一个指标口径；候选提出后支持隔数轮回复编号（延迟澄清恢复），查询成功后支持基于结果追问；多 pending 冲突消解等能力经评估不再引入。
-- Checkpointer 仍为进程内 `MemorySaver`，服务重启后不能恢复 Topic。
+- Checkpointer 仍为进程内 `MemorySaver`，服务重启后不能恢复对话。
 - 时间表达式的确定性 SQL 构造目前优先覆盖“昨天”场景，复杂时间范围继续走 LLM 修复链。
 - JoinPlanner 当前连接 QueryPlan 涉及表，尚未自动引入桥表或基于成本选择最优路径。
 - Hive 执行仍是主要耗时来源，需要继续建设超时、异步执行、查询成本控制和结果缓存。
@@ -332,11 +332,11 @@ Web / CLI 请求
 
 - [大厂 AI 数据开发岗位简历项目](./求职/大厂AI数据开发岗位简历项目.md)
 - [项目面试问题、困难与参考答案](./求职/项目面试问题与参考答案.md)
-### 连续问答能力（第13课已实现）
+### 连续问答能力（去 Topic 化后）
 
-现有架构已实现两类 Topic 级连续问答能力：
+现有架构已实现跨问数的连续问答：
 
 - 查询完成后，用户可以继续问“第一名的业务经理是谁”“这些经销商里有几个正常状态”“换成最近 7 天”。
 - Advisor 给出候选后，用户可以先询问口径差异或修改其他条件，隔数轮再回复“第二个”。
 
-设计上使用 `QueryResultSnapshot（last_query_result）+ pending_clarifications`，不新增独立 Agent，也不把大结果和全部消息直接塞给 LLM；`FollowUpContext` 等结构化跟进状态经评估不再引入。
+设计上**去掉 pending 状态机**：整个对话共享一个 LangGraph Checkpoint（完整历史跨问数保留），Planner 每轮基于对话历史 + `effective_query` 改写还原当轮需求；已确认方案通过 `confirmed_plan` 快照在历史消息中保留，供追问引用；不再跨轮固化候选/解析证据。

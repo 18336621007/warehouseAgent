@@ -91,7 +91,7 @@ def build_build_final_answer_node(runtime):
 
         sql_valid = state.get("sql_valid", False)
         # 回答基准使用当前有效需求，避免多轮追问后仍按话题首轮原文判断完整性
-        question = state.get("effective_query") or state.get("original_question", "")
+        question = state.get("effective_query") or ""
         timer = start_timer()
 
         # 记录节点开始日志

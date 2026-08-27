@@ -14,6 +14,7 @@ from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end, start_timer, log_node_start, elapsed_ms, log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import log_tools_called, log_example_retrieved, log_plan_locked, log_advisor_mode
 from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
+from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
 from agentTest.langgraph_app.prompts.advisor_prompt import ADVISOR_SYSTEM_PROMPT
@@ -35,6 +36,7 @@ from agentTest.langgraph_app.services.metric_clarification_service import Metric
 from agentTest.semantic_layer.metric_matcher import (
     match_metrics_from_query,
     format_metric_context,
+    resolve_entity_dimension_fields,
 )
 from agentTest.langgraph_app.services.candidate_reranker import (
     build_candidate_reranker,
@@ -418,7 +420,6 @@ def build_advisor_subgraph(runtime):
         effective_query = (
                 state.get("effective_query")
                 or planner_entities.get("effective_query")
-                or state.get("original_question")
                 or state.get("current_user_input", "")
         )
         current_user_input = state.get("current_user_input", "")
@@ -479,24 +480,85 @@ def build_advisor_subgraph(runtime):
         )
 
         # ── 语义层权威口径注入：匹配候选指标供 Advisor 核验字段参考，不替代候选口径白名单 ──
-        metric_search_text = effective_query or "\n".join(
-            part for part in (original_question, current_user_input) if part and part.strip()
-        )
+        # 去 Topic 化：语义层匹配用改写后的 effective_query（无则用本轮输入）
+        metric_search_text = effective_query or current_user_input
         semantic_matches = match_metrics_from_query(metric_search_text, limit=5)
+        # 语义层命中日志：便于排查"走了语义层还是召回"
+        log_metric_event(
+            "semantic.match",
+            node_name="advisor",
+            mention=metric_search_text[:100],
+            hit_count=len(semantic_matches),
+            metric_ids=[m.get("id", "") for m in semantic_matches],
+            metric_names=[m.get("name", "") for m in semantic_matches],
+        )
         metric_context_text = format_metric_context(semantic_matches)
 
-        # 语义层唯一命中短路：top1 得分远高于 top2（gap >= 阈值）时，
-        # 直接注入 resolved 结果到 previous_resolutions，跳过 validator 的候选发现和澄清
+        # 语义层命中短路：对每个指标概念，若语义层有唯一强匹配（概念在指标名/别名中），
+        # 视为已 resolved，跳过该概念的候选发现与澄清；
+        # 多指标各自唯一匹配时同样短路（如"租赁中订单、新增订单"分别唯一命中两个指标）
         _semantic_previous_resolutions: list[dict] = []
-        if len(semantic_matches) >= 2:
-            top1_score = semantic_matches[0].get("score", 0)
-            top2_score = semantic_matches[1].get("score", 0)
-            if top1_score - top2_score >= SEMANTIC_UNIQUE_GAP_THRESHOLD:
-                winner = semantic_matches[0]
+        _semantic_mentions = list(current_spec.get("metric_mentions") or [])
+        for _sm_mention in _semantic_mentions:
+            _sm_lower = str(_sm_mention).strip().lower()
+            if not _sm_lower:
+                continue
+            _sm_matched = [
+                m for m in semantic_matches
+                if _sm_lower in str(m.get("name", "")).lower()
+                or any(_sm_lower in str(a).lower() for a in (m.get("aliases") or []))
+            ]
+            if len(_sm_matched) == 1:
+                _sm_winner = _sm_matched[0]
                 _semantic_previous_resolutions.append({
-                    "mention": winner.get("name", ""),
-                    "selected_field": winner.get("id", ""),
-                    "selected_table": winner.get("source_model", ""),
+                    "mention": _sm_mention,
+                    "selected_field": _sm_winner.get("id", ""),
+                    "selected_table": _sm_winner.get("source_model", ""),
+                    "source": "semantic_layer",
+                    "status": "resolved",
+                })
+
+        # 维度实体解析：dimension mention 匹配语义层实体时，用 display_fields 作为权威维度字段
+        # （语义名 → 关联模型 dimensions → 物理字段），并短路跳过 validator 的维度澄清
+        _semantic_dimension_candidates: list[dict] = []
+        _semantic_layer_provider = runtime.get("semantic_metadata_provider")
+        _semantic_layer_api = (
+            _semantic_layer_provider.semantic_layer
+            if _semantic_layer_provider is not None else None
+        )
+        for _dim_mention in (current_spec.get("dimension_mentions") or []):
+            _dim_lower = str(_dim_mention).strip().lower()
+            if not _dim_lower:
+                continue
+            _entity = (
+                _semantic_layer_api.get_entity_by_keyword(_dim_mention)
+                if _semantic_layer_api is not None else None
+            )
+            if not _entity:
+                continue
+            # 语义层规范：语义维度 key == 实体 id（如 dealer）或物理键一致时解析为该实体的分组键字段
+            # 解析范围收敛到指标 source_model + join 契约可达模型，避免全量模型候选噪声
+            _scope_ids: set[str] = set()
+            if _semantic_layer_api is not None:
+                for _sm in semantic_matches:
+                    _src = str(_sm.get("source_model", "") or "")
+                    if _src:
+                        _scope_ids.add(_src)
+                        for _c in _semantic_layer_api.get_join_contracts_for_model(_src):
+                            _scope_ids.add(str(_c.get("left_model", "") or ""))
+                            _scope_ids.add(str(_c.get("right_model", "") or ""))
+            _entity_fields = resolve_entity_dimension_fields(
+                _entity,
+                _semantic_layer_api.get_all_semantic_models() if _semantic_layer_api is not None else [],
+                scope_model_ids=_scope_ids or None,
+                provider=_semantic_layer_api,
+            )
+            _semantic_dimension_candidates.extend(_entity_fields)
+            if _entity_fields:
+                _semantic_previous_resolutions.append({
+                    "mention": _dim_mention,
+                    "selected_field": _entity_fields[0]["field"],
+                    "selected_table": _entity_fields[0]["table"],
                     "source": "semantic_layer",
                     "status": "resolved",
                 })
@@ -604,7 +666,10 @@ def build_advisor_subgraph(runtime):
             pre_clarification_result = metric_validator.validate(
                 metric_mentions=metric_mentions,
                 dimension_mentions=dimension_mentions,
-                planner_candidates=planner_entities.get("column_candidates") or [],
+                planner_candidates=(
+                    list(planner_entities.get("column_candidates") or [])
+                    + _semantic_dimension_candidates
+                ),
                 table_candidates=planner_entities.get("table_candidates") or [],
                 previous_resolutions=_prev_res,
                 target_tables=target_tables,
@@ -854,7 +919,10 @@ def build_advisor_subgraph(runtime):
                 resolution_result = metric_validator.validate(
                     metric_mentions=metric_mentions,
                     dimension_mentions=dimension_mentions,
-                    planner_candidates=planner_entities.get("column_candidates") or [],
+                    planner_candidates=(
+                    list(planner_entities.get("column_candidates") or [])
+                    + _semantic_dimension_candidates
+                ),
                     table_candidates=planner_entities.get("table_candidates") or [],
                     previous_resolutions=(
                         _semantic_previous_resolutions
@@ -987,7 +1055,10 @@ def build_advisor_subgraph(runtime):
             pre_result = metric_validator.validate(
                 metric_mentions=metric_mentions,
                 dimension_mentions=dimension_mentions,
-                planner_candidates=planner_entities.get("column_candidates") or [],
+                planner_candidates=(
+                    list(planner_entities.get("column_candidates") or [])
+                    + _semantic_dimension_candidates
+                ),
                 table_candidates=planner_entities.get("table_candidates") or [],
                 previous_resolutions=(
                     _semantic_previous_resolutions
@@ -1104,13 +1175,8 @@ def build_advisor_subgraph(runtime):
             # 追问中逐步完善的方案以 draft 状态持久化，供下一轮继续补充
             return_value["confirmed_plan"] = draft_plan
 
-        # 提交校验和预校验统一回写，最近展示候选快照（无编号）跨轮保留，供模型判断下一轮用户选择。
-        effective_result = resolution_result or ambiguity_result
-        if effective_result is not None:
-            return_value["analysis_spec"] = MetricClarificationService.update_recent_shown_candidates(
-                state.get("analysis_spec") or {},
-                effective_result,
-            )
+        # 去 pending：不再跨轮保存最近展示候选快照（候选在历史消息中，
+        # 用户选择由 Planner 每轮改写 effective_query 体现）
 
 
         # 节点完成后记录 State 分层摘要，供 trace 查看数据流转

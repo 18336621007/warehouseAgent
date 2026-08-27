@@ -249,7 +249,6 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
-    time_range = confirmed_plan.get("time_range", "") or "昨天"  # 未指定默认昨天（企业惯例：当天分区常为空）
     filters = confirmed_plan.get("filters", "")
 
     if not table:
@@ -305,14 +304,6 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
         confirmed_plan.get("table_plans") or [],
     )
     issues.extend(table_filter_issues)
-
-    # 5. 日期值校验：time_range说"昨天"但SQL没用date_sub → 报错
-    if time_range:
-        sql_lower = sql.lower()
-        if "昨天" in time_range and "date_sub" not in sql_lower:
-            issues.append(f"时间条件应为昨天(date_sub(current_date(),1))，但SQL中未找到date_sub，疑似使用了当天日期")
-        elif "今天" in time_range and "current_date" not in sql_lower:
-            issues.append(f"时间条件应为今天(current_date())，但SQL中未找到current_date")
 
     # 6. filters 校验
     if filters and filters.strip():
@@ -517,7 +508,7 @@ def build_generate_sql_node(runtime):
 
 
         # SQL 生成使用 Planner 改写后的完整有效需求，避免使用“好的”等确认文本
-        question = state.get("effective_query") or state.get("original_question", "")
+        question = state.get("effective_query") or ""
         schema_context = state["schema_context"]
         # 从统一消息中获取最近一次Advisor确认描述
         advisor_last_answer = get_last_ai_content(

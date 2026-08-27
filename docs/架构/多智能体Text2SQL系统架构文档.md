@@ -41,12 +41,12 @@ flowchart TD
 ### 图结构
 
 - **父图**（Supervisor）：记录用户消息 → Planner 路由决策 → Advisor/Seeker。
-- **Advisor 统一模式**：只使用 `plan_agent`（绑定全部工具）；指标编号、字段名和中文含义优先由 pending 状态确定性解析，其余语义再交给模型。
+- **Advisor 统一模式**：只使用 `plan_agent`（绑定全部工具）；指标编号、字段名和中文含义由指标歧义门禁（`MetricClarificationService`）按当轮候选固化解析，其余语义再交给模型。
 - **同轮锁定**：`partial/none` 时先检索并追问，未确认口径由指标歧义门禁在 `submit_query_plan → lock_query_plan` 之间拦截；用户本轮解决歧义后直接提交完整方案生成 `locked`。
 - **查询方案领域服务**：`lock_query_plan()` 将 Advisor 提案标准化为 `locked`；`confirm_query_plan()` 只允许 Planner 将合法 `locked` 方案升级为 `confirmed`；`merge_draft_plan()` 将追问中确认的部分槽位持久化为 `draft`（`concept_resolutions` 统一为字典结构）。
-- **全局唯一共享方案**：`confirmed_plan` 是 Topic 内唯一查询契约，三态（`draft` 追问中 / `locked` 待确认 / `confirmed` 可执行）；用户选择或改选口径时 Planner 通过 `_apply_user_selection_to_draft()` 直接替换该概念旧字段并回到 `draft`，不再平行维护一份“已确认口径”。
+- **全局唯一共享方案**：`confirmed_plan` 是对话内唯一查询契约，三态（`draft` 追问中 / `locked` 待确认 / `confirmed` 可执行）；用户选择或改选口径时 Planner 通过 `_apply_user_selection_to_draft()` 直接替换该概念旧字段并回到 `draft`，不再平行维护一份“已确认口径”。
 - **Seeker 子图**：`retrieve_schema → generate_sql → validate_sql → execute_sql → build_final_answer → evaluator`。
-- **状态隔离**：MemorySaver 以 `conversation_id:topic_id` 为 checkpoint `thread_id`，同一 Topic 多轮共享状态。
+- **状态隔离**：MemorySaver 以 `conversation_id` 为 checkpoint `thread_id`（去 Topic 化），整个对话多轮共享状态与完整历史。
 - **消息记忆**：`messages + add_messages` 统一保存用户、Advisor、工具和 Seeker 消息。
 
 ### 关键设计原则
@@ -56,14 +56,14 @@ flowchart TD
 3. **职责分离**：Advisor 负责澄清或形成 `locked` 方案；Planner 负责理解用户是否接受完整方案；Seeker 只执行 `confirmed` 方案。
 4. **不允许执行层猜测**：Seeker 不再通过向量检索重新选表选字段，方案缺失或物理 Schema 不一致时直接失败。
 5. **检索证据不直接决定路由**：高相似候选数量保留为日志和调优指标，但不再作为把 `full` 强制降为 `partial` 的硬门禁；业务完整度由对话语义、元数据映射、QueryPlan 校验和用户确认共同决定。
-6. **多表覆盖分析已实现**：`TableCoverageAnalyzer` + `JoinPlanner` 已集成到 `retrieve_schema_node`，BFS安全Join路径规划从 `semantic_metadata.json` 驱动，找不到关系时安全拒绝。多表 Schema 解析（加载多表结构）将在第10课实现。
+6. **多表覆盖分析已实现**：`TableCoverageAnalyzer` + `JoinPlanner` 已集成到 `retrieve_schema_node`，BFS 安全 Join 路径规划从语义层 `join_contracts.yaml`（`SemanticLayerProvider`）驱动，找不到关系时安全拒绝。
 7. **下一阶段功能优先**：在保留 confirmed_plan 业务契约的基础上新增 ExecutionPlan、关系元数据和确定性 Join Planner，再扩展分析性查询。
 
 ## 三、模块职责
 
 ### 3.1 State 分层设计（`state/`）
 
-State 按“身份 → Topic → 公共流程 → 领域状态”分层：
+State 按“身份 → 请求 → 公共流程 → 领域状态”分层（去 Topic 化，`topic_status` 仅作当轮请求阶段标识）：
 
 ```
 state/
@@ -77,7 +77,7 @@ state/
 核心规则：
 
 - Web/CLI 只传 `conversation_id / topic_id / request_id / current_user_input`。
-- `original_question / advisor_turns / confirmed_plan` 由 Graph State 管理。
+- `effective_query / advisor_turns / confirmed_plan` 由 Graph State 管理（`original_question` 已删除）。
 - `messages` 使用 `add_messages` reducer，节点只返回本轮新增消息。
 - `advisor_messages` 和 State 字段 `advisor_last_answer` 已删除；Planner 从标准消息中读取最近的 Advisor 回复。
 - 子图编译时使用自己的 State，父图使用聚合后的 `AgentState`。
@@ -653,12 +653,12 @@ MetricAmbiguityValidator 再次拦截
 ```text
 MetricAmbiguityValidator 生成候选
   ↓
-MetricClarificationService 固化 clarification_id + options
-  ↓ 写入 AnalysisSpec.pending_clarifications
-下一轮 Planner LLM 判断 user_selection（结合历史对话与待澄清候选）
+MetricClarificationService 固化当轮候选（mention → options，编号由模型在澄清文案定义）
+  ↓ 注入 Advisor 上下文（只读事实，禁止引用候选之外字段）
+Planner 结合【完整对话历史】判断 user_selection
   ↓ 程序 validate_user_selection 白名单校验（field 命中候选集合）
-ConceptResolution(status=resolved, source=explicit_user)
-  ↓ 清理 pending、effective_query 基线滚动更新（original_question 保留原文）
+resolved 结果生效（去 pending：不跨轮固化候选快照，改选由对话历史 + effective_query 还原）
+  ↓ effective_query 每轮改写滚动更新需求基线
 Planner 将选择落到共享方案草稿（_apply_user_selection_to_draft：替换旧字段、状态回 draft）
   ↓
 Advisor 只看到【当前已有方案】，不再注入“已确认口径”列表
@@ -670,9 +670,9 @@ lock_query_plan
 
 关键变化：
 
-- 候选不仅展示给用户，也进入 State。
-- 编号语义由创建 pending 时的 options 决定，不依赖重新召回。
-- Planner 基于已有 AnalysisSpec 增量更新，不再重新创建后丢失 pending。
+- 候选只展示给用户并注入 Advisor 上下文（去 pending 后不再跨轮固化进 State）。
+- 编号语义由当轮澄清文案中的 options 决定，不依赖重新召回。
+- Planner 基于完整对话历史 + `effective_query` 每轮改写，不再依赖跨轮 pending 证据。
 - Validator 保留上轮真实候选中的 resolved field，候选重排不使选择失效。
 - Advisor 未调用提交工具时的预校验结果也会写回 State。
 - Advisor 不再注入“已确认指标口径”上下文，只依赖当前共享方案，避免改选后旧口径被程序提示保留。
@@ -684,10 +684,10 @@ lock_query_plan
 
 ### 18.3 连续问答落地结果
 
-- 用户先询问候选差异、数轮后再选择：已支持（单 open pending 延迟澄清恢复，候选编号创建时冻结）。
+- 用户先询问候选差异、数轮后再选择：已支持（候选编号在当轮文案中冻结，隔数轮由 Planner 结合对话历史还原选择）。
 - 查询成功后引用“第一名”“这些经销商”：已支持（对话历史 + `last_query_result` 结果快照）。
 - 基于上一轮 QueryPlan 只修改时间、过滤或维度：由 Planner 结合对话历史与 `effective_query` 需求基线处理，不引入 `FollowUpContext` 结构化状态。
-- 同一 Topic 同时存在多个未解决澄清：经评估不再引入（当前一次只澄清一个问题）。
+- 同一请求同时存在多个未解决澄清：经评估不再引入（一次只澄清一个问题）。
 
 ## 十九、连续问答与延迟澄清恢复
 
@@ -696,12 +696,12 @@ lock_query_plan
 连续问答在现有状态契约上实现，不新增 FollowUp Agent，由现有 Capture / Planner / Advisor / Seeker 链路完成：
 
 ```text
-Capture → Planner（结合对话历史 + pending + last_query_result 判断 user_selection / follow_up_mode）
+Capture → Planner（结合完整对话历史 + last_query_result 判断 user_selection / follow_up_mode；去 pending 后不再依赖跨轮候选证据）
   ↓
 Advisor / Seeker
 ```
 
-- Planner LLM 结合【对话历史 + 待澄清候选 + 结果快照】判断 `user_selection` 与 `follow_up_mode`，程序 `validate_user_selection` 只做白名单校验，不写死编号/字段名解析规则。
+- Planner LLM 结合【完整对话历史 + 结果快照】判断 `user_selection` 与 `follow_up_mode`，程序 `validate_user_selection` 只做白名单校验，不写死编号/字段名解析规则。
 - 结果追问、方案增量修改、候选解释或新查询由 Planner 统一判断，不再单独拆 FollowUpAnalyzer。
 - Planner 继续负责形成完整有效需求和 AnalysisSpec。
 - Advisor 继续负责元数据核验与业务澄清。
@@ -720,14 +720,13 @@ Advisor / Seeker
 
 ### 19.3 延迟澄清
 
-单 pending 升级为 `pending_clarifications` 注册表：
+**去 pending 状态机**（已移除 `pending_clarifications`）：
 
-- 每条记录有稳定 `clarification_id`、创建请求、候选快照和状态。
-- 用户询问选项差异时保持 `open`，不能误判为选择。
-- 只有一个 open pending 时，隔数轮回复“第二个”仍可直接命中。
-- 当前实现一次只澄清一个问题；多 open pending 冲突消解经评估不引入，仍保留“必须要求用户指定业务概念”的安全原则。
-- 新 Topic 与旧 Topic 状态严格隔离。
-- pending 过期策略经评估不引入，当前不自动过期。
+- 候选不跨轮固化进 State，澄清依赖完整对话历史 + `effective_query` 每轮改写。
+- 用户询问选项差异时，Planner 结合历史判断是否为选择，程序白名单校验。
+- 隔数轮回复“第二个”：由 Planner 结合对话历史还原选择，程序校验命中候选集合。
+- 一次只澄清一个问题；多候选冲突消解经评估不引入，保留“必须要求用户指定业务概念”的安全原则。
+- 新问数由 Planner 判定 `new_query` 并清空遗留 `confirmed_plan`，不再按 Topic 隔离。
 
 ### 19.4 方案增量修改
 
@@ -737,8 +736,8 @@ Advisor / Seeker
 
 ### 19.5 安全边界
 
-- 结果引用只在同一 Topic 内生效。
+- 结果引用在同一对话内生效（去 Topic 化后为整个对话）。
 - 无快照、快照过期或引用不唯一时必须追问。
 - 全量大结果不写入 State，只保存引用和预览。
-- 消息摘要可以压缩自然语言历史，但不能替代 QueryPlan、pending 和结果快照。
+- 消息摘要可以压缩自然语言历史，但不能替代 QueryPlan 和结果快照。
 - 连续问答仍需经过字段来源、Join、逐表过滤和 SQL Guardrails。

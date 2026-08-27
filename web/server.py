@@ -99,7 +99,7 @@ def create_conversation():
     # conversation_id对应前端的一个完整对话
     conversation_id = uuid.uuid4().hex
 
-    # 新对话默认创建第一个问数Topic
+    # 去 Topic 化：conversation 级固定 topic_id（仅作日志/状态标识，不再按问数切换）
     topic_id = uuid.uuid4().hex
 
     sessions[conversation_id] = {
@@ -141,11 +141,7 @@ def chat():
     if not message: return jsonify({"error": "empty message"}), 400
 
     session = sessions[conversation_id]
-    # 新查数问题创建独立Topic，并使用新的LangGraph Checkpoint
-    if session.pop("_new_topic", False):
-        session["topic_id"] = uuid.uuid4().hex
-
-    # 当前Topic的多轮追问共享同一个topic_id
+    # 去 Topic 化：整个对话共享一个 Checkpoint，topic_id 固定不再切换
     topic_id = session["topic_id"]
 
     # 每次HTTP请求使用独立request_id
@@ -155,8 +151,8 @@ def chat():
         # SSE 事件统一携带 request_id，前端可据此关联日志排查问题
         return _sse({**data_dict, "request_id": request_id})
 
-    # 每个Topic拥有独立的LangGraph Checkpoint
-    graph_thread_id = f"{conversation_id}:{topic_id}"
+    # 去 Topic 化：整个对话共享同一个 LangGraph Checkpoint（完整历史跨问数保留）
+    graph_thread_id = conversation_id
     config = {
         "configurable": {
             "thread_id": graph_thread_id,
@@ -165,7 +161,8 @@ def chat():
 
     def generate(request_timer, topic_state):
         # ── query: LangGraph pipeline ──
-        is_first_topic_turn = not topic_state.get("original_question")
+        # 去 Topic 化：是否本对话首轮（Checkpoint 尚无消息），首轮才做意图识别
+        is_first_topic_turn = not bool(topic_state.get("messages"))
 
         # 保存请求开始前的Topic状态，用于识别真实状态变化
         observed_topic_status = topic_state.get(
@@ -329,15 +326,8 @@ def chat():
                 "evaluator": evaluator_payload,
             })
 
-            # ── 根据本轮语义决定下一次查数任务 ──
-            # 追问类（plan_refinement / result_follow_up / clarification_explanation）沿用同一 Topic，
-            # 保留 confirmed_plan 与历史供下一轮识别；只有真正换话题(new_query)或异常终态才切 Topic。
-            follow_up_mode = result.get("follow_up_mode", "")
-            if topic_status in ("failed", "cancelled") or (
-                    topic_status == "completed" and follow_up_mode == "new_query"
-            ):
-                # 当前Topic已结束或用户已换话题，下一条消息创建独立Topic
-                session["_new_topic"] = True
+            # ── 去 Topic 化：不再按 new_query / 异常终态切换 Topic，
+            #    整个对话共享历史与状态，新问数由 Planner 每轮重新改写 effective_query ──
 
             log_request_end(
                 result_type="query",
@@ -391,8 +381,7 @@ def chat():
                     related_error_id=error_id,
                     stage="persist_failed_state",
                 )
-            # failed是Topic终态，下一条消息创建新的Topic
-            session["_new_topic"] = True
+            # 去 Topic 化：失败后不切换 Topic，下一条消息在同一对话内重试
             log_request_error(
                 error=error,
                 error_id=error_id,
@@ -488,8 +477,7 @@ def chat():
                     stage="persist_failed_state",
                 )
 
-            # failed是Topic终态，下一条消息创建新的Topic
-            session["_new_topic"] = True
+            # 去 Topic 化：失败后不切换 Topic，下一条消息在同一对话内重试
 
             log_request_error(
                 error=error,

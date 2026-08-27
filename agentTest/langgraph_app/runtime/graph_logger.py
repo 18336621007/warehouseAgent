@@ -483,11 +483,13 @@ def log_state_change(
 
 
 def log_metric_event(event, **kwargs):
-    """指标歧义门禁结构化日志，event 为 metric_ambiguity.detected 等稳定事件名。"""
+    """指标/语义层结构化日志，event 为 metric_ambiguity.detected / semantic.match 等稳定事件名。
+    默认归属 metric_ambiguity 节点，可通过 node_name 覆盖（如 planner / advisor）。"""
+    node_name = kwargs.pop("node_name", "metric_ambiguity")
     _write_log(
         logging.INFO,
         event,
-        node_name="metric_ambiguity",
+        node_name=node_name,
         category="metric",
         **kwargs,
     )
@@ -634,10 +636,6 @@ def build_state_snapshot(state, node_name=""):
     snapshot["effective_query"] = _short_text(
         state.get("effective_query", ""),
         max_length=300,
-    )
-    snapshot["original_question"] = _short_text(
-        state.get("original_question", ""),
-        max_length=150,
     )
     snapshot["confirmed_plan"] = _plan_summary(state.get("confirmed_plan") or {})
     snapshot["analysis_spec"] = _spec_summary(state.get("analysis_spec") or {})

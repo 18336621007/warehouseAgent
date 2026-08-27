@@ -19,8 +19,8 @@ def capture_user_message_node(state: AgentState):
         ]
     }
 
-    # 新 Topic 的首轮请求从 new 状态开始
-    if not state.get("original_question"):
+    # 去 Topic 化：对话首轮（尚无消息）从 new 状态开始
+    if not state.get("messages"):
         return_value["topic_status"] = "new"
 
     return return_value

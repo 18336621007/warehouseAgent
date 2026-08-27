@@ -1,6 +1,6 @@
-﻿# ── state/analysis_spec.py ──
-# AnalysisSpec：从自然语言提取的结构化业务分析意图，跨轮保留在 Topic State 中。
-# ConceptResolution：单个业务概念（指标/维度）的候选与解析证据，未解决候选不进入 QueryPlan。
+# ── state/analysis_spec.py ──
+# AnalysisSpec：从自然语言提取的结构化业务分析意图，跨轮保留在 Conversation State 中。
+# 去 pending 状态机：不再跨轮保存解析证据/候选快照，澄清靠历史 + effective_query 改写。
 from typing import TypedDict
 
 
@@ -14,23 +14,7 @@ class ConceptCandidate(TypedDict, total=False):
     score: float            # 检索排序分数，仅用于排序，不产生解析证据
 
 
-class ConceptResolution(TypedDict, total=False):
-    """业务概念的解析记录：status=ambiguous 表示仍需用户选择口径。"""
-    mention: str            # 用户提到的业务概念，如"新增订单"
-    concept_type: str       # metric / dimension
-    status: str             # ambiguous / resolved   （未定义/用户已确认）
-    selected_field: str     # 已选物理字段，未解析时为空
-    selected_table: str     # 已选字段所属表
-    resolution_source: str  # llm_submitted / explicit_user / unique_metadata / semantic_default / unknown
-    candidates: list[dict]  # ConceptCandidate 列表（按排序分数降序）
-
-class ShownCandidateGroup(TypedDict, total=False):
-    """最近展示给用户的候选快照（无编号）：供改选参照与程序白名单，编号由模型在澄清文案中定义。"""
-    mention: str                    # 业务概念，如"新增订单"
-    concept_type: str               # metric / dimension，区分指标与维度概念
-    candidates: list[ConceptCandidate]  # 最近展示过的候选（字段+含义+来源表）
-
-# 跨轮保存“用户分析意图 + 指标解析证据”的结构化状态
+# 跨轮保存“用户分析意图”的结构化状态（仅当轮字段；解析证据/候选快照已去 pending 化）
 class AnalysisSpec(TypedDict, total=False):
     """从自然语言提取的结构化分析意图，作为指标歧义门禁和后续语义层的公共入口。"""
     analysis_type: str                # detail / aggregate / trend / ranking / comparison
@@ -42,6 +26,3 @@ class AnalysisSpec(TypedDict, total=False):
     order_by: list[dict]              # 排序规则 [{"concept": "...", "direction": "DESC"}]
     limit: int                        # TopN 数量
     comparison: dict                  # 同比/环比/基期对比
-    metric_resolutions: list[ConceptResolution]  # 指标解析证据，跨轮保留候选
-    dimension_resolutions: list[ConceptResolution]  # 维度解析证据，跨轮保留候选
-    recent_shown_candidates: list[ShownCandidateGroup]  # 最近展示候选快照（无编号，编号由模型文案定义）

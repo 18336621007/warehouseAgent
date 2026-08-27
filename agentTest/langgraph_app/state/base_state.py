@@ -44,10 +44,8 @@ class TopicState(IdentityState, total=False):
     # messages 只保存当前 Topic 的消息，并通过 Reducer 增量合并
     messages: Annotated[list[AnyMessage], add_messages] # 节点以后只需要返回新增消息,会自动追加到消息列表
 
-    # 话题原始问题，在同一个 Topic 中保持不变。新话题创建时更新原始问题
-    original_question: str
-
-    # Planner 每轮改写后的有效需求，original_question 保留原文、本字段滚动更新
+    # 去 Topic 化：不再保存 original_question 固定基线；
+    # Planner 每轮基于完整历史 + 本轮输入改写 effective_query（query 改写）作为当前需求
     effective_query: str
 
     # 当前输入，每轮更新

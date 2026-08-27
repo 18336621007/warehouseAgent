@@ -184,7 +184,7 @@ fields：
 - 禁止编造字段
 
 如果 accept_locked_plan=true：
-- 复用 confirmed_context 中的表和字段
+- 复用对话历史中最近确认/展示的方案中的表和字段
 - 不使用新的检索结果覆盖已有方案
 - 若方案不是 locked，必须返回 false
 
@@ -239,34 +239,8 @@ fields：
 - clarification_explanation：用户只询问候选区别或解释，尚未做出选择。
 """
 
-PLANNER_USER_TEMPLATE = """
-【当前需求基线】
-{question}
-
-【语义层指标候选】
-{metric_context}
-
-【当前查询方案】
-{confirmed_context}
-
-【对话历史（最近 N 轮）】
-{history_context}
-
-【本轮用户输入】
-{current_user_input}
-
-【最近展示候选】
-{recent_candidates_text}
-
-【已确认口径】
-{resolution_context}
-
-【分层元数据检索结果】
-{metadata_section}
-
-【历史相似问题】
-{example_context}
-"""
+# 用户消息由 planner_node 按需拼接 sections（有内容的才带标题，避免空标题占用 token）
+PLANNER_USER_TEMPLATE = """{sections}"""
 
 METADATA_SECTION_TEMPLATE = """【分层元数据检索结果】
 {metadata_context}"""

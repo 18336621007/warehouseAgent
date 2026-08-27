@@ -1,6 +1,6 @@
 # State 与记忆系统架构
 
-> 最后更新：2026-08-12
+> 最后更新：2026-08-27
 > [返回文档索引](../文档索引.md)
 
 ## 一、设计目标
@@ -15,12 +15,12 @@ State 与记忆系统负责解决以下问题：
 
 当前实现采用：
 
-- `conversation_id / topic_id / request_id` 三层身份模型。
-- `conversation_id:topic_id` 作为 LangGraph checkpoint 的 `thread_id`。
+- `conversation_id / topic_id / request_id` 身份模型（**去 Topic 化**：`topic_id` 固定为会话标识，不再按查数任务切换）。
+- `conversation_id` 作为 LangGraph checkpoint 的 `thread_id`（整个对话共享一个 Checkpoint，完整历史跨问数保留）。
 - `AgentState` 作为父图统一 State。
-- `messages + add_messages` 作为 Topic 标准消息记忆。
+- `messages + add_messages` 作为对话标准消息记忆。
 - `MemorySaver` 作为进程内短期 Checkpointer。
-- MySQL + FAISS 示例库作为跨 Topic 的长期经验记忆。
+- MySQL + FAISS 示例库作为跨对话的长期经验记忆。
 
 ---
 
@@ -29,25 +29,23 @@ State 与记忆系统负责解决以下问题：
 | 标识 | 生命周期 | 含义 | 示例 |
 |---|---|---|---|
 | `conversation_id` | 一个前端对话 | 左侧会话列表中的完整聊天 | `6a8f...` |
-| `topic_id` | 一次独立查数任务 | 从提出问题到 Seeker 完成查询 | `b7c1...` |
+| `topic_id` | 对话级固定标识 | 去 Topic 化后仅作日志/状态标识，不再按问数切换 | `b7c1...` |
 | `request_id` | 一次请求 | 一次 HTTP 请求或 CLI 图调用 | `d92e...` |
 
-关系如下：
+关系如下（去 Topic 化后，整个对话共享一个 Checkpoint，每次请求在同一对话历史上前进）：
 
 ```mermaid
 flowchart TD
-    C["Conversation"] --> T1["Topic A：订单分析"]
-    C --> T2["Topic B：补贴分析"]
-    T1 --> R1["Request 1：原始问题"]
-    T1 --> R2["Request 2：选择候选表"]
-    T1 --> R3["Request 3：确认方案"]
-    T2 --> R4["Request 4：新问题"]
+    C["Conversation（一个 Checkpoint）"] --> R1["Request 1：原始问题"]
+    C --> R2["Request 2：追问/改选/确认方案"]
+    C --> R3["Request 3：新问数"]
+    C --> R4["Request 4：对新结果追问"]
 ```
 
 LangGraph 配置：
 
 ```python
-graph_thread_id = f"{conversation_id}:{topic_id}"
+graph_thread_id = conversation_id   # 去 Topic 化：整个对话共享一个 Checkpoint
 
 config = {
     "configurable": {
@@ -60,8 +58,8 @@ config = {
 
 - 产品 API 使用 `conversation_id`，不使用 `thread_id`。
 - `thread_id` 只作为 LangGraph Checkpointer 的框架配置字段。
-- 同一 Topic 的所有 Request 复用同一个 `graph_thread_id`。
-- Seeker 完成后，下一次查数创建新的 `topic_id`。
+- 同一对话的所有 Request 复用同一个 `graph_thread_id`（完整历史跨问数保留）。
+- 新问数不再创建新 `topic_id`；Planner 判定 `new_query` 时清空遗留 `confirmed_plan`。
 
 ---
 
@@ -78,11 +76,9 @@ classDiagram
     }
     class TopicState {
         messages
-        original_question
         current_user_input
+        effective_query
         topic_status
-        topic_summary
-        topic_started_at
         advisor_turns
         confirmed_plan
     }
@@ -144,11 +140,11 @@ agentTest/langgraph_app/state/
 
 | 字段 | 类型 | 主要写入者 | 生命周期 | 状态 | 说明 |
 |---|---|---|---|---|---|
-| `conversation_id` | `str` | Web/CLI | 一个前端对话 | 使用中 | 前端会话列表中的对话标识，一个 Conversation 可以包含多个 Topic。 |
-| `topic_id` | `str` | Web/CLI | 一次独立查数任务 | 使用中 | 隔离不同查数任务的业务状态，并与 `conversation_id` 共同组成 checkpoint `thread_id`。 |
+| `conversation_id` | `str` | Web/CLI | 一个前端对话 | 使用中 | 前端会话列表中的对话标识；去 Topic 化后同时作为 checkpoint `thread_id`。 |
+| `topic_id` | `str` | Web/CLI | 对话级固定标识 | 使用中 | 去 Topic 化后固定不变，仅作日志/状态标识，不再参与 checkpoint `thread_id` 组装。 |
 | `request_id` | `str` | Web/CLI | 一次 HTTP/CLI 调用 | 使用中 | 标识单次图调用，并用于生成消息 ID，防止同一请求重复追加用户或 Agent 消息。 |
 
-三个业务身份字段会被 Planner、Advisor、Seeker 自动继承；`graph_thread_id` 由 `conversation_id:topic_id` 派生并注入日志上下文。全链路日志使用四个身份字段定位请求，具体查询命令见 [日志使用与问题排查指南](../指南/日志使用与问题排查指南.md)。
+三个业务身份字段会被 Planner、Advisor、Seeker 自动继承；`graph_thread_id` 即 `conversation_id` 并注入日志上下文。全链路日志使用四个身份字段定位请求，具体查询命令见 [日志使用与问题排查指南](../指南/日志使用与问题排查指南.md)。
 
 ### 3.2 TopicState
 
@@ -157,24 +153,22 @@ agentTest/langgraph_app/state/
 | 字段 | 类型 | 主要写入者 | 主要读取者 | 状态 | 说明 |
 |---|---|---|---|---|---|
 | `messages` | `Annotated[list[AnyMessage], add_messages]` | Capture、Advisor、Seeker | Planner、Advisor、GenerateSQL、Evaluator | 使用中 | 当前 Topic 的标准消息历史。节点只返回新增消息，由 `add_messages` 按消息 ID 合并。 |
-| `original_question` | `str` | Planner 首轮初始化 | Planner、Advisor、Seeker、Evaluator | 使用中 | 当前 Topic 的首轮原始问题，同一 Topic 后续澄清轮次保持不变。 |
-| `effective_query` | `str` | Planner | Planner、Advisor、GenerateSQL、Evaluator、build_final_answer | 使用中 | Planner 每轮改写后的有效需求（需求基线），`original_question` 保留原文、本字段滚动更新；`build_final_answer` 以它作为回答基准。 |
+| `effective_query` | `str` | Planner | Planner、Advisor、GenerateSQL、Evaluator、build_final_answer | 使用中 | Planner 每轮改写后的有效需求（需求基线，已删除 `original_question`，本字段即唯一需求来源并滚动更新）；`build_final_answer` 以它作为回答基准。 |
 | `current_user_input` | `str` | Web/CLI | Capture、Planner、Advisor | 使用中 | 用户本轮真实输入，每个 Request 都会更新，例如候选序号、确认词或修改意见。 |
-| `topic_status` | `TopicStatus` | Capture、Planner、Advisor、Seeker 各阶段节点 | Web、CLI、恢复与监控流程 | 使用中 | 描述 Topic 当前生命周期阶段。现有节点在完成后写入下一业务阶段，Web/CLI 使用终态判断是否创建新 Topic。 |
+| `topic_status` | `TopicStatus` | Capture、Planner、Advisor、Seeker 各阶段节点 | Web、CLI、恢复与监控流程 | 使用中 | 描述当轮请求的阶段（去 Topic 化后不再创建新 Topic，仅作为请求推进标识）。 |
 | `topic_summary` | `str` | 后续摘要节点 | Planner、Advisor、问题改写节点 | 预留 | 对较早对话的压缩摘要，用于控制多轮消息 Token，不替代 `confirmed_plan`。 |
 | `topic_started_at` | `float` | 后续 Topic 初始化节点 | Evaluator、监控与超时处理 | 预留 | Topic 开始时间，计划使用 Unix 时间戳，用于计算完整 Topic 耗时。 |
 | `advisor_turns` | `int` | Advisor | Evaluator、前端或 CLI | 使用中 | Advisor 完成一次澄清回复后加一，用于评估澄清轮数和对话效率。 |
 | `confirmed_plan` | `QueryPlan` | Advisor、Planner | Planner、Seeker、GenerateSQL、Evaluator | 使用中 | 同一个键同时承载 `locked` 和 `confirmed` 两个阶段。Advisor 写入完整 `locked` 方案，Planner 在用户接受完整方案后写回 `confirmed` 方案；只有 `confirmed` 才允许进入 Seeker。 |
-| `analysis_spec` | `AnalysisSpec` | Planner、Advisor | Planner、Advisor、后续连续问答节点 | 使用中 | 保存指标概念、解析证据和 `pending_clarifications`。Planner 采用增量更新：模型判断 `user_selection` + 程序白名单校验，不能因短回答重建后丢失已确认字段。 |
+| `analysis_spec` | `AnalysisSpec` | Planner、Advisor | Planner、Advisor | 使用中 | 仅保留当轮意图（analysis_type/metric_mentions/dimension_mentions 等）；去 pending 后不再跨轮保存解析证据/候选快照，澄清靠对话历史 + `effective_query` 改写。 |
 | `last_query_result` | `QueryResultSnapshot` | `build_final_answer` 节点 | FollowUpAnalyzer、Planner | 使用中 | 保存上一轮结果引用、列、预览行、行数、实体键和 QueryPlan，用于“第一名”“这些”“刚才结果”等追问。 |
-| `pending_clarifications` | `list[PendingClarification]` | Advisor、Planner、澄清服务 | Planner、Advisor、FollowUpAnalyzer | 使用中 | 候选创建时固化 `clarification_id` 与 options；用户未选择同一概念时复用 open pending，选择通过白名单校验后清空。多 pending 冲突保护第二阶段接入。 |
-| `follow_up_context` | `FollowUpContext` | 第13课连续问答分析 | Planner、Seeker | 规划中 | 标记新查询、结果追问、方案修改或口径解释，并记录引用结果和变化槽位。 |
+| `follow_up_context` | `FollowUpContext` | （不再引入） | Planner、Seeker | 已评估不引入 | 结构化跟进状态经评估不引入，追问靠历史消息 + `effective_query` 还原。 |
 
 #### TopicStatus 可选值
 
 | 值 | 含义 | 当前状态 |
 |---|---|---|
-| `new` | Topic 首轮消息已捕获，尚未完成 Planner 分析 | 使用中 |
+| `new` | （去 Topic 化后不再使用） | 已移除 |
 | `clarifying` | Advisor 正在澄清，或 locked 方案正在等待用户最终确认 | 使用中 |
 | `confirmed` | Planner 已将 locked 方案升级为 confirmed，准备进入 Seeker | 使用中 |
 | `generating_sql` | Schema 已准备完成，或 SQL 修复后准备重新生成 | 使用中 |
@@ -182,7 +176,7 @@ agentTest/langgraph_app/state/
 | `executing` | SQL 已通过校验，进入 Hive 执行与结果整理阶段 | 使用中 |
 | `completed` | 最终回答已构建，包括正常空结果 | 使用中 |
 | `failed` | 已知业务失败或 SQL 达到最大修复次数后结束 | 部分使用 |
-| `cancelled` | 用户主动取消或系统终止 Topic | 预留 |
+| `cancelled` | 用户主动取消或系统终止请求 | 预留 |
 
 ### 3.3 BaseState
 

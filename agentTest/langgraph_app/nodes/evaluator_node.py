@@ -90,8 +90,8 @@ def build_evaluator_node(runtime):
     ])
 
     def evaluator_node(state: AgentState):
-        question = state.get("original_question", "")
-        effective_query = state.get("effective_query", "") or question
+        question = state.get("effective_query", "") or ""
+        effective_query = question
         route = state.get("route", "seeker")
         planner_reason = state.get("planner_reason", "")
         advisor_turns = state.get("advisor_turns", 0)

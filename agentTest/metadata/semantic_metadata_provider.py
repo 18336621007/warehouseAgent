@@ -1,10 +1,6 @@
 # 语义元数据 Provider，统一管理表定义和 Join 关系
-# 数据来源：
-#   - 人工配置的 semantic_metadata.json（兼容老接口）
-#   - 哈尔滨语义层 YAML（推荐来源，结构更完整）
-# 后续语义层扩展时，优先调用 SemanticLayerProvider，新增方法在末尾追加以保证兼容性
-import json
-import os
+# 数据来源：哈尔滨语义层 YAML（SemanticLayerProvider，唯一权威来源）
+# 已废弃 semantic_metadata.json（表/关系/粒度均由语义层 YAML 提供）
 from typing import Optional
 
 from agentTest.semantic_layer.semantic_layer_provider import (
@@ -16,113 +12,71 @@ from agentTest.semantic_layer.semantic_layer_provider import (
 class SemanticMetadataProvider:
     """语义元数据查询服务，为 JoinPlanner/TableCoverageAnalyzer/Planner 提供统一数据。
 
-    该类同时暴露两类数据：
-    1) 老接口（基于 semantic_metadata.json）：用于向后兼容 JoinPlanner
-    2) 新接口（基于 SemanticLayerProvider）：用于扩展能力（指标/实体/Join契约/物理表）
+    数据全部来自语义层 YAML（SemanticLayerProvider）：
+    - 指标（metrics）、实体（entities）、物理表（physical）、逻辑模型（semantic_models）
+    - Join 契约（join_contracts）、分区（partition）、候选键（candidate_keys）
     """
 
-    def __init__(
-        self,
-        config_path: Optional[str] = None,
-        semantic_layer: Optional[SemanticLayerProvider] = None,
-    ):
-        if config_path is None:
-            config_path = os.path.join(
-                os.path.dirname(__file__),
-                "semantic_metadata.json",
-            )
-        self.config_path = config_path
-        self._tables: list[dict] = []
-        self._relations: list[dict] = []
-        self._load()
-        # 新语义层：默认全局单例，可注入便于测试
+    def __init__(self, semantic_layer: Optional[SemanticLayerProvider] = None):
         self._semantic_layer = semantic_layer or get_semantic_layer_provider()
-
-    def _load(self):
-        """加载并校验语义元数据配置。"""
-        if not os.path.exists(self.config_path):
-            self._tables = []
-            self._relations = []
-            return
-
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            raise ValueError("semantic_metadata.json 必须是对象，包含 tables 和 relations")
-
-        self._tables = raw.get("tables") or []
-        all_relations = raw.get("relations") or []
-
-        # 只保留已启用的关系
-        self._relations = []
-        for rel in all_relations:
-            required = ["id", "left_table", "right_table", "left_key",
-                         "right_key", "cardinality", "enabled"]
-            missing = [f for f in required if f not in rel]
-            if missing:
-                raise ValueError(
-                    f"关系 {rel.get('id', '?')} 缺少必填字段: {', '.join(missing)}"
-                )
-            if rel["enabled"]:
-                self._relations.append(rel)
 
     # ── JoinPlanner 用 ──
 
     def get_relations_for_table(self, table_identifier: str) -> list[dict]:
-        """获取指定表参与的所有已启用关系。"""
-        result = []
-        for rel in self._relations:
-            if rel["left_table"] == table_identifier or rel["right_table"] == table_identifier:
-                result.append(rel)
-        return result
+        """获取指定表参与的所有合规 Join 契约（语义层 join_contracts）。"""
+        return self._semantic_layer.get_join_contracts_for_model(table_identifier)
 
     def get_relation_between(
         self, left_table: str, right_table: str
     ) -> list[dict]:
-        """获取两张表之间的直接关系（忽略方向）。"""
+        """获取两张表之间的直接 Join 契约（忽略方向）。"""
+        contracts = self._semantic_layer.get_all_join_contracts()
         result = []
-        for rel in self._relations:
-            if (rel["left_table"] == left_table and rel["right_table"] == right_table) or \
-               (rel["left_table"] == right_table and rel["right_table"] == left_table):
+        for rel in contracts:
+            if (rel.get("left_model") == left_table and rel.get("right_model") == right_table) or \
+               (rel.get("left_model") == right_table and rel.get("right_model") == left_table):
                 result.append(rel)
         return result
 
     def get_table_grain(self, table_identifier: str) -> str:
-        """获取指定表的数据粒度。"""
-        for t in self._tables:
-            if t.get("identifier") == table_identifier:
-                return t.get("grain", "")
+        """获取指定表的数据粒度（语义层 semantic_models grain.keys，逗号拼接）。"""
+        model = self._semantic_layer.get_semantic_model(table_identifier)
+        if model:
+            keys = (model.get("grain") or {}).get("keys") or []
+            if keys:
+                return ", ".join(str(k) for k in keys)
         return ""
 
     def get_table_primary_key(self, table_identifier: str) -> list[str]:
-        for t in self._tables:
-            if t.get("identifier") == table_identifier:
-                return t.get("primary_key") or []
+        """获取指定表的主键候选（语义层 physical grain.candidate_keys）。"""
+        info = self._semantic_layer.get_physical_table(table_identifier)
+        if info:
+            return list(info.get("candidate_keys") or [])
         return []
 
     def get_table_time_field(self, table_identifier: str) -> Optional[str]:
-        """获取指定表的时间字段。"""
-        for t in self._tables:
-            if t.get("identifier") == table_identifier:
-                return t.get("time_field")
-        return None
+        """获取指定表的时间字段（语义层 physical partition 中第一个非平台字段）。"""
+        partitions = self._semantic_layer.get_partition_fields(table_identifier)
+        for f in partitions:
+            if f not in ("pt_platform",):
+                return f
+        return partitions[0] if partitions else None
 
-    # ── 语义层用（未来扩展）──
+    # ── 枚举接口 ──
 
     def get_all_tables(self) -> list[dict]:
-        """获取所有已定义的表。"""
-        return list(self._tables)
+        """获取所有物理表（语义层 physical YAML）。"""
+        return self._semantic_layer.get_all_physical_tables()
 
     def get_all_enabled_relations(self) -> list[dict]:
-        """获取所有已启用关系。"""
-        return list(self._relations)
+        """获取所有合规 Join 契约（语义层 join_contracts）。"""
+        return self._semantic_layer.get_all_join_contracts()
 
     def reload(self):
-        """重新加载配置，用于热更新。"""
-        self._load()
+        """重新加载语义层配置，用于热更新。"""
+        self._semantic_layer.reload()
 
-    # ── 新语义层（SemanticLayerProvider）直通接口 ──
-    # 优先返回语义层 YAML 的权威结果，老 JSON 仅作 fallback。
+    # ── 语义层直通接口 ──
 
     @property
     def semantic_layer(self) -> SemanticLayerProvider:
@@ -147,10 +101,7 @@ class SemanticMetadataProvider:
         return self._semantic_layer.get_physical_table(full_name)
 
     def get_partition_fields(self, full_name: str) -> list[str]:
-        """获取指定物理表的分区字段（如 pt_dt, pt_platform）。这是程序的唯一真实来源。
-
-        替代依赖向量库猜测字段归属的旧实现。
-        """
+        """获取指定物理表的分区字段（如 pt_dt, pt_platform）。"""
         return self._semantic_layer.get_partition_fields(full_name)
 
     def get_table_fields(self, full_name: str) -> list[str]:
@@ -160,23 +111,6 @@ class SemanticMetadataProvider:
     def is_field_in_table(self, full_name: str, field_name: str) -> bool:
         """精确校验字段是否属于指定物理表（基于语义层 YAML 权威定义）"""
         return self._semantic_layer.is_field_in_table(full_name, field_name)
-
-    def get_table_time_field(self, table_identifier: str) -> Optional[str]:
-        """获取表的时间字段（兼容老接口；优先返回新语义层的 partition 第一个非平台字段）"""
-        # 老 JSON 优先（语义层兼容期，保留原始定义）
-        legacy = None
-        for t in self._tables:
-            if t.get("identifier") == table_identifier:
-                legacy = t.get("time_field")
-                break
-        if legacy:
-            return legacy
-        # Fallback：新语义层 partition 中第一个非 pt_platform 字段
-        partitions = self._semantic_layer.get_partition_fields(table_identifier)
-        for f in partitions:
-            if f not in ("pt_platform",):
-                return f
-        return partitions[0] if partitions else None
 
     def get_join_contract(self, left_model: str, right_model: str) -> Optional[dict]:
         """获取 join_contracts.yaml 中两表之间的合规 Join 路径"""
