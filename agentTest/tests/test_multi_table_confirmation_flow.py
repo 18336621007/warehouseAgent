@@ -257,7 +257,8 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
         contracts = provider.get_all_enabled_relations()
         target = next(
             (c for c in contracts
-             if c.get("right_model") == "dim_trip.dim_exchange_common_company_info_day"),
+             if c.get("left_model") == "dws_trip.dm_exchange_order_addition_info_hour"
+             and c.get("right_model") == "dim_trip.dim_exchange_common_company_info_day"),
             None,
         )
         self.assertIsNotNone(target)
