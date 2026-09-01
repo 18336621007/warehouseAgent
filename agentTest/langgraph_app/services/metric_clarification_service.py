@@ -56,7 +56,7 @@ class MetricClarificationService:
                 continue
             table = str(candidate.get("table") or "")
             table_short = table.split(".")[-1] if "." in table else table
-            options.append({
+            option = {
                 "index": index,
                 "mention": mention,
                 "field": str(field),
@@ -64,7 +64,18 @@ class MetricClarificationService:
                 "table_short": table_short,
                 "meaning": MetricAmbiguityValidator._build_meaning(candidate),
                 "comment": str(candidate.get("comment") or "")[:200],
-            })
+            }
+            # 过滤型候选：保留口径过滤信息，供展示/解析识别
+            if str(candidate.get("semantic_type") or "").lower() == "filter":
+                option["semantic_type"] = "filter"
+                for key in (
+                    "metric_id", "metric_name",
+                    "filter_field", "filter_value",
+                    "filter_label", "filter_model",
+                ):
+                    if candidate.get(key):
+                        option[key] = candidate[key]
+            options.append(option)
         return options
 
     @classmethod
@@ -293,7 +304,10 @@ class MetricClarificationService:
             raw_comment = MetricClarificationService._extract_comment_value(
                 option.get("comment") or "", "原始备注"
             )
-            if raw_comment:
+            if str(option.get("semantic_type") or "").lower() == "filter":
+                # 过滤型候选：label 用"指标（过滤标签）+ 过滤条件"口径文案
+                label = MetricClarificationService._build_option_label(option)
+            elif raw_comment:
                 label = raw_comment[:80]
             elif with_aliases:
                 label = MetricClarificationService._build_option_label(option)
@@ -337,7 +351,11 @@ class MetricClarificationService:
             table_suffix = f"，来源表：{table_short}" if table_short else ""
             # 展示分层：优先原始备注，无原始备注才回退系统推断别名
             label = MetricClarificationService._build_option_label(option)
-            lines.append(f"{index}. {label}（字段：{field}{table_suffix}）")
+            if str(option.get("semantic_type") or "").lower() == "filter":
+                # 过滤型候选：label 已含"按 xx=xx 过滤"口径，不再暴露合成字段标识
+                lines.append(f"{index}. {label}{table_suffix}")
+            else:
+                lines.append(f"{index}. {label}（字段：{field}{table_suffix}）")
         lines.append("请回复编号选择您需要的口径。")
         return "\n".join(lines)
 
@@ -362,6 +380,10 @@ class MetricClarificationService:
             table_suffix = f"，来源表：{table_short}" if table_short else ""
             # 与口径区别说明保持一致：原始备注优先，无备注才回退系统推断别名
             label = MetricClarificationService._build_option_label(option)
-            lines.append(f"{index}. {label}（字段：{field}{table_suffix}）")
+            if str(option.get("semantic_type") or "").lower() == "filter":
+                # 过滤型候选：label 已含"按 xx=xx 过滤"口径，不再暴露合成字段标识
+                lines.append(f"{index}. {label}{table_suffix}")
+            else:
+                lines.append(f"{index}. {label}（字段：{field}{table_suffix}）")
         lines.append("请回复编号、字段名或完整中文含义。")
         return "\n".join(lines)

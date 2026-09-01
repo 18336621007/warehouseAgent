@@ -185,6 +185,13 @@ def _build_shown_options(result, reranker, history_text, effective_query, user_i
     if not selected_fields:
         # 模型精选失败：回退程序排序前 RERANK_MIN_CANDIDATES 个
         selected_fields = complete_selection(candidates, [])
+    # 过滤型候选（如 A类→company_category=A）不参与模型精选：
+    # 合成字段模型难以按相关性排序，直接追加到展示尾部，保证口径候选可见
+    for candidate in candidates:
+        if str(candidate.get("semantic_type") or "").lower() == "filter":
+            field = str(candidate.get("field") or "")
+            if field and field not in selected_fields:
+                selected_fields.append(field)
     options = MetricClarificationService.build_shown_options(
         ambiguity, selected_fields, candidates
     )
@@ -491,6 +498,18 @@ def build_advisor_subgraph(runtime):
             hit_count=len(semantic_matches),
             metric_ids=[m.get("id", "") for m in semantic_matches],
             metric_names=[m.get("name", "") for m in semantic_matches],
+            metric_scores=[m.get("score", 0) for m in semantic_matches],
+            metric_confidences=[
+                round(float(m.get("confidence", 0) or 0), 2)
+                for m in semantic_matches
+            ],
+            top_confidence=round(
+                max(
+                    (float(m.get("confidence", 0) or 0) for m in semantic_matches),
+                    default=0.0,
+                ),
+                2,
+            ),
         )
         metric_context_text = format_metric_context(semantic_matches)
 
@@ -499,6 +518,27 @@ def build_advisor_subgraph(runtime):
         # 多指标各自唯一匹配时同样短路（如"租赁中订单、新增订单"分别唯一命中两个指标）
         _semantic_previous_resolutions: list[dict] = []
         _semantic_mentions = list(current_spec.get("metric_mentions") or [])
+        # 存在"指标+维度值"组合候选（如 A类→company_category=A）时，即使指标唯一命中
+        # 也不能短路：修饰词存在歧义（渠道A vs 代理商A），必须保留候选发现与澄清
+        _semantic_filter_present = False
+        if _semantic_mentions:
+            from agentTest.semantic_layer.semantic_layer_provider import (
+                get_semantic_layer_provider,
+            )
+            _filter_terms = (
+                list(_semantic_mentions)
+                + list(current_spec.get("dimension_mentions") or [])
+            )
+            _filter_matched = match_metrics_from_query(
+                " ".join(_semantic_mentions), limit=8
+            )
+            if _filter_matched:
+                _semantic_filter_present = bool(
+                    get_semantic_layer_provider()
+                    .discover_dimension_filter_candidates(
+                        _filter_terms, _filter_matched
+                    )
+                )
         for _sm_mention in _semantic_mentions:
             _sm_lower = str(_sm_mention).strip().lower()
             if not _sm_lower:
@@ -508,7 +548,7 @@ def build_advisor_subgraph(runtime):
                 if _sm_lower in str(m.get("name", "")).lower()
                 or any(_sm_lower in str(a).lower() for a in (m.get("aliases") or []))
             ]
-            if len(_sm_matched) == 1:
+            if len(_sm_matched) == 1 and not _semantic_filter_present:
                 _sm_winner = _sm_matched[0]
                 _semantic_previous_resolutions.append({
                     "mention": _sm_mention,
@@ -977,6 +1017,7 @@ def build_advisor_subgraph(runtime):
                     for info in resolved_concept_resolutions.values()
                     if isinstance(info, dict) and info.get("field")
                     and info.get("concept_type") != "dimension"
+                    and str(info.get("semantic_type") or "") != "filter"
                 ]
                 if metric_fields:
                     submitted_measures = list(proposed_plan["measures"])
@@ -1002,6 +1043,39 @@ def build_advisor_subgraph(runtime):
                         "advisor_agent",
                         "已按用户确认维度合并 dimensions: "
                         f"{submitted_dimensions} -> {proposed_plan['dimensions']}",
+                    )
+                # 过滤型口径（如 A类→company_category='A'）：落 filters 槽位，
+                # 指标保留在 measures，过滤字段所在维表加入 tables 与 field_sources
+                filter_entries = [
+                    info
+                    for info in resolved_concept_resolutions.values()
+                    if isinstance(info, dict)
+                    and str(info.get("semantic_type") or "") == "filter"
+                    and info.get("filter_field") and info.get("filter_value")
+                ]
+                if filter_entries:
+                    new_filter_parts = [
+                        f"{info['filter_field']}='{info['filter_value']}'"
+                        for info in filter_entries
+                    ]
+                    combined = " AND ".join(new_filter_parts)
+                    existing_filters = str(proposed_plan.get("filters") or "").strip()
+                    proposed_plan["filters"] = (
+                        f"{existing_filters} AND {combined}"
+                        if existing_filters else combined
+                    )
+                    for info in filter_entries:
+                        fmodel = str(info.get("filter_model") or "")
+                        ffield = str(info.get("filter_field") or "")
+                        if fmodel and fmodel not in proposed_plan["tables"]:
+                            proposed_plan["tables"] = list(proposed_plan["tables"]) + [fmodel]
+                        if ffield and fmodel:
+                            fs = proposed_plan.get("field_sources") or []
+                            if f"{fmodel}.{ffield}" not in fs:
+                                proposed_plan["field_sources"] = list(fs) + [f"{fmodel}.{ffield}"]
+                    log_node_event(
+                        "advisor_agent",
+                        "已按用户确认口径追加过滤: " + combined,
                     )
 
             if ambiguity_result is not None:

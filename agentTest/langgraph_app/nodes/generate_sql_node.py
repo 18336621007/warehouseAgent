@@ -60,9 +60,17 @@ def _normalize_join_keys(keys) -> list[str]:
     return [key for key in (keys or []) if isinstance(key, str) and key]
 
 
+def _normalize_join_type(join_type: str) -> str:
+    """把语义层契约的 join_type 规范化为 SQL JOIN 关键字（'join' 视为 INNER）。"""
+    t = (join_type or "LEFT").upper()
+    if t in ("LEFT", "RIGHT", "INNER", "FULL", "CROSS"):
+        return t
+    return "INNER" if t == "JOIN" else "LEFT"
+
+
 def _invert_join_type(join_type: str) -> str:
     """Join边反向使用时同步反转左右连接类型。"""
-    normalized = (join_type or "LEFT").upper()
+    normalized = _normalize_join_type(join_type)
     if normalized == "LEFT":
         return "RIGHT"
     if normalized == "RIGHT":
@@ -179,7 +187,7 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
             # 被连接表的分区和过滤条件放入ON，避免LEFT JOIN被WHERE条件退化为INNER JOIN。
             on_parts.extend(table_conditions.pop(target_table, []))
             from_clause += (
-                f"\n{join_type} JOIN {target_table} {target_alias} "
+                f"\n{_normalize_join_type(join_type)} JOIN {target_table} {target_alias} "
                 f"ON {' AND '.join(on_parts)}"
             )
             joined_tables.add(target_table)

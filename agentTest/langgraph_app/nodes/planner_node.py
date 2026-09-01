@@ -325,7 +325,26 @@ def build_planner_node(runtime):
             # 去 Topic 化：语义层匹配用本轮输入（完整历史在 history_context 中）
             metric_search_text = current_user_input
             semantic_matches = match_metrics_from_query(metric_search_text, limit=5)
-            # 语义层命中日志：便于排查"走了语义层还是召回"
+            metric_context_text = format_metric_context(semantic_matches)
+            # 语义层唯一命中：按置信度判定（对齐 skill 置信度规则），
+            # 完全相等/近义前缀（confidence>=0.9）才短路跳过 FAISS 双路召回；
+            # 一般子串命中（0.55~0.9）视为部分匹配，保留候选发现与澄清
+            _top_confidence = (
+                float(semantic_matches[0].get("confidence", 0) or 0)
+                if semantic_matches else 0.0
+            )
+            _semantic_unique = (
+                len(semantic_matches) == 1 and _top_confidence >= 0.9
+            ) or (
+                len(semantic_matches) >= 2
+                and _top_confidence >= 0.9
+                and (
+                    float(semantic_matches[0].get("score", 0) or 0)
+                    - float(semantic_matches[1].get("score", 0) or 0)
+                ) >= SEMANTIC_UNIQUE_GAP_THRESHOLD
+            )
+            # 语义层命中日志：记录每个指标的分数/置信度与短路判定，
+            # 便于排查"走了语义层还是召回"
             log_metric_event(
                 "semantic.match",
                 node_name="planner",
@@ -333,16 +352,13 @@ def build_planner_node(runtime):
                 hit_count=len(semantic_matches),
                 metric_ids=[m.get("id", "") for m in semantic_matches],
                 metric_names=[m.get("name", "") for m in semantic_matches],
-            )
-            metric_context_text = format_metric_context(semantic_matches)
-            # 语义层唯一命中：命中 1 个，或 top1-top2 得分差达到阈值 → 跳过 FAISS 双路召回
-            _semantic_unique = (
-                len(semantic_matches) == 1
-                or (
-                    len(semantic_matches) >= 2
-                    and (semantic_matches[0].get("score", 0) - semantic_matches[1].get("score", 0))
-                    >= SEMANTIC_UNIQUE_GAP_THRESHOLD
-                )
+                metric_scores=[m.get("score", 0) for m in semantic_matches],
+                metric_confidences=[
+                    round(float(m.get("confidence", 0) or 0), 2)
+                    for m in semantic_matches
+                ],
+                top_confidence=round(_top_confidence, 2),
+                semantic_unique=_semantic_unique,
             )
 
             # 语义层唯一命中时跳过 FAISS 双路召回，直接用语义层推荐的来源构建元数据

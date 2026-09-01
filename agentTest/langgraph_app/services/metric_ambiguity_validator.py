@@ -43,6 +43,12 @@ def _is_dimension_candidate(candidate: dict) -> bool:
     return semantic_type == "dimension" or "【维度】" in comment
 
 
+def _is_filter_candidate(candidate: dict) -> bool:
+    """判断候选是否为"指标+过滤"型（如 A类→company_category=A）。"""
+    semantic_type = str(candidate.get("semantic_type") or "").lower()
+    return semantic_type == "filter"
+
+
 def _mention_matches_candidate(mention: str, candidate: dict) -> bool:
     """指标概念与候选的关联判断：字段名、注释或别名包含该概念词。"""
     text = (mention or "").strip().lower()
@@ -110,6 +116,24 @@ class MetricAmbiguityValidator:
             if mention:
                 llm_map[mention] = item
 
+        # 维度枚举值候选发现：指标概念额外生成"指标+过滤"型候选（如 A类→company_category=A）。
+        # 只在存在指标概念时触发；范围收敛到指标 source_model + join 契约可达模型。
+        filter_candidates: list[dict] = []
+        if any(concept_type == "metric" for _, concept_type in concepts):
+            from agentTest.semantic_layer.metric_matcher import match_metrics_from_query
+            from agentTest.semantic_layer.semantic_layer_provider import (
+                get_semantic_layer_provider,
+            )
+            mention_terms = [mention for mention, _ in concepts]
+            matched_metrics = match_metrics_from_query(" ".join(mention_terms), limit=8)
+            if matched_metrics:
+                filter_candidates = (
+                    get_semantic_layer_provider().discover_dimension_filter_candidates(
+                        mention_terms,
+                        matched_metrics,
+                    )
+                )
+
         resolutions: list[dict] = []
         ambiguities: list[dict] = []
         clarification_options: list[dict] = []
@@ -125,6 +149,21 @@ class MetricAmbiguityValidator:
                 truncate=truncate,
                 concept_type=concept_type,
             )
+            # 指标概念把"指标+过滤"型候选并入候选池（过滤候选用合成 field 保证唯一，
+            # 不参与 measure/dimension 分流，由 _build_clarification_options 特殊渲染）
+            if concept_type == "metric" and filter_candidates:
+                candidates = self._merge_filter_candidates(
+                    candidates, filter_candidates,
+                )
+            # 维度概念无任何候选（字段召回与过滤候选均为空）时跳过，
+            # 避免 0 候选 ambiguity 阻塞锁定；该修饰词语义由指标候选承载
+            if concept_type == "dimension" and not candidates:
+                log_metric_event(
+                    "metric_resolution.skipped",
+                    mention=mention,
+                    reason="维度概念无候选",
+                )
+                continue
             previous = previous_map.get(mention)
             llm_resolution = llm_map.get(mention)
 
@@ -251,15 +290,43 @@ class MetricAmbiguityValidator:
         plan_resolutions = {}
         for item in result.resolutions:
             if item.get("selected_field"):
-                plan_resolutions[item["mention"]] = {
+                entry = {
                     "field": item["selected_field"],
                     "table": item.get("selected_table", ""),
                     "source": item.get("resolution_source", "unknown"),
                     "concept_type": item.get("concept_type") or "metric",
                 }
+                # 过滤型候选：保留口径过滤信息，供 Advisor 落 filters
+                if item.get("semantic_type") == "filter":
+                    entry["semantic_type"] = "filter"
+                    for key in (
+                        "metric_id", "metric_name",
+                        "filter_field", "filter_value",
+                        "filter_label", "filter_model",
+                    ):
+                        if item.get(key):
+                            entry[key] = item[key]
+                plan_resolutions[item["mention"]] = entry
         return plan_resolutions
 
     # ── 候选收集与匹配 ──────────────────────────────────────
+
+    @staticmethod
+    def _merge_filter_candidates(
+        candidates: list[dict],
+        filter_candidates: list[dict],
+    ) -> list[dict]:
+        """把"指标+过滤"候选并入字段候选池，按合成 field 去重。"""
+        if not filter_candidates:
+            return candidates
+        seen = {str(c.get("field") or "") for c in candidates}
+        merged = list(candidates)
+        for fc in filter_candidates:
+            field = str(fc.get("field") or "")
+            if field and field not in seen:
+                seen.add(field)
+                merged.append(fc)
+        return merged
 
     def _collect_candidates(
         self,
@@ -615,7 +682,7 @@ class MetricAmbiguityValidator:
         source: str,
         concept_type: str = "metric",
     ) -> dict:
-        return {
+        result = {
             "mention": mention,
             "concept_type": concept_type,
             "status": "resolved",
@@ -624,6 +691,17 @@ class MetricAmbiguityValidator:
             "resolution_source": source,
             "candidates": [candidate],
         }
+        # 过滤型候选：保留口径过滤信息，供 to_plan_resolutions 落 filters
+        if _is_filter_candidate(candidate):
+            result["semantic_type"] = "filter"
+            for key in (
+                "metric_id", "metric_name",
+                "filter_field", "filter_value",
+                "filter_label", "filter_model",
+            ):
+                if candidate.get(key):
+                    result[key] = candidate[key]
+        return result
 
     @staticmethod
     def _build_ambiguity(
@@ -645,6 +723,14 @@ class MetricAmbiguityValidator:
     def _build_meaning(candidate: dict) -> str:
         """从候选提取一句简洁中文含义：原始备注 > 首个别名 > 短说明 > 注释截断。"""
         comment = str(candidate.get("comment") or "")
+        # 过滤型候选：口径 = 指标名（过滤标签），按过滤字段=值过滤
+        if _is_filter_candidate(candidate):
+            metric_name = candidate.get("metric_name", "")
+            label = candidate.get("filter_label", "")
+            filter_field = candidate.get("filter_field", "")
+            filter_value = candidate.get("filter_value", "")
+            head = f"{metric_name}（{label}）" if metric_name and label else (label or "")
+            return f"{head}，按 {filter_field}={filter_value} 过滤"
         # 原始备注优先，确保展示口径与报表自带备注一致
         for line in comment.splitlines():
             if line.startswith("原始备注:"):
@@ -672,12 +758,23 @@ class MetricAmbiguityValidator:
         ):
             table = str(candidate.get("table") or "")
             table_short = table.split(".")[-1] if "." in table else table
-            options.append({
+            option = {
                 "index": index,
                 "field": candidate.get("field", ""),
                 "table": table,
                 "table_short": table_short,
                 "meaning": MetricAmbiguityValidator._build_meaning(candidate),
                 "comment": str(candidate.get("comment") or "")[:200],
-            })
+            }
+            # 过滤型候选：保留口径过滤信息，供展示/解析识别
+            if _is_filter_candidate(candidate):
+                option["semantic_type"] = "filter"
+                for key in (
+                    "metric_id", "metric_name",
+                    "filter_field", "filter_value",
+                    "filter_label", "filter_model",
+                ):
+                    if candidate.get(key):
+                        option[key] = candidate[key]
+            options.append(option)
         return options

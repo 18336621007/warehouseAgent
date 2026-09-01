@@ -1,6 +1,7 @@
 # 查询方案领域服务，集中处理方案锁定、确认和校验
 from copy import deepcopy
 from datetime import datetime
+import re
 
 from agentTest.langgraph_app.state.query_plan import QueryPlan
 from agentTest.langgraph_app.state.query_plan import validate_query_plan
@@ -19,6 +20,33 @@ def _deduplicate(values: list[str]) -> list[str]:
 
     return result
 
+
+
+def _distribute_shared_filters(
+    filters: str, source_map: dict, primary_table: str
+) -> dict:
+    """按过滤字段归属把全局 filters 分发到对应表：{table: filter_sql}。
+
+    解析 "field='value' AND ..." 每段，取前导字段名，用 source_map 定位所属表；
+    字段未声明或解析失败的过滤段回退主表，避免维表过滤字段被挂到主表 table_plan。
+    """
+    result: dict[str, list[str]] = {}
+    if not filters or not filters.strip():
+        return {}
+    segments = re.split(r"\s+AND\s+", filters.strip(), flags=re.IGNORECASE)
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        m = re.match(
+            r"^(?:`?[A-Za-z_]\w*`?\.)?`?([A-Za-z_]\w*)`?\s*(?:=|<>|!=|>=|<=|>|<|IN(?:\s|\()|LIKE(?:\s|\())",
+            seg,
+            re.IGNORECASE,
+        )
+        field = m.group(1) if m else ""
+        table = source_map.get(field) or primary_table
+        result.setdefault(table, []).append(seg)
+    return {t: " AND ".join(v) for t, v in result.items()}
 
 
 def _normalize_concept_resolutions(value) -> dict:
@@ -157,6 +185,11 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
     fields = list(measures) + list(dimensions)
     if time_field:
         fields.append(time_field)
+    # 过滤字段（如 A类→company_category）只用于过滤不进入 SELECT/GROUP BY，
+    # 但需登记进 fields 供字段覆盖分析定位归属表，保证维表参与 Join 规划
+    for _filter_field in (source_map or {}):
+        if _filter_field and _filter_field not in fields:
+            fields.append(_filter_field)
 
     plan["fields"] = _deduplicate(fields)
     # optional fields passthrough
@@ -180,6 +213,10 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
     shared_range = plan.get("time_range", "昨天")
     shared_filters = plan.get("filters", "")
     primary_table = plan.get("table", "")
+    # 全局 filters 按过滤字段归属分发到对应表，未声明归属的过滤段回退主表
+    _filters_by_table = _distribute_shared_filters(
+        shared_filters, source_map, primary_table
+    )
     advisor_plan_map = {
         table_plan.get("table", ""): table_plan
         for table_plan in advisors_table_plans
@@ -191,10 +228,8 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
     for table_name in all_tables:
         source_plan = advisor_plan_map.get(table_name) or {}
         source_filters = source_plan.get("filters", "")
-        # 全局filters只兼容主表；其他表必须使用各自table_plan中的业务过滤。
-        table_filters = source_filters or (
-            shared_filters if table_name == primary_table else ""
-        )
+        # 表自身声明的过滤优先；未声明时用全局过滤按字段归属分发的条件
+        table_filters = source_filters or _filters_by_table.get(table_name, "")
         normalized_table_plans.append({
             "table": table_name,
             "time_field": source_plan.get("time_field") or shared_time,
