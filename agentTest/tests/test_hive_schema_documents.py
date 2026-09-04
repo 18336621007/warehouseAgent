@@ -1,4 +1,4 @@
-from agentTest.db.hive_guardrails import ALLOWED_HIVE_TABLES
+from agentTest.db.hive_guardrails import ALLOWED_TABLES
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.rag.schema_document_builder import SchemaDocumentBuilder
 from agentTest.rag.schema_snapshot_service import SchemaSnapshotService

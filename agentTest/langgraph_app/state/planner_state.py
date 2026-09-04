@@ -11,7 +11,7 @@ class PlannerState(BaseState, PlannerHandoffState, total=False):
     # Planner 置信度用于控制澄清和直接查询的边界
     planner_confidence: float
 
-    # Planner 负责检查方案并处理最终确认
+    # Planner 是唯一路由者，负责判定 seeker/advisor 并落盘最终方案
     confirmed_plan: QueryPlan         # 当前查询方案（draft/locked/confirmed）
 
     # 连续问答类型：new_query / plan_refinement / result_follow_up / clarification_explanation

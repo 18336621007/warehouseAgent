@@ -1,6 +1,6 @@
 ﻿# 该文件用于测试基于真实 Hive metadata 构建 schema_context 的结果是否稳定，
 # 重点验证候选表、候选字段是否包含预期业务语义字段，便于后续接入 RAG。
-from agentTest.db.hive_guardrails import ALLOWED_HIVE_TABLES
+from agentTest.db.hive_guardrails import ALLOWED_TABLES
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.schema.schema_context_builder import SchemaContextBuilder
 from agentTest.tools.schema_tool import SchemaTool
@@ -70,8 +70,8 @@ def run_schema_context_tests():
             if expected_table not in table_names:
                 raise AssertionError(f"未召回预期表: {expected_table}")
 
-            if ALLOWED_HIVE_TABLES:
-                invalid_tables = [table_name for table_name in table_names if table_name not in ALLOWED_HIVE_TABLES]
+            if ALLOWED_TABLES:
+                invalid_tables = [table_name for table_name in table_names if table_name not in ALLOWED_TABLES]
                 if invalid_tables:
                     raise AssertionError(f"召回了白名单外表: {invalid_tables}")
 

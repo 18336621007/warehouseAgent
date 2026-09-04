@@ -45,10 +45,16 @@ def build_retrieve_schema_node(runtime):
             coverage = coverage_analyzer.analyze(confirmed_plan)
 
             if coverage.uncovered_fields:
-                raise ValueError(
+                # 方案不可行：交由上级回 Planner 修复，不再直接抛异常
+                plan_error_msg = (
                     "以下字段无法映射到物理表，请确认字段名是否正确："
                     + ", ".join(coverage.uncovered_fields)
                 )
+                log_node_error("retrieve_schema", error=plan_error_msg, ms=elapsed_ms(timer))
+                return {
+                    "seeker_plan_error": plan_error_msg,
+                    "topic_status": "failed",
+                }
 
             log_node_event(
                 "retrieve_schema",
@@ -66,7 +72,8 @@ def build_retrieve_schema_node(runtime):
 
                 if not join_result.success:
                     # 安全拒绝：缺少关系配置且不允许 AI 推断
-                    error_msg = (
+                    # 方案不可行：交由上级回 Planner 修复，或最终给用户具体提示
+                    plan_error_msg = (
                         "当前查询涉及多张表，但缺少必要的关联关系配置，"
                         "无法安全执行 Join：\n"
                         + "\n".join(
@@ -75,8 +82,11 @@ def build_retrieve_schema_node(runtime):
                         )
                         + "\n请联系数据管理员补充语义层 join_contracts 中的表关系配置。"
                     )
-                    log_node_error("retrieve_schema", error=error_msg, ms=elapsed_ms(timer))
-                    raise ValueError(error_msg)
+                    log_node_error("retrieve_schema", error=plan_error_msg, ms=elapsed_ms(timer))
+                    return {
+                        "seeker_plan_error": plan_error_msg,
+                        "topic_status": "failed",
+                    }
 
                 # Join 路径已找到（或允许 AI 推断），更新 confirmed_plan
                 confirmed_plan["joins"] = join_result.join_edges

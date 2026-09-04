@@ -1,27 +1,35 @@
-# Planner 调度节点：FAISS 检索增强元数据 → LLM 结构化解析 → 模糊度判定
+# Planner 调度节点：FAISS 检索增强元数据 → LLM 结构化解析 → 路由判定
 #
-# Planner 是唯一的调度中心：LLM 语义判断为主，FAISS 仅做 full 时的极端兜底。
-# 三步流程（对齐论文 SQL-MARS 的 Planner 设计）：
-#   ① FAISS 检索：用余弦相似度召回 top-k 增强元数据
-#   ② LLM 解析：将召回元数据 + 用户问题 + 用户实际输入 + 已确认方案 + Advisor 上轮回复传给 LLM
-#   ③ 阈值判定：模糊需求进入 Advisor；明确需求先由 Advisor 锁定方案；
-#       只有用户最终确认 locked 方案后才能进入 Seeker
-from copy import deepcopy
-
-from langchain.agents.middleware.todo import Todo
+# Planner 是唯一的路由者：由 LLM 判定本轮进入 Seeker（直接执行）还是 Advisor（澄清/核验）。
+# 流程：
+#   ① 语义层 grep + FAISS/BM25 检索增强元数据
+#   ② LLM 解析：输出 effective_query / route / 槽位 / semantic_metrics（置信度）
+#   ③ 路由：route=seeker 时由语义层确定性构建方案（plan_synthesizer），校验通过才执行；
+#       构建失败或 route=advisor 时进入 Advisor
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage
-from agentTest.langgraph_app.services.query_plan_service import confirm_query_plan
-from agentTest.langgraph_app.services.metric_clarification_service import MetricClarificationService
+from agentTest.langgraph_app.services.plan_synthesizer import (
+    build_plan_from_semantic,
+    finalize_draft_plan,
+)
 from agentTest.semantic_layer.metric_matcher import (
     format_metric_context,
-    match_metrics_from_query,
+    grep_metrics_from_keywords,
+    resolve_metric_chain,
 )
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
-from agentTest.langgraph_app.prompts.planner_prompt import PlannerOutput, PLANNER_SYSTEM_PROMPT, PLANNER_USER_TEMPLATE, METADATA_SECTION_TEMPLATE
+from agentTest.langgraph_app.prompts.planner_prompt import (
+    PlannerOutput,
+    SemanticKeywordsOutput,
+    PLANNER_SYSTEM_PROMPT,
+    PLANNER_USER_TEMPLATE,
+    PLANNER_KEYWORD_SYSTEM_PROMPT,
+    PLANNER_KEYWORD_USER_TEMPLATE,
+    METADATA_SECTION_TEMPLATE,
+)
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
-from agentTest.langgraph_app.runtime.graph_logger import log_node_end, log_node_event
+from agentTest.langgraph_app.runtime.graph_logger import log_node_end
 from agentTest.langgraph_app.runtime.graph_logger import log_example_retrieved
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
@@ -36,9 +44,13 @@ from agentTest.config.planner import (
     COLUMN_SEARCH_K,
     PER_TABLE_COLUMN_QUOTA,
     HIGH_SIMILARITY_THRESHOLD,
-    MAX_HIGH_SIMILARITY_COUNT
 )
-from agentTest.config.semantic import SEMANTIC_UNIQUE_GAP_THRESHOLD
+from agentTest.config.semantic import (
+    SEMANTIC_UNIQUE_GAP_THRESHOLD,
+    SEMANTIC_GREP_TOP_K,
+    SEMANTIC_CONFIDENCE_UNIQUE,
+    SEMANTIC_CONFIDENCE_CANDIDATE,
+)
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 
 
@@ -165,91 +177,6 @@ def _recall_columns(column_vector_store, question: str, table_scope: list[str]) 
         docs.append((doc, distance))
     return docs
 
-
-def _apply_user_selection_to_draft(confirmed_plan: dict, selected_resolution: dict) -> dict:
-    """用户选择/改选口径后，Planner 将选择落到共享方案草稿：
-    更新该概念的 concept_resolutions，并把 measures/fields/order_by 中旧字段替换为最新选择，
-    方案状态回到 draft（Advisor 下一轮在此基础上继续完善或直接锁定）。
-
-    仅当方案已存在且能反查该概念旧字段时才改写；否则返回 None，
-    由 Advisor 通过 update_draft_plan 落草稿，避免凭空造方案。
-    """
-    plan = deepcopy(confirmed_plan or {})
-    if not plan or not selected_resolution:
-        return None
-    mention = str(selected_resolution.get("mention") or "")
-    new_field = str(selected_resolution.get("selected_field") or "")
-    concept_type = str(selected_resolution.get("concept_type") or "metric")
-    # 指标概念落 measures，维度概念落 dimensions
-    target_key = "dimensions" if concept_type == "dimension" else "measures"
-    if not mention or not new_field:
-        return None
-    concepts = plan.get("concept_resolutions") or {}
-    if not isinstance(concepts, dict):
-        concepts = {}
-    old_field = ""
-    previous = concepts.get(mention)
-    if isinstance(previous, dict):
-        old_field = str(previous.get("field") or "")
-    if not old_field:
-        # 方案尚未记录该概念解析：确认的是新维度字段时直接落到 dimensions，
-        # 保证“负责人”这类属性字段不丢失；指标概念仍交由 Advisor 重建
-        if concept_type != "dimension":
-            return None
-        dimensions = list(plan.get("dimensions") or [])
-        if new_field not in dimensions:
-            plan["dimensions"] = dimensions + [new_field]
-        concepts = dict(concepts)
-        concepts[mention] = {
-            "field": new_field,
-            "table": str(selected_resolution.get("selected_table") or ""),
-            "source": "explicit_user",
-            "concept_type": concept_type,
-        }
-        plan["concept_resolutions"] = concepts
-        plan["status"] = "draft"
-        plan.pop("locked_at", None)
-        plan.pop("confirmed_at", None)
-        return plan
-    concepts = dict(concepts)
-    concepts[mention] = {
-        "field": new_field,
-        "table": str(selected_resolution.get("selected_table") or ""),
-        "source": "explicit_user",
-        "concept_type": concept_type,
-    }
-    plan["concept_resolutions"] = concepts
-    # 按概念类型分流：替换目标列表中的旧字段；维度字段缺失时追加保证不丢失
-    if old_field in (plan.get(target_key) or []):
-        plan[target_key] = [
-            new_field if m == old_field else m
-            for m in (plan.get(target_key) or [])
-        ]
-    elif concept_type == "dimension":
-        dimensions = list(plan.get("dimensions") or [])
-        if new_field not in dimensions:
-            plan["dimensions"] = dimensions + [new_field]
-    if old_field in (plan.get("fields") or []):
-        plan["fields"] = [
-            new_field if f == old_field else f
-            for f in (plan.get("fields") or [])
-        ]
-    # order_by 中的排序字段同步替换
-    order_by = list(plan.get("order_by") or [])
-    replaced_order = False
-    for item in order_by:
-        if isinstance(item, dict) and item.get("field") == old_field:
-            item["field"] = new_field
-            replaced_order = True
-    if replaced_order:
-        plan["order_by"] = order_by
-    # 改选后旧方案锁定/确认状态失效，回到草稿阶段
-    plan["status"] = "draft"
-    plan.pop("locked_at", None)
-    plan.pop("confirmed_at", None)
-    return plan
-
-
 def build_planner_node(runtime):
     # 三层索引中的表层和字段层
     table_vector_store = runtime["table_vector_store"]
@@ -268,6 +195,13 @@ def build_planner_node(runtime):
     )
     # with_structured_output：告诉 LLM 按 PlannerOutput 的格式返回 JSON
     structured_llm = chat_openai.with_structured_output(PlannerOutput)
+
+    # 第0层关键词提取：独立小调用（只输出 semantic_keywords），避免拆词噪声进入完整解析
+    keyword_structured_llm = chat_openai.with_structured_output(SemanticKeywordsOutput)
+    keyword_prompt = ChatPromptTemplate.from_messages([
+        ("system", PLANNER_KEYWORD_SYSTEM_PROMPT),
+        ("human", PLANNER_KEYWORD_USER_TEMPLATE),
+    ])
 
     # 组装 Prompt：system 定义角色和规则，human 传入用户问题和检索到的元数据
     prompt = ChatPromptTemplate.from_messages([
@@ -321,63 +255,83 @@ def build_planner_node(runtime):
 
             retrieval_question = "\n".join(retrieval_parts)
 
-            # ── 语义层优先匹配：gap >= 阈值时跳过 FAISS 召回，直接使用语义层推荐的来源 ──
-            # 去 Topic 化：语义层匹配用本轮输入（完整历史在 history_context 中）
-            metric_search_text = current_user_input
-            semantic_matches = match_metrics_from_query(metric_search_text, limit=5)
+            # ── 第0层：LLM 拆业务检索词（对齐 skill 关键词 grep）──
+            # 独立小调用只输出 semantic_keywords，避免拆词噪声进入完整解析
+            history_context = _build_history_context(state.get("messages") or [])
+            keyword_output = keyword_structured_llm.invoke(
+                keyword_prompt.invoke({
+                    "question": current_user_input,
+                    "history": history_context or "无",
+                })
+            )
+            semantic_keywords = [
+                str(k).strip()
+                for k in (keyword_output.semantic_keywords or [])
+                if str(k).strip()
+            ]
+            log_sub_info(f"semantic_keywords: {semantic_keywords}", node_name="planner")
+
+            # ── 第1层：全文 grep 检索语义层指标（含 notes/definition，避免备注命中静默漏召）──
+            semantic_matches = grep_metrics_from_keywords(
+                semantic_keywords, limit=SEMANTIC_GREP_TOP_K
+            )
             metric_context_text = format_metric_context(semantic_matches)
-            # 语义层唯一命中：按置信度判定（对齐 skill 置信度规则），
-            # 完全相等/近义前缀（confidence>=0.9）才短路跳过 FAISS 双路召回；
-            # 一般子串命中（0.55~0.9）视为部分匹配，保留候选发现与澄清
-            _top_confidence = (
-                float(semantic_matches[0].get("confidence", 0) or 0)
-                if semantic_matches else 0.0
-            )
-            _semantic_unique = (
-                len(semantic_matches) == 1 and _top_confidence >= 0.9
-            ) or (
-                len(semantic_matches) >= 2
-                and _top_confidence >= 0.9
-                and (
-                    float(semantic_matches[0].get("score", 0) or 0)
-                    - float(semantic_matches[1].get("score", 0) or 0)
-                ) >= SEMANTIC_UNIQUE_GAP_THRESHOLD
-            )
-            # 语义层命中日志：记录每个指标的分数/置信度与短路判定，
-            # 便于排查"走了语义层还是召回"
             log_metric_event(
-                "semantic.match",
+                "semantic.grep",
                 node_name="planner",
-                mention=metric_search_text[:100],
+                mention=current_user_input[:100],
+                keywords=semantic_keywords,
                 hit_count=len(semantic_matches),
                 metric_ids=[m.get("id", "") for m in semantic_matches],
                 metric_names=[m.get("name", "") for m in semantic_matches],
-                metric_scores=[m.get("score", 0) for m in semantic_matches],
-                metric_confidences=[
+                hit_types=[m.get("hit_type", "") for m in semantic_matches],
+                grep_confidences=[
                     round(float(m.get("confidence", 0) or 0), 2)
                     for m in semantic_matches
                 ],
-                top_confidence=round(_top_confidence, 2),
-                semantic_unique=_semantic_unique,
             )
 
-            # 语义层唯一命中时跳过 FAISS 双路召回，直接用语义层推荐的来源构建元数据
-            if _semantic_unique:
+            # 强命中（名称/别名）视为语义层主导，短路跳过 FAISS 双路召回；
+            # 弱命中/无命中保留 FAISS 补充物理字段（RAG 兜底）
+            _grep_strong = any(
+                str(m.get("hit_type", "")) == "strong"
+                for m in semantic_matches
+            )
+            if _grep_strong:
                 # 未走检索：置空后续日志/统计引用的检索结果，避免引用未定义变量
                 table_docs_with_scores = []
                 column_docs_with_scores = []
-                winner = semantic_matches[0]
-                winner_table = winner.get("source_model", "")
-                metadata_lines = [
-                    f"[表 {winner_table}, 相似度: 1.0000]\n语义层推荐口径：{winner.get('name', '')}，"
-                    f"来源表：{winner_table}，表达式：{winner.get('expression', winner.get('id', ''))}"
-                ]
+                metadata_lines = []
+                for _sm in semantic_matches:
+                    _src = _sm.get("source_model", "")
+                    if not _src:
+                        continue
+                    # 第2层：指针导航（metric → semantic_model → physical），只打开小组信息，
+                    # 把分区/物理字段带出来，供 LLM 生成 SQL 时参考（如无分区明细表需用日期字段过滤）
+                    _chain = resolve_metric_chain(_sm.get("id", ""))
+                    _phys = _chain.get("physical") or {}
+                    _phys_note = ""
+                    if _phys:
+                        _part = "、".join(_phys.get("partition") or []) or "无分区"
+                        _fields = list((_phys.get("fields") or {}).keys())
+                        _phys_note = (
+                            f"；分区字段：{_part}"
+                            f"；物理字段：{', '.join(_fields[:30])}"
+                        )
+                    metadata_lines.append(
+                        f"[表 {_src}, 相似度: 1.0000]\n语义层推荐口径：{_sm.get('name', '')}，"
+                        f"来源表：{_src}，表达式：{_sm.get('expression', _sm.get('id', ''))}{_phys_note}"
+                    )
                 metadata_context = "\n".join(metadata_lines)
-                table_candidates = [{
-                    "table": winner_table,
-                    "score": 1.0,
-                    "comment": f"语义层推荐：{winner.get('name', '')}"
-                }]
+                table_candidates = [
+                    {
+                        "table": _sm.get("source_model", ""),
+                        "score": 1.0,
+                        "comment": f"语义层推荐：{_sm.get('name', '')}",
+                    }
+                    for _sm in semantic_matches
+                    if _sm.get("source_model")
+                ]
                 column_candidates = []
             else:
                 # ── 步骤①：FAISS 检索增强元数据（先召回表，再在召回表内召回字段）──
@@ -451,13 +405,18 @@ def build_planner_node(runtime):
 
             # ── 步骤②：LLM 结构化解析（含 current_user_input、advisor_last_answer）──
             # 组装用户消息 sections：有内容的才带标题，避免空标题占用 token
-            history_context = _build_history_context(state.get("messages") or [])
+            # （history_context 已在第0层关键词提取时计算）
             metadata_section = (
                 METADATA_SECTION_TEMPLATE.format(metadata_context=metadata_context)
-                if metadata_context.strip() and not _semantic_unique
+                if metadata_context.strip() and not _grep_strong
                 else ""
             )
             sections = [f"【当前需求基线】\n{current_user_input}"]
+            seeker_plan_error = state.get("seeker_plan_error") or ""
+            if seeker_plan_error:
+                sections.append(
+                    f"【上次执行失败原因（必须调整方案避开该问题）】\n{seeker_plan_error}"
+                )
             if metric_context_text:
                 sections.append(f"【语义层指标候选】\n{metric_context_text}")
             if history_context:
@@ -474,12 +433,90 @@ def build_planner_node(runtime):
                     planner_output.effective_query.strip()
                     or current_user_input
             )
-            accept_locked_plan = planner_output.accept_locked_plan
-
             # ── 信任 LLM 的 completeness 判定，不做覆盖 ──
             tables = planner_output.tables
             fields = planner_output.fields
             completeness = planner_output.completeness
+
+            # ── 第3层：LLM 置信度 → 分档路由（对齐 skill 置信度规则）──
+            # >=0.9 唯一强命中短路；0.55~0.9 候选反问；<0.55 走 RAG
+            semantic_metrics = sorted(
+                (m for m in (planner_output.semantic_metrics or [])),
+                key=lambda m: float(m.confidence or 0),
+                reverse=True,
+            )
+            if semantic_metrics:
+                _top_confidence = max(
+                    (float(m.confidence or 0) for m in semantic_metrics),
+                    default=0.0,
+                )
+                _semantic_unique = (
+                    len(semantic_metrics) == 1
+                    and _top_confidence >= SEMANTIC_CONFIDENCE_UNIQUE
+                ) or (
+                    len(semantic_metrics) >= 2
+                    and _top_confidence >= SEMANTIC_CONFIDENCE_UNIQUE
+                    and (
+                        float(semantic_metrics[0].confidence or 0)
+                        - float(semantic_metrics[1].confidence or 0)
+                    ) >= SEMANTIC_UNIQUE_GAP_THRESHOLD
+                )
+            elif (
+                len(semantic_matches) == 1
+                and str(semantic_matches[0].get("hit_type", "")) == "strong"
+            ):
+                # LLM 未输出语义判定但 grep 唯一强命中：回退按语义层唯一短路
+                semantic_metrics = [{
+                    "id": semantic_matches[0]["id"],
+                    "confidence": SEMANTIC_CONFIDENCE_UNIQUE,
+                    "mention": "",
+                }]
+                _top_confidence = SEMANTIC_CONFIDENCE_UNIQUE
+                _semantic_unique = True
+            else:
+                semantic_metrics = []
+                _top_confidence = 0.0
+                _semantic_unique = False
+
+            # 分档：unique=唯一强命中短路；candidate=候选反问；rag=走检索召回
+            if _semantic_unique:
+                _tier = "unique"
+            elif _top_confidence >= SEMANTIC_CONFIDENCE_CANDIDATE:
+                _tier = "candidate"
+            else:
+                _tier = "rag"
+
+            # 语义层命中日志：记录每个指标的分数/置信度与短路判定，
+            # 便于排查"走了语义层还是召回"
+            log_metric_event(
+                "semantic.match",
+                node_name="planner",
+                mention=current_user_input[:100],
+                hit_count=len(semantic_matches),
+                metric_ids=[m.get("id", "") for m in semantic_matches],
+                metric_names=[m.get("name", "") for m in semantic_matches],
+                metric_scores=[m.get("score", 0) for m in semantic_matches],
+                metric_confidences=[
+                    round(float(m.get("confidence", 0) or 0), 2)
+                    for m in semantic_matches
+                ],
+                top_confidence=round(_top_confidence, 2),
+                semantic_unique=_semantic_unique,
+                tier=_tier,
+            )
+
+            # 语义层候选：完整指标信息 + LLM 置信度，供 Advisor 复用（避免 Advisor 词法漏召）
+            semantic_candidates = [dict(m) for m in semantic_matches]
+            _conf_by_id = {
+                str(m.id): float(m.confidence or 0)
+                for m in (planner_output.semantic_metrics or [])
+            }
+            for _sc in semantic_candidates:
+                _sc["confidence"] = _conf_by_id.get(
+                    _sc.get("id", ""), _sc.get("confidence", 0.0)
+                )
+                # score 统一为 grep 得分，供 Advisor/日志展示使用
+                _sc.setdefault("score", _sc.get("grep_score", 0))
 
             # 使用 LLM 还原后的完整需求重新探测候选数量，避免“1”“A”等短回答携带整组选项
             # 语义层唯一命中时跳过，指标口径已由语义层确定
@@ -551,43 +588,71 @@ def build_planner_node(runtime):
                 if similarity > HIGH_SIMILARITY_THRESHOLD:
                     high_similarity_column_count += 1
 
-            # 只有用户接受完整 locked 方案并通过程序校验后才能进入 Seeker
+            # ── Planner 是唯一路由者：LLM 判定 route，程序只做方案安全网 ──
             updated_plan = None
+            route_llm = planner_output.route or "advisor"
+            draft_plan = (
+                confirmed_plan
+                if (confirmed_plan or {}).get("status") == "draft"
+                else None
+            )
 
-            if accept_locked_plan:
-                try:
-                    updated_plan = confirm_query_plan(confirmed_plan)
-
-                    # 最终确认必须严格使用 locked 方案，禁止检索结果覆盖方案
-                    tables = updated_plan.get("tables", [])
-                    fields = updated_plan.get("fields", [])
+            if route_llm == "seeker":
+                # 只采信 LLM 判定相关（>=候选阈值）的语义层命中
+                _confirmed_ids = {
+                    str(m.id)
+                    for m in (planner_output.semantic_metrics or [])
+                    if float(m.confidence or 0) >= SEMANTIC_CONFIDENCE_CANDIDATE
+                }
+                metric_hits = [
+                    sc for sc in semantic_candidates
+                    if str(sc.get("id") or "") in _confirmed_ids
+                ]
+                if not metric_hits and semantic_candidates:
+                    # LLM 未输出语义判定但 grep 唯一强命中时，回退采信最强候选
+                    metric_hits = [semantic_candidates[0]]
+                _conf_by_id = {
+                    str(m.id): float(m.confidence or 0)
+                    for m in (planner_output.semantic_metrics or [])
+                }
+                metric_hits = sorted(
+                    metric_hits,
+                    key=lambda h: _conf_by_id.get(str(h.get("id") or ""), 0.0),
+                    reverse=True,
+                )
+                # 语义层确定性构建方案；失败时回退 Advisor 已落盘的完整草稿
+                plan = build_plan_from_semantic(
+                    metric_hits=metric_hits,
+                    semantic_provider=runtime.get("semantic_metadata_provider"),
+                    dimension_mentions=planner_output.dimension_mentions,
+                    time_range=planner_output.time_range,
+                    filters=planner_output.filters,
+                    draft=draft_plan,
+                    complex_flag=planner_output.complex,
+                )
+                if plan is None and draft_plan:
+                    plan = finalize_draft_plan(draft_plan)
+                if plan is not None:
+                    updated_plan = plan
+                    tables = plan.get("tables", [])
+                    fields = plan.get("fields", [])
                     completeness = "full"
                     route = "seeker"
                     planner_reason = (
-                            "用户接受完整 locked 方案，程序校验通过："
-                            + planner_output.reason
+                        "Planner 判定可直接执行，语义层确定性构建方案通过："
+                        + planner_output.reason
                     )
-                except ValueError as error:
-                    # 即使模型误判为确认，程序校验失败也不能进入 Seeker
-                    accept_locked_plan = False
+                else:
                     route = "advisor"
                     planner_reason = (
-                        f"最终确认未通过程序校验：{error}；"
-                        "返回 Advisor 继续澄清"
+                        "Planner 判定 seeker 但方案构建失败，降级 Advisor 澄清："
+                        + planner_output.reason
                     )
-
-            elif completeness in ("none", "partial"):
-                route = "advisor"
-                planner_reason = (
-                        f"LLM 判定元数据映射为 {completeness}："
-                        + planner_output.reason
-                )
             else:
-                # 需求已经明确，但还需要 Advisor 生成并展示 locked 方案
                 route = "advisor"
                 planner_reason = (
-                        "需求映射明确，交由 Advisor 生成并展示完整 locked 方案："
-                        + planner_output.reason
+                    "Planner 判定需要先澄清/核验，进入 Advisor："
+                    + planner_output.reason
                 )
 
             new_entities = {
@@ -599,18 +664,25 @@ def build_planner_node(runtime):
                 "measures": [],
                 "dimensions": [],
                 "time_field": "pt_dt",
-                "filters": "",
+                "filters": planner_output.filters,
+                "time_range": planner_output.time_range,
                 "complex": planner_output.complex,
-                                "completeness": completeness,
+                "completeness": completeness,
+                "plan_error": seeker_plan_error,
                 "table_candidates": table_candidates,
                 "column_candidates": column_candidates,
                 "follow_up_mode": planner_output.follow_up_mode,
+                # 语义层 grep 候选（含 notes 命中）与 LLM 置信度，供 Advisor 复用，
+                # 避免 Advisor 词法匹配漏掉备注命中（如"调出"）
+                "semantic_keywords": semantic_keywords,
+                "semantic_metrics": [dict(m) for m in semantic_metrics],
+                "semantic_candidates": semantic_candidates,
             }
 
             log_node_end(
                 "planner",
                 route=route,
-                accept_locked_plan=accept_locked_plan,
+                route_source="planner_llm",
                 completeness=completeness,
                 tables=str(tables),
                 fields=str(fields),
@@ -646,6 +718,7 @@ def build_planner_node(runtime):
                 "analysis_type": planner_output.analysis_type,
                 "metric_mentions": metric_mentions,
                 "dimension_mentions": dimension_mentions,
+                # 语义层命中状态统一存于 planner_entities，analysis_spec 只保留业务意图
                 "time_range": "",
                 "time_grain": "",
                 "filters": [],
@@ -670,6 +743,12 @@ def build_planner_node(runtime):
             elif planner_output.follow_up_mode == "new_query":
                 # 新问数：清空历史遗留方案，避免旧方案干扰新需求理解
                 return_value["confirmed_plan"] = None
+                # 新问数重置执行失败修复计数，给每个新问题一次修复机会
+                return_value["plan_repair_rounds"] = 0
+            # 执行失败修复：本轮已消费失败原因，清空并累计修复次数
+            if seeker_plan_error:
+                return_value["seeker_plan_error"] = None
+                return_value["plan_repair_rounds"] = (state.get("plan_repair_rounds") or 0) + 1
 
             log_sub_info(f"follow_up_mode: {planner_output.follow_up_mode}", node_name="planner")
 

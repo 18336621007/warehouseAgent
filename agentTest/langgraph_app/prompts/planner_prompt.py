@@ -3,33 +3,33 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-class UserSelection(BaseModel):
-    """Planner 对用户本轮选择的判断：判断归模型，程序只做白名单校验。"""
+class SemanticMetricHit(BaseModel):
+    """Planner 对语义层候选指标的置信度判定（第3层）。"""
 
-    selected: bool = Field(
-        default=False,
-        description="用户是否在本轮完成了明确选择（仅当存在最近展示候选或候选口径时）"
+    id: str = Field(
+        default="",
+        description="语义层命中指标的 id"
     )
 
-    field: str = Field(
-        default="",
-        description="用户选中的物理字段名，必须逐字等于候选集合或已确认字段中的 field"
+    confidence: float = Field(
+        default=0.0,
+        description="置信度（0~1）：>=0.9 名称/别名强命中唯一口径；0.55~0.9 定义/备注弱命中需澄清；<0.55 视为无关"
     )
 
     mention: str = Field(
         default="",
-        description="用户选中字段归属的业务概念，如负责人/新增订单，必须与 metric_mentions 或 dimension_mentions 一致"
+        description="用户问题中命中该指标的关键词"
     )
 
-    concept_type: str = Field(
-        default="",
-        description="用户选中字段的概念类型：metric=指标 / dimension=维度属性，必须与字段元数据语义类型一致"
+
+class SemanticKeywordsOutput(BaseModel):
+    """第0层：从用户问题中拆出用于语义层全文检索的业务关键词。"""
+
+    semantic_keywords: list[str] = Field(
+        default_factory=list,
+        description="业务检索词，剔除时间词/查询动词/实体词，每个词尽量短且独立可检索"
     )
 
-    reasoning: str = Field(
-        default="",
-        description="判断依据，引用用户原话，用于审计"
-    )
 
 class PlannerOutput(BaseModel):
     """Planner 对当前有效需求的模糊度分析结果。"""
@@ -39,9 +39,19 @@ class PlannerOutput(BaseModel):
         description="结合对话上下文还原出的完整有效查数需求"
     )
 
-    accept_locked_plan: bool = Field(
-        default=False,
-        description="用户是否接受 Advisor 上一轮展示的完整 locked 方案"
+    route: Literal["seeker", "advisor"] = Field(
+        default="advisor",
+        description="本轮路由判定：seeker=可直接执行（语义层唯一解析、槽位齐全）；advisor=需先澄清/核验"
+    )
+
+    time_range: str = Field(
+        default="",
+        description="用户明确的时间范围，如 昨天、最近7天、2026-08-01至2026-08-31；未明确时留空由默认兜底"
+    )
+
+    filters: str = Field(
+        default="",
+        description="用户明确的口径过滤条件，如 company_category='A'；多个用 AND 连接；没有则留空"
     )
 
     tables: list[str] = Field(
@@ -88,9 +98,14 @@ class PlannerOutput(BaseModel):
         description="确认判断和模糊度判断的主要依据"
     )
 
-    user_selection: UserSelection = Field(
-        default_factory=UserSelection,
-        description="用户对上一轮候选的选择判断（无候选时不选）"
+    semantic_keywords: list[str] = Field(
+        default_factory=list,
+        description="从用户问题拆出的语义层检索关键词（第0层输出，用于全文 grep）"
+    )
+
+    semantic_metrics: list[SemanticMetricHit] = Field(
+        default_factory=list,
+        description="语义层候选指标的置信度判定（第3层输出），用于分档路由"
     )
 
     follow_up_mode: Literal[
@@ -109,14 +124,16 @@ PLANNER_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，不要�
 
 你需要输出：
 1. effective_query：当前完整有效需求
-2. accept_locked_plan：是否接受当前 locked 方案
-3. tables：候选目标表
-4. fields：已确定字段
-5. completeness：需求映射完整度
-6. complex：是否复杂查询
-7. metric_mentions：用户提到的指标业务概念
-8. dimension_mentions：用户提到的维度业务概念
-9. analysis_type：分析类型
+2. route：本轮路由判定（seeker=可直接执行，advisor=需先澄清/核验）
+3. time_range：用户明确的时间范围
+4. filters：用户明确的口径过滤条件
+5. tables：候选目标表
+6. fields：已确定字段
+7. completeness：需求映射完整度
+8. complex：是否复杂查询
+9. metric_mentions：用户提到的指标业务概念
+10. dimension_mentions：用户提到的维度业务概念
+11. analysis_type：分析类型
 
 禁止：
 - 生成SQL
@@ -150,20 +167,28 @@ Advisor：
 禁止将无独立含义的序号直接作为需求。
 无法确定选项含义时，保留原需求，并将 completeness 判定为 partial。
 
-【accept_locked_plan规则】
-只有满足全部条件才返回 true：
-- 当前方案状态为 locked
-- Advisor 上轮展示完整方案
-- 正等待用户最终确认
-- 用户明确接受整份方案
-- 用户未提出任何修改、补充或问题
+【route判定规则】
+route 决定本轮是否直接执行，还是先由 Advisor 澄清/核验。你是唯一路由者：
+- seeker：当前有效需求的全部指标都能被语义层唯一解析（semantic_metrics 中每个指标 confidence>=0.55
+  且口径唯一），时间、过滤、维度已明确（含从已有草稿继承），不需要用户补充任何信息，可直接生成方案执行。
+- advisor：存在口径歧义、多个冲突候选、时间/过滤/维度缺失，需要向用户确认；
+  或命中指标无法唯一解析，需要先用工具核验表/字段是否真实存在。
 
-以下情况返回 false：
-- 用户选择指标、字段、维度或序号
-- 用户接受同时提出修改
-- 当前方案不是 locked
+要点：
+- 用户一次问多个指标时，只要每个指标都能唯一映射、槽位齐全，即使命中多个语义层指标也应判定 seeker。
+- 多指标不等于 advisor；含糊不清、口径冲突才判 advisor。
+- 不确定时判 advisor 更安全（Advisor 会继续澄清），但不要把可以确定的查询推给 Advisor。
+- 结合【语义层指标候选】的置信度与【对话历史】判断，不允许仅根据关键词判断。
 
-必须结合上下文判断，不允许仅根据关键词判断。
+【time_range规则】
+- 从 effective_query 或用户原话中提取明确时间范围（昨天/最近7天/某日/某区间）。
+- 未明确时留空 ""，由系统默认（昨天）兜底。
+- 只写业务时间范围，不要写 SQL 表达式。
+
+【filters规则】
+- 用户明确限定口径时输出过滤条件，如 company_category='A'（A类代理商）、platform='cos'。
+- 多个条件用 AND 连接；没有限定留空 ""。
+- 只写能确定字段名的过滤；不确定归属表也照写字段条件，表归属由语义层解析。
 
 【元数据映射规则】
 completeness：
@@ -183,13 +208,10 @@ fields：
 - 相似字段不得自行选择
 - 禁止编造字段
 
-如果 accept_locked_plan=true：
-- 复用对话历史中最近确认/展示的方案中的表和字段
-- 不使用新的检索结果覆盖已有方案
-- 若方案不是 locked，必须返回 false
+tables/fields 只作为 Advisor 核验参考，最终物理字段由语义层确定性解析，不要自行编造。
 
 原则：
-不确定时保守处理，禁止让模糊需求进入执行阶段。
+不确定时保守处理；route 判定不了时选 advisor，禁止让模糊需求直接进入执行阶段。
 
 【complex判断】
 以下任一情况设置 complex=true：
@@ -228,21 +250,28 @@ fields：
   必须单独写入 dimension_mentions，禁止并入 metric_mentions。
 - 无法从自然语言中识别维度时返回空列表。
 
-【user_selection规则】
-结合【对话历史】中上轮展示的候选编号与名称、【最近展示候选】字段事实和【已确认口径】判断用户是否完成了选择：
-- 用户回复编号、中文序号、字段名、中文含义或口语指代（如"净增那个""我要第二个"）时，先在上轮展示文案中定位“编号→候选名称”的对应关系，再映射到【最近展示候选】中的物理字段，输出对应 field。
-- selected=true 时，除 field 外还必须输出 mention（该字段归属的业务概念）与 concept_type（metric=指标/dimension=维度属性）：mention 必须逐字等于 metric_mentions 或 dimension_mentions 中的概念；concept_type 必须与字段的元数据语义类型一致（如“负责人”是 dimension，“新增订单数”是 metric），禁止把维度/属性字段归属到指标概念下。
-- 用户上一轮已选择后继续改选（如"改成1""不要4了""换另一个"）时，以最新选择为准输出对应 field；“第一个/第二个”等编号指代同样优先从上轮展示文案中定位，再映射到【最近展示候选】或【历史展示候选（改选时参考）】。
-- 用户在询问候选区别、解释含义、补充其他条件或闲聊时，selected 必须为 false。
-- 同时提到多个候选、指代不明或无法确定时，selected 必须为 false，宁可不选也不猜测。
-- field 必须逐字等于候选集合或已确认字段中的物理字段名，找不到匹配必须 selected=false。
-- selected=true 时 reasoning 必须引用用户原话说明判断依据。
-
 【follow_up_mode规则】
 - new_query：全新需求或明显换话题（与当前需求无关）。
 - result_follow_up：用户引用上一轮查询结果（"第一名""这些经销商""刚才的结果"）。
 - plan_refinement：沿用当前方案只修改时间、过滤、维度、排序或指标中的部分内容。
 - clarification_explanation：用户只询问候选区别或解释，尚未做出选择。
+
+【semantic_keywords规则】
+- 输出从当前有效需求中提取的业务检索关键词，用于语义层全文 grep。
+- 只提取与业务指标/口径相关的词（如「新增订单」「调出」「天数池」「续租」「发货」），
+  剔除时间词（昨天/今天/上月/近7天）、查询动词（查询/统计/看看/分析/对比）、
+  以及纯实体/维度词（经销商/平台/区域，无业务限定时剔除）。
+- 每个关键词尽量短且独立可检索（如「调出明细」拆成「调出」「明细」）。
+- 保留渠道/口径限定词（如「A类」「月租」），它们可能对应维度枚举值或独立指标。
+- 没有可提取的业务关键词时返回空数组。
+
+【semantic_metrics置信度判定规则】
+- 结合【语义层指标候选】判断每个候选指标与用户问题的相关度，输出 id、mention、confidence：
+  - confidence >= 0.9：用户说法与指标名称/别名完全一致或近义，口径唯一，直接采信并短路。
+  - 0.55 <= confidence < 0.9：指标在定义/备注中相关但口径不完全确定，需要候选反问确认。
+  - confidence < 0.55：指标与用户问题无关，不采信，走检索召回。
+- 只输出与用户问题相关的候选；无关候选不要出现在列表里。
+- 多个指标都强相关时全部输出；只有唯一强相关（top1 明显领先，差值 >= 0.15）才算语义层唯一命中。
 """
 
 # 用户消息由 planner_node 按需拼接 sections（有内容的才带标题，避免空标题占用 token）
@@ -250,3 +279,25 @@ PLANNER_USER_TEMPLATE = """{sections}"""
 
 METADATA_SECTION_TEMPLATE = """【分层元数据检索结果】
 {metadata_context}"""
+
+# 第0层：语义层检索关键词提取（独立小调用，避免拆词噪声进入完整解析）
+PLANNER_KEYWORD_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，不要解释文字。
+
+你是 Text2SQL 系统中 Planner 的检索词提取器。你的任务是从用户查询中提取用于
+语义层全文检索的业务关键词（对齐语义层 grep 方式：id/name/aliases/definition/notes/dimensions 全文匹配）。
+
+规则：
+- 只提取与业务指标/口径相关的词，如「新增订单」「调出」「天数池」「续租」「退租」「发货」「库存」。
+- 剔除时间词（昨天、今天、上月、近7天等）、查询动词（查询、统计、看看、分析、对比等）、
+  实体/维度词（经销商、平台、区域等，无业务限定时剔除）。
+- 每个关键词尽量短且独立可检索（如「调出明细」拆成「调出」「明细」两个词）。
+- 保留渠道/口径限定词（如「A类」「月租」），它们可能对应维度枚举值或独立指标。
+- 若没有可提取的业务关键词，返回空数组。
+"""
+
+PLANNER_KEYWORD_USER_TEMPLATE = """当前需求：
+{question}
+
+对话历史（最近N轮）：
+{history}
+"""

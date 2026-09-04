@@ -72,3 +72,8 @@ class BaseState(TopicState, total=False):
     # 公共流程字段
     current_node: str
     error_message: str
+
+    # Seeker 方案不可行时的失败原因（缺 join 契约等），触发回 Planner 修复
+    seeker_plan_error: str
+    # 已消费的执行失败修复轮次，用于限制回 Planner 次数
+    plan_repair_rounds: int

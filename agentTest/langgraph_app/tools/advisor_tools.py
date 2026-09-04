@@ -1,7 +1,6 @@
 # Advisor 的分层检索工具与方案提交工具，k 值从 config/advisor.py 读取
 from langchain.tools import tool
 from agentTest.config.advisor import SEARCH_DB_K, SEARCH_TABLE_K, SEARCH_COLUMN_K, BM25_ALPHA
-from agentTest.langgraph_app.tools.submit_query_plan import submit_query_plan  # 完整方案提交工具
 from agentTest.langchain_app.rag.hybrid_retriever import HybridRetriever
 
 # 全局变量，由 build_advisor_tools() 注入 FAISS 实例和 BM25 实例
@@ -250,9 +249,9 @@ def update_draft_plan(
 ) -> str:
     """在追问过程中，把当前已确认的查询方案部分写入草稿状态（status=draft）。
 
-    与 submit_query_plan 的区别：本工具允许只提交部分槽位（如先确认指标、再补维度），
-    程序会保留旧方案未修改部分；当你判断查询方案已满足查询需求时，
-    必须调用 submit_query_plan 提交完整方案并等待用户最终确认。
+    草稿是 Planner 判定是否执行的核心依据：你可以只提交部分槽位（如先确认指标、再补维度），
+    程序会保留旧方案未修改部分并跨轮保存；不要锁定方案、不要请求用户最终确认，
+    是否进入执行由 Planner 统一判定。
 
     参数说明：
     - tables: 查询涉及的全部表列表，单表如 ["ads_trip.xxx"]，多表如 ["ads_trip.xxx", "dim_trip.yyy"]
@@ -315,5 +314,4 @@ def build_advisor_tools(
         search_tables,
         search_columns,
         update_draft_plan,
-        submit_query_plan,
     ]

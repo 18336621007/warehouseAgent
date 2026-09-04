@@ -17,6 +17,9 @@ MAX_DEMO_ADVISOR_TURNS = 10
 # 锁定方案前前必须先调用 search_columns  图级拦截最大重试次数（避免死循环）
 MAX_COLUMN_CHECK_RETRIES = 3
 
+# Seeker 方案不可行（缺 join 契约/字段无归属）时，回 Planner 的修复机会次数
+MAX_PLAN_REPAIR_ROUNDS = 1
+
 # 指标歧义门禁候选收敛：只展示最相关的少量口径候选
 MAX_AMBIGUITY_CANDIDATES = 6   # 澄清候选数量上限
 MIN_CANDIDATE_SCORE = 0.5      # 候选相似度下限，低于该分视为不相关

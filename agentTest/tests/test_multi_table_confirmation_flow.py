@@ -69,13 +69,6 @@ def _build_plan() -> dict:
 class MultiTableConfirmationFlowTest(unittest.TestCase):
     """覆盖单次确认和多表Join安全规则。"""
 
-    def test_unlocked_message_cannot_request_final_confirmation(self):
-        """未生成locked_plan时必须明确提示仍处于核对阶段。"""
-        message = _normalize_clarification_message("已确认所需字段和时间维度，请确认是否执行")
-
-        self.assertTrue(message.startswith("当前方案尚未锁定"))
-        self.assertNotIn("已确认所需字段和时间维度", message)
-        self.assertNotIn("请确认是否执行", message)
 
     def test_fallback_sql_uses_composite_keys_and_keeps_dimension_filter_in_on(self):
         """复合键必须完整生成，维表分区条件不能让LEFT JOIN退化。"""
