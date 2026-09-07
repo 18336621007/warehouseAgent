@@ -241,7 +241,8 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
             rejected = planner.plan(tables, sources)
         self.assertFalse(rejected.success)
         self.assertFalse(rejected.needs_ai_inference)
-        self.assertTrue(ALLOW_AI_INFERRED_JOIN)
+        # 默认关闭：缺 join 契约时禁止 AI 推断，走"告知用户请联系管理员"路径
+        self.assertFalse(ALLOW_AI_INFERRED_JOIN)
 
     def test_semantic_relation_uses_composite_business_key(self):
         """语义层 join_contracts 中事实表与经销商维表按复合键关联。"""

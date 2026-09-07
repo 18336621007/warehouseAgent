@@ -2,8 +2,8 @@
 from typing import Literal, TypedDict
 
 
-# draft 表示追问中逐步完善的方案，locked 表示完整方案等待确认，confirmed 表示允许 Seeker 执行
-PlanStatus = Literal["draft", "locked", "confirmed"]
+# draft 表示追问中逐步完善的方案，locked 表示程序校验通过、可交给 Seeker 执行的完整方案
+PlanStatus = Literal["draft", "locked"]
 
 
 class QueryPlan(TypedDict, total=False):
@@ -11,7 +11,15 @@ class QueryPlan(TypedDict, total=False):
     table: str
     tables: list[str]
 
-    # 用户确认的度量、维度和全部查询字段
+    # ── 业务方案字段（Advisor/Planner 只写这 3 个，模板简化契约）──
+    # 查看字段：度量+维度+明细字段统一收口，元素可为裸字段名或 db.table.field 完整路径
+    select_fields: list[str]
+    # 过滤字段（含时间条件）：字符串形式，如 "create_time 今年 AND region_name='徐州大区'"
+    filters: str
+    # 明细型查询（不聚合、无 GROUP BY），由 Advisor 显式确认或指标 query_type=detail 派生
+    detail_query: bool
+
+    # ── 程序派生的执行字段（锁定后由 select_fields/filters 推导，不要求手工维护）──
     measures: list[str]
     dimensions: list[str]
     fields: list[str]
@@ -61,18 +69,17 @@ def validate_query_plan(
     if plan.get("status") == "draft":
         draft_errors = []
         draft_tables = plan.get("tables") or []
-        draft_measures = plan.get("measures") or []
-        draft_dimensions = plan.get("dimensions") or []
-        if not isinstance(draft_measures, list) or any(
-            not isinstance(item, str) for item in draft_measures
+        draft_select_fields = plan.get("select_fields") or []
+        if not isinstance(draft_select_fields, list) or any(
+            not isinstance(item, str) for item in draft_select_fields
         ):
-            draft_errors.append("measures 必须是字符串列表")
-        if not isinstance(draft_dimensions, list) or any(
-            not isinstance(item, str) for item in draft_dimensions
+            draft_errors.append("select_fields 必须是字符串列表")
+        if (
+            not draft_tables
+            and not draft_select_fields
+            and not str(plan.get("filters") or "").strip()
         ):
-            draft_errors.append("dimensions 必须是字符串列表")
-        if (not draft_tables) and (not draft_measures) and (not draft_dimensions):
-            draft_errors.append("草稿方案至少需要数据表或字段")
+            draft_errors.append("草稿方案至少需要数据表、查看字段或过滤条件")
         return draft_errors
 
     table = plan.get("table", "")
@@ -178,15 +185,12 @@ def validate_query_plan(
             elif not str(table_time_range).strip():
                 errors.append(f"表 {table_name} 设置了 time_field 但缺少 time_range")
 
-    if status not in ("locked", "confirmed"):
-        errors.append("status 必须是 locked 或 confirmed")
+    if status != "locked":
+        errors.append("status 必须是 locked")
 
     # 指标解析证据为可选审计字段，存在时必须是字典
     concept_resolutions = plan.get("concept_resolutions")
     if concept_resolutions is not None and not isinstance(concept_resolutions, dict):
         errors.append("concept_resolutions 必须是字典")
-
-    if require_confirmed and status != "confirmed":
-        errors.append("查询方案尚未经过用户最终确认")
 
     return errors

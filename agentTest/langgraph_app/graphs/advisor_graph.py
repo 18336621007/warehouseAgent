@@ -358,11 +358,9 @@ def build_advisor_subgraph(runtime):
                 "【当前已有草稿方案】",
                 f"状态：{current_plan.get('status', '未设置')}",
                 f"数据表：{', '.join(current_plan.get('tables') or []) or '未设置'}",
-                f"度量：{', '.join(current_plan.get('measures') or []) or '无'}",
-                f"维度：{', '.join(current_plan.get('dimensions') or []) or '无'}",
-                f"时间字段：{current_plan.get('time_field', '未设置')}",
-                f"时间范围：{current_plan.get('time_range', '未设置')}",
+                f"查看字段：{', '.join(current_plan.get('select_fields') or []) or '未设置'}",
                 f"过滤条件：{current_plan.get('filters', '') or '无'}",
+                f"明细查询：{'是' if current_plan.get('detail_query') else '否'}",
                 "用户可能只修改了部分内容，未修改内容应尽可能保留；"
                 "如果整体目标已经变化，可以重新构建完整草稿。",
             ])
@@ -543,11 +541,9 @@ def build_advisor_subgraph(runtime):
             draft_text = (
                 f"状态：{draft_plan.get('status', '未设置')}\n"
                 f"数据表：{', '.join(draft_plan.get('tables') or []) or '未设置'}\n"
-                f"度量：{', '.join(draft_plan.get('measures') or []) or '无'}\n"
-                f"维度：{', '.join(draft_plan.get('dimensions') or []) or '无'}\n"
-                f"时间字段：{draft_plan.get('time_field', '未设置')}\n"
-                f"时间范围：{draft_plan.get('time_range', '未设置')}\n"
-                f"过滤条件：{draft_plan.get('filters', '') or '无'}"
+                f"查看字段：{', '.join(draft_plan.get('select_fields') or []) or '未设置'}\n"
+                f"过滤条件：{draft_plan.get('filters', '') or '无'}\n"
+                f"明细查询：{'是' if draft_plan.get('detail_query') else '否'}"
             )
         else:
             draft_text = "无（本轮未更新草稿）"

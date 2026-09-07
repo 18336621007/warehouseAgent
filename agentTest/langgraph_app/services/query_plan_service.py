@@ -21,6 +21,82 @@ def _deduplicate(values: list[str]) -> list[str]:
     return result
 
 
+def _extract_time_from_filters(filters: str) -> tuple[str, str]:
+    """从过滤条件字符串里识别时间字段与时间范围（如 create_time 今年、pt_dt 昨天）。
+
+    返回 (time_field, time_range)；识别不到时返回空串，由无分区明细表安全网兜底。
+    """
+    if not filters:
+        return "", ""
+    time_range = ""
+    m = re.search(
+        r"(今年|去年|昨天|今天|前天|本周|上周|本月|上月|"
+        r"近\s*\d+\s*(?:天|日|周|月)|"
+        r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s*(?:至|~|-)\s*20\d{2}[-/]\d{1,2}[-/]\d{1,2})",
+        filters,
+    )
+    if m:
+        time_range = re.sub(r"\s+", "", m.group(1))
+    time_field = ""
+    for m in re.finditer(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:>=|<=|=|范围|今年|去年|昨天|今天|近|between|BETWEEN)",
+        filters,
+    ):
+        field = m.group(1)
+        if (
+            field == "pt_dt"
+            or field == "day"
+            or "time" in field.lower()
+            or "date" in field.lower()
+        ):
+            time_field = field
+            break
+    return time_field, time_range
+
+
+def _derive_execution_fields(plan: dict) -> None:
+    """从业务方案字段（select_fields/filters）派生执行字段（measures/dimensions/time_field/fields）。
+
+    Advisor/Planner 只维护 select_fields + filters，聚合/分组/时间字段由程序统一推导，
+    避免"过滤词被误写进维度"这类口径错误；已显式给出执行字段时不覆盖（兼容构建器直出）。
+    """
+    select_fields = plan.get("select_fields") or []
+    if not select_fields and plan.get("filters") is None:
+        return
+    if select_fields and plan.get("measures") is not None and plan.get("dimensions") is not None:
+        return
+    fields = []
+    for field_ref in select_fields:
+        name = str(field_ref).rsplit(".", 1)[-1] if "." in str(field_ref) else str(field_ref)
+        if name and name not in fields:
+            fields.append(name)
+    # 按元数据字段类型拆度量/维度，未知类型默认维度（属性/分组字段）
+    index = _build_field_semantic_index()
+    measures, dimensions = [], []
+    for name in fields:
+        if index.get(name) == "measure":
+            measures.append(name)
+        else:
+            dimensions.append(name)
+    # 明细查询不聚合，度量/维度均不派生
+    if plan.get("detail_query"):
+        measures, dimensions = [], []
+    if measures:
+        plan["measures"] = _deduplicate(measures)
+    if dimensions:
+        plan["dimensions"] = _deduplicate(dimensions)
+    # 时间字段从过滤条件识别（时间属于过滤字段，不新增独立槽位）
+    time_field, time_range = _extract_time_from_filters(str(plan.get("filters") or ""))
+    if time_field:
+        plan["time_field"] = time_field
+    if time_range:
+        plan["time_range"] = time_range
+    # fields 汇总：度量 + 维度 + 时间字段
+    all_fields = list(plan.get("measures") or []) + list(plan.get("dimensions") or [])
+    if plan.get("time_field"):
+        all_fields.append(plan["time_field"])
+    plan["fields"] = _deduplicate(all_fields)
+
 
 def _distribute_shared_filters(
     filters: str, source_map: dict, primary_table: str
@@ -95,10 +171,11 @@ def merge_draft_plan(current_plan: dict, draft_args: dict) -> QueryPlan:
     list_keys = [
         "tables", "measures", "dimensions", "field_sources",
         "order_by", "table_plans", "concept_resolutions",
+        "select_fields",
     ]
     scalar_keys = [
         "time_field", "time_range", "filters", "having",
-        "result_limit", "complex",
+        "result_limit", "complex", "detail_query",
     ]
     for key in list_keys:
         if key in draft_args and draft_args[key] is not None:
@@ -120,11 +197,14 @@ def merge_draft_plan(current_plan: dict, draft_args: dict) -> QueryPlan:
     elif plan.get("table"):
         plan["tables"] = [plan["table"]]
 
-    # fields 汇总：度量 + 维度 + 时间字段，保持去重
-    fields = list(plan.get("measures") or []) + list(plan.get("dimensions") or [])
-    if plan.get("time_field"):
-        fields.append(plan["time_field"])
-    plan["fields"] = _deduplicate(fields)
+    # 派生执行字段：先清空旧派生值，再按当前 select_fields/filters 统一重算，
+    # 避免跨轮修改 select_fields 后 measures/dimensions 残留上一轮旧值
+    plan.pop("measures", None)
+    plan.pop("dimensions", None)
+    plan.pop("fields", None)
+    plan.pop("time_field", None)
+    plan.pop("time_range", None)
+    _derive_execution_fields(plan)
 
     plan["status"] = "draft"
     return plan
@@ -133,6 +213,10 @@ def merge_draft_plan(current_plan: dict, draft_args: dict) -> QueryPlan:
 def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> QueryPlan:
     """将 Advisor 生成的完整方案标准化为 locked 方案。table 从 tables[0] 推导。"""
     plan = deepcopy(proposed_plan)
+
+    # 兼容业务方案字段输入：只有 select_fields/filters 时先派生执行字段
+    if plan.get("select_fields") and not plan.get("measures") and not plan.get("dimensions"):
+        _derive_execution_fields(plan)
 
     measures = plan.get("measures") or []
     dimensions = plan.get("dimensions") or []
@@ -366,19 +450,3 @@ def validate_field_table_bindings(plan: dict) -> list[str]:
     return errors
 
 
-def confirm_query_plan(current_plan: QueryPlan) -> QueryPlan:
-    """最终确认 locked 方案，只有确认后才能交给 Seeker。"""
-    if not current_plan:
-        raise ValueError("当前不存在可确认的查询方案")
-
-    if current_plan.get("status") != "locked":
-        raise ValueError("只有 locked 状态的查询方案才能最终确认")
-
-    errors = validate_query_plan(current_plan)
-    if errors:
-        raise ValueError("查询方案校验失败：" + "；".join(errors))
-
-    plan = deepcopy(current_plan)
-    plan["status"] = "confirmed"
-    plan["confirmed_at"] = datetime.now().isoformat()
-    return plan

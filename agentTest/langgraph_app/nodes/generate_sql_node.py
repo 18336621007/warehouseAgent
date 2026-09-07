@@ -90,7 +90,13 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     field_sources = confirmed_plan.get("field_sources") or {}  # {字段名: db.table}
     having = confirmed_plan.get("having", "")
 
-    if not table or not measures:
+    is_detail = confirmed_plan.get("detail_query", False)
+    if not table:
+        return ""
+    if not measures and not dimensions and not is_detail:
+        return ""
+    # 明细查询兜底只支持“昨天”这类固定日期表达式，其他时间范围交给 LLM/上层处理
+    if is_detail and (confirmed_plan.get("time_range", "") or "昨天") != "昨天":
         return ""
 
     date_expr = DATE_FORMAT_HIVE_EXPR.get("yyyyMMdd", "date_sub(current_date(), 1)")
@@ -122,6 +128,13 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
         select_parts.append(_qualify(dim))
     for m in measures:
         select_parts.append(f"SUM({_qualify(m)}) AS {m}")
+    # 明细查询：无度量/维度时直接输出已选明细字段，未指定则用 *
+    if is_detail and not select_parts:
+        detail_select_fields = confirmed_plan.get("select_fields") or []
+        if detail_select_fields:
+            select_parts = [_qualify(f.split(".")[-1]) for f in detail_select_fields]
+        else:
+            select_parts = ["*"]
 
     from_clause = f"FROM {table} {left_alias}"
 
@@ -456,11 +469,23 @@ def build_generate_sql_node(runtime):
                 parts.append(f"- 维度字段（必须在 SELECT 和 GROUP BY 中）: {', '.join(dimensions)}")
             # 明细查询：无度量字段，不聚合不分组，直接查明细行
             if confirmed_plan.get("detail_query"):
-                parts.append(
-                    "- 查询类型：明细查询（detail）——不聚合、不 GROUP BY，"
-                    "直接 SELECT 需要展示的字段（无指定字段时可用 *），"
-                    "必须带 WHERE 时间过滤与 LIMIT"
-                )
+                # 明细查询中已选字段实际传给 LLM，避免只 SELECT 旧维度
+                detail_select_fields = confirmed_plan.get("select_fields") or []
+                if detail_select_fields:
+                    detail_fields_str = ", ".join(
+                        f.split(".")[-1] for f in detail_select_fields
+                    )
+                    parts.append(
+                        "- 查询类型：明细查询（detail）——不聚合、不 GROUP BY，"
+                        f"直接 SELECT 以下字段：{detail_fields_str}，并且不做聚合"
+                        "必须带 WHERE 时间过滤与 LIMIT"
+                    )
+                else:
+                    parts.append(
+                        "- 查询类型：明细查询（detail）——不聚合、不 GROUP BY，"
+                        "直接 SELECT 需要展示的字段（无指定字段时可用 *），"
+                        "必须带 WHERE 时间过滤与 LIMIT"
+                    )
             time_range_cs = confirmed_plan.get("time_range", "") or "昨天"
             parts.append(f"- 主表时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
             if filters:

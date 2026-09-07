@@ -33,6 +33,15 @@ class SeekerRepairRoutingTest(unittest.TestCase):
         self.assertEqual(route_after_seeker({"seeker_plan_error": ""}), "end")
         self.assertEqual(route_after_seeker({}), "end")
 
+    def test_unresolvable_plan_error_skips_repair(self):
+        # 缺 join 契约等不可修复错误：即使修复轮次未耗尽也直接走 fallback 告知用户
+        state = {
+            "seeker_plan_error": "缺少 join 契约",
+            "seeker_error_unresolvable": True,
+            "plan_repair_rounds": 0,
+        }
+        self.assertEqual(route_after_seeker(state), "fallback")
+
 
 class AdvisorAutoContinueRoutingTest(unittest.TestCase):
     """Advisor 收尾结构化 next_step 决定是否自动回 Planner 的分派逻辑。"""
@@ -76,6 +85,17 @@ class PlanErrorFallbackTest(unittest.TestCase):
         self.assertIn("缺少必要的关联关系配置", result["final_answer"])
         self.assertEqual(result["topic_status"], "completed")
         self.assertTrue(result["messages"])
+
+    def test_fallback_node_unresolvable_mentions_admin(self):
+        # 缺 join 契约：最终答复明确告知用户无法关联、请联系管理员
+        result = plan_error_fallback_node({
+            "seeker_plan_error": "当前查询涉及多张表，但缺少必要的关联关系配置。",
+            "seeker_error_unresolvable": True,
+            "request_id": "req124",
+        })
+        self.assertIn("请联系数据管理员", result["final_answer"])
+        self.assertIn("缺少关联关系配置", result["final_answer"])
+        self.assertEqual(result["topic_status"], "completed")
 
 
 class PlanSynthesizerTest(unittest.TestCase):

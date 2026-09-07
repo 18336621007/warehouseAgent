@@ -85,6 +85,8 @@ def build_retrieve_schema_node(runtime):
                     log_node_error("retrieve_schema", error=plan_error_msg, ms=elapsed_ms(timer))
                     return {
                         "seeker_plan_error": plan_error_msg,
+                        # 缺 join 契约不可修复：跳过 Planner repair，直接告知用户
+                        "seeker_error_unresolvable": True,
                         "topic_status": "failed",
                     }
 

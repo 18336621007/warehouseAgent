@@ -745,7 +745,7 @@ def build_planner_node(runtime):
                 # 用户新输入触发：重置 Advisor 自动回环计数（防死循环）
                 return_value["advisor_auto_rounds"] = 0
             # 去 Topic 化：不再写入 original_question（当前需求以 effective_query 为准）
-            # 用户最终确认后，写回 status=confirmed 的查询方案
+            # Planner 构建的 locked 方案直接交给 Seeker 执行，无需用户确认环节
             if updated_plan is not None:
                 return_value["confirmed_plan"] = updated_plan
             elif planner_output.follow_up_mode == "new_query":
@@ -756,6 +756,8 @@ def build_planner_node(runtime):
             # 执行失败修复：本轮已消费失败原因，清空并累计修复次数
             if seeker_plan_error:
                 return_value["seeker_plan_error"] = None
+                # 清空不可修复错误标志，避免残留影响后续轮次路由
+                return_value["seeker_error_unresolvable"] = None
                 return_value["plan_repair_rounds"] = (state.get("plan_repair_rounds") or 0) + 1
 
             log_sub_info(f"follow_up_mode: {planner_output.follow_up_mode}", node_name="planner")

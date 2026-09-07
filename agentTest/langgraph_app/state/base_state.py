@@ -75,6 +75,8 @@ class BaseState(TopicState, total=False):
 
     # Seeker 方案不可行时的失败原因（缺 join 契约等），触发回 Planner 修复
     seeker_plan_error: str
+    # 不可修复错误标志（如缺 join 契约）：置位时跳过 Planner repair，直接告知用户
+    seeker_error_unresolvable: bool
     # 已消费的执行失败修复轮次，用于限制回 Planner 次数
     plan_repair_rounds: int
 

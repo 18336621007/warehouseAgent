@@ -15,7 +15,15 @@ from agentTest.langgraph_app.routers.seeker_router import route_after_seeker, ro
 def plan_error_fallback_node(state):
     """Seeker 方案不可行且修复机会耗尽时，把具体失败原因转成给用户的最终答复。"""
     error = state.get("seeker_plan_error") or "当前查询无法安全执行"
-    final_answer = "很抱歉，当前查询无法安全执行。\n\n" + error
+    if state.get("seeker_error_unresolvable"):
+        # 缺 join 契约：明确告知用户无法关联，请联系管理员
+        final_answer = (
+            "很抱歉，当前查询无法执行：涉及的数据表之间缺少关联关系配置，"
+            "无法安全进行多表关联，请联系数据管理员补充语义层 join_contracts 配置后重试。\n\n"
+            + error
+        )
+    else:
+        final_answer = "很抱歉，当前查询无法安全执行。\n\n" + error
     request_id = state.get("request_id", "")
     return {
         "final_answer": final_answer,

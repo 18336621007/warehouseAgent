@@ -22,7 +22,8 @@ REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES = [
 # 是否允许 join
 ALLOW_JOIN = True
 # 是否允许 AI 推测 Join（semantic_metadata.json 未配置关联关系时，由 LLM 推断 Join 条件）
-ALLOW_AI_INFERRED_JOIN = True
+# 缺 join 契约时禁止 AI 推断：未配置关联关系直接告知用户请联系管理员（方案A）
+ALLOW_AI_INFERRED_JOIN = False
 # 是否必须Limit
 REQUIRE_LIMIT = True
 #是否允许with

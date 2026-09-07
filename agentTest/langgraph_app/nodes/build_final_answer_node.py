@@ -122,6 +122,23 @@ def build_build_final_answer_node(runtime):
             sql_result = state.get("sql_result", {})
             row_count = sql_result.get("row_count", 0) if isinstance(sql_result, dict) else 0
 
+            # 执行失败：SQL 真实报错，不能当成"0 行空结果"误导用户
+            if state.get("sql_exec_failed"):
+                sql_exec_error = state.get("sql_exec_error") or "SQL 执行失败"
+                log_node_end(
+                    "build_final_answer",
+                    branch="sql_exec_failed",
+                    sql_error=sql_exec_error,
+                    ms=elapsed_ms(timer),
+                )
+                update = _build_answer_update(
+                    state,
+                    f"SQL 执行失败：{sql_exec_error}",
+                    "failed",
+                )
+                log_state_snapshot("build_final_answer", {**state, **update})
+                return update
+
             # 空结果与成功分支都刷新结果快照，避免旧结果被后续追问错误复用
             snapshot = _build_result_snapshot(state, sql_result)
             result_update = {

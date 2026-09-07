@@ -171,6 +171,9 @@ def build_plan_from_semantic(
             if entity:
                 break
         if not entity:
+            # 过滤限定词误入维度（如"徐州大区"已作为过滤值出现在 filters 中）：跳过不阻断
+            if word and filters and word in filters:
+                continue
             return None
         entity_fields = resolve_entity_dimension_fields(
             entity,
@@ -255,6 +258,10 @@ def build_plan_from_semantic(
         "tables": tables,
         "measures": list(dict.fromkeys(measures)),
         "dimensions": list(dict.fromkeys(dimensions)),
+        # 查看字段 = 草稿已确认字段 + 语义层构建的度量/维度（业务方案字段）
+        "select_fields": list(dict.fromkeys(
+            (draft.get("select_fields") or []) + measures + dimensions
+        )),
         "detail_query": detail_flag,
         "time_field": time_field,
         "time_range": final_time_range,
