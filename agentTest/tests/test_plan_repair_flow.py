@@ -238,5 +238,34 @@ class PlanSynthesizerTest(unittest.TestCase):
         self.assertEqual(plan.get("status"), "locked")
 
 
+    def test_detail_metric_with_planner_time_field_builds_plan(self):
+        # Planner 已识别出时间字段（fields=["create_time"]）时可直接构建，无需再降级 Advisor
+        sl = get_semantic_layer_provider()
+        sp = self._provider()
+        plan = build_plan_from_semantic(
+            [sl.get_metric_by_id("device_return_detail")], sp,
+            dimension_mentions=[], time_range="今年",
+            filters="region_name='徐州大区' AND status='同意返厂'",
+            planner_time_field="create_time",
+        )
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan.get("detail_query"))
+        self.assertEqual(plan.get("time_field"), "create_time")
+        self.assertEqual(plan.get("time_range"), "今年")
+        self.assertEqual(plan.get("status"), "locked")
+
+    def test_detail_metric_with_hallucinated_planner_time_field_returns_none(self):
+        # Planner 推断的字段不属于该表时不应被采信，维持降级行为
+        sl = get_semantic_layer_provider()
+        sp = self._provider()
+        plan = build_plan_from_semantic(
+            [sl.get_metric_by_id("device_return_detail")], sp,
+            dimension_mentions=[], time_range="今年",
+            filters="region_name='徐州大区' AND status='同意返厂'",
+            planner_time_field="fake_time_col",
+        )
+        self.assertIsNone(plan)
+
+
 if __name__ == "__main__":
     unittest.main()

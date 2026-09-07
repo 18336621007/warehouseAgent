@@ -44,11 +44,6 @@ class PlannerOutput(BaseModel):
         description="本轮路由判定：seeker=可直接执行（语义层唯一解析、槽位齐全）；advisor=需先澄清/核验"
     )
 
-    time_range: str = Field(
-        default="",
-        description="用户明确的时间范围，如 昨天、最近7天、2026-08-01至2026-08-31；未明确时留空由默认兜底"
-    )
-
     filters: str = Field(
         default="",
         description="用户明确的口径过滤条件，如 company_category='A'；多个用 AND 连接；没有则留空"
@@ -125,15 +120,14 @@ PLANNER_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，不要�
 你需要输出：
 1. effective_query：当前完整有效需求
 2. route：本轮路由判定（seeker=可直接执行，advisor=需先澄清/核验）
-3. time_range：用户明确的时间范围
-4. filters：用户明确的口径过滤条件
-5. tables：候选目标表
-6. fields：已确定字段
-7. completeness：需求映射完整度
-8. complex：是否复杂查询
-9. metric_mentions：用户提到的指标业务概念
-10. dimension_mentions：用户提到的维度业务概念
-11. analysis_type：分析类型
+3. filters：用户明确的口径过滤条件（含时间，时间按【当前日期】换算成 yyyy-MM-dd 日期区间）
+4. tables：候选目标表
+5. fields：已确定字段
+6. completeness：需求映射完整度
+7. complex：是否复杂查询
+8. metric_mentions：用户提到的指标业务概念
+9. dimension_mentions：用户提到的维度业务概念
+10. analysis_type：分析类型
 
 禁止：
 - 生成SQL
@@ -180,10 +174,12 @@ route 决定本轮是否直接执行，还是先由 Advisor 澄清/核验。你�
 - 不确定时判 advisor 更安全（Advisor 会继续澄清），但不要把可以确定的查询推给 Advisor。
 - 结合【语义层指标候选】的置信度与【对话历史】判断，不允许仅根据关键词判断。
 
-【time_range规则】
-- 从 effective_query 或用户原话中提取明确时间范围（昨天/最近7天/某日/某区间）。
-- 未明确时留空 ""，由系统默认（昨天）兜底。
-- 只写业务时间范围，不要写 SQL 表达式。
+【时间写入 filters 规则】
+- 系统没有独立的时间槽位，时间条件一律写入 filters。
+- 日期必须写成 yyyy-MM-dd 字面量（如 create_time >= '2026-01-01' AND create_time <= '2026-12-31'），
+  禁止写"今年""昨天""2026年"这类相对或模糊表达。
+- "今天/昨天/今年/本月/最近N天"等相对时间按用户消息中的【当前日期】换算成具体日期区间后再写入。
+- 用户未明确时间时 filters 中不含时间条件，由系统默认（昨天）兜底。
 
 【filters规则】
 - 用户明确限定口径时输出过滤条件，如 company_category='A'（A类代理商）、platform='cos'。

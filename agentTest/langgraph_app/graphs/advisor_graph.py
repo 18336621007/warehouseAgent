@@ -2,6 +2,7 @@
 # Planner 是唯一路由者：Advisor 只负责和用户澄清、用工具核验表/字段真实性、
 # 通过 update_draft_plan 把已确认槽位写入共享草稿（status=draft）。
 # 不再锁定方案、不再请求用户最终确认，是否进入 Seeker 由 Planner 统一判定。
+from datetime import date
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
@@ -393,6 +394,10 @@ def build_advisor_subgraph(runtime):
         # candidate_text 是 Planner 检索到的候选表/候选字段摘要，追加为固定参考上下文
         if candidate_text:
             agent_history.insert(0, SystemMessage(content=candidate_text))
+        # 注入当前日期：Advisor 把"今天/昨天/今年"等相对时间换算成 yyyy-MM-dd 时以此为基准
+        agent_history.insert(0, SystemMessage(
+            content=f"【当前日期】{date.today().isoformat()}。相对时间（今天/昨天/今年/本月）按此换算成具体日期。"
+        ))
         # 多轮场景：就地替换最后一条用户消息
         if agent_history and isinstance(agent_history[-1], HumanMessage):
             current_user_message = agent_history[-1]

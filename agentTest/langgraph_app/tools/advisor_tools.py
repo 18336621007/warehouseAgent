@@ -250,7 +250,7 @@ def update_draft_plan(
     - select_fields: 需要查看的字段列表（度量+维度+明细字段统一收口），
       可为裸字段名或完整路径 "db.table.field"；无则传 []
     - filters: 过滤条件（含时间），多个条件用 AND 连接，如
-      "create_time 今年 AND region_name='徐州大区' AND status='同意返厂'"；没有时传 ""
+      "create_time >= '2026-01-01' AND create_time <= '2026-12-31' AND region_name='徐州大区' AND status='同意返厂'"；没有时传 ""
     - detail_query: 是否为明细型查询（不聚合、不 GROUP BY），默认 False
     """
     return (

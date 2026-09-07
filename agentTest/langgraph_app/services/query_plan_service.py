@@ -37,6 +37,14 @@ def _extract_time_from_filters(filters: str) -> tuple[str, str]:
     )
     if m:
         time_range = re.sub(r"\s+", "", m.group(1))
+    else:
+        # 模型按 yyyy-MM-dd 写入的标准日期（如 create_time >= '2026-01-01' AND create_time <= '2026-12-31'），
+        # 取最早/最晚日期拼成区间，供执行字段派生与 SQL 提示使用
+        dates = sorted(set(re.findall(r"20\d{2}-\d{2}-\d{2}", filters)))
+        if len(dates) == 1:
+            time_range = dates[0]
+        elif len(dates) >= 2:
+            time_range = f"{dates[0]} 至 {dates[-1]}"
     time_field = ""
     for m in re.finditer(
         r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:>=|<=|=|范围|今年|去年|昨天|今天|近|between|BETWEEN)",

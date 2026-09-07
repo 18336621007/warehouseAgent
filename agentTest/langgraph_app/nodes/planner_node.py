@@ -6,6 +6,7 @@
 #   ② LLM 解析：输出 effective_query / route / 槽位 / semantic_metrics（置信度）
 #   ③ 路由：route=seeker 时由语义层确定性构建方案（plan_synthesizer），校验通过才执行；
 #       构建失败或 route=advisor 时进入 Advisor
+from datetime import date
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage
@@ -13,6 +14,7 @@ from agentTest.langgraph_app.services.plan_synthesizer import (
     build_plan_from_semantic,
     finalize_draft_plan,
 )
+from agentTest.langgraph_app.services.query_plan_service import _extract_time_from_filters
 from agentTest.semantic_layer.metric_matcher import (
     format_metric_context,
     grep_metrics_from_keywords,
@@ -176,6 +178,17 @@ def _recall_columns(column_vector_store, question: str, table_scope: list[str]) 
         seen.add(key)
         docs.append((doc, distance))
     return docs
+
+
+def _pick_planner_time_field(fields: list) -> str:
+    """从 Planner 识别字段中提取时间字段（pt_dt/day/含 time/date 的字段名）。
+    仅作为草稿时间字段缺失时的推断兜底，字段真实性与归属由构建函数校验。"""
+    for field_ref in (fields or []):
+        name = str(field_ref).rsplit(".", 1)[-1]
+        low = name.lower()
+        if name in ("pt_dt", "day") or "time" in low or "date" in low:
+            return name
+    return ""
 
 def build_planner_node(runtime):
     # 三层索引中的表层和字段层
@@ -413,7 +426,11 @@ def build_planner_node(runtime):
                 if metadata_context.strip() and not _grep_strong
                 else ""
             )
-            sections = [f"【当前需求基线】\n{current_user_input}"]
+            # 注入当前日期：模型把"今天/昨天/今年"等相对时间换算成 yyyy-MM-dd 日期区间时以此为基准
+            sections = [
+                f"【当前日期】\n{date.today().isoformat()}",
+                f"【当前需求基线】\n{current_user_input}",
+            ]
             seeker_plan_error = state.get("seeker_plan_error") or ""
             if seeker_plan_error:
                 sections.append(
@@ -627,10 +644,11 @@ def build_planner_node(runtime):
                     metric_hits=metric_hits,
                     semantic_provider=runtime.get("semantic_metadata_provider"),
                     dimension_mentions=planner_output.dimension_mentions,
-                    time_range=planner_output.time_range,
+                    # 时间不再单独传槽位：统一由 filters 中的 yyyy-MM-dd 条件派生
                     filters=planner_output.filters,
                     draft=draft_plan,
                     complex_flag=planner_output.complex,
+                    planner_time_field=_pick_planner_time_field(planner_output.fields),
                 )
                 if plan is None and draft_plan:
                     plan = finalize_draft_plan(draft_plan)
@@ -667,7 +685,8 @@ def build_planner_node(runtime):
                 "dimensions": [],
                 "time_field": "pt_dt",
                 "filters": planner_output.filters,
-                "time_range": planner_output.time_range,
+                # 时间范围从 filters 中的 yyyy-MM-dd 条件派生，不再依赖独立槽位
+                "time_range": _extract_time_from_filters(planner_output.filters)[1],
                 "complex": planner_output.complex,
                 "completeness": completeness,
                 "plan_error": seeker_plan_error,
