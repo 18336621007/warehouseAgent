@@ -93,8 +93,10 @@ def validate_table_plan_filters(
     sql: str,
     tables: list[str],
     table_plans: list[dict],
+    required_filter_fields: list[str] | None = None,
 ) -> list[str]:
-    """校验每张参与表都存在独立过滤计划，且SQL条件中实际使用对应字段。"""
+    """校验每张参与表都存在独立过滤计划，且SQL条件中实际使用对应字段。
+    required_filter_fields 覆盖全局默认必选字段（如明细查询无 pt_dt 分区时传时间字段）。"""
     issues = []
     plan_by_table = {
         table_plan.get("table", ""): table_plan
@@ -111,14 +113,17 @@ def validate_table_plan_filters(
             continue
 
         time_field = (table_plan.get("time_field") or "").strip()
-        business_filter = (table_plan.get("filters") or "").strip()
         alias = _extract_table_alias(sql, table_name)
         if not alias:
             issues.append(f"表 {table_name} 未出现在SQL的FROM或JOIN中")
             continue
 
         # 全局必选字段必须在每张表上分别形成真实过滤，字段对字段Join不算过滤。
-        required_fields = list(REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES)
+        # 调用方可传入 required_filter_fields 覆盖默认（明细查询无 pt_dt 时用方案时间字段）。
+        required_fields = (
+            list(required_filter_fields) if required_filter_fields
+            else list(REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES)
+        )
         if time_field and time_field not in required_fields:
             required_fields.append(time_field)
         for required_field in required_fields:
@@ -128,15 +133,6 @@ def validate_table_plan_filters(
             if not _has_real_filter_condition(predicate_sql, pattern):
                 issues.append(
                     f"表 {table_name} 缺少全局必选过滤条件 {alias}.{required_field}"
-                )
-
-        if business_filter:
-            # 业务过滤允许SQL增加表别名前缀，因此使用去空格后的包含校验。
-            normalized_filter = business_filter.lower().replace(" ", "").replace("`", "")
-            normalized_predicates = predicate_sql.lower().replace(" ", "").replace("`", "")
-            if normalized_filter not in normalized_predicates:
-                issues.append(
-                    f"表 {table_name} 缺少独立业务过滤条件 {business_filter}"
                 )
 
     return issues

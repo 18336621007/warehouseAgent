@@ -76,6 +76,14 @@ def build_execute_sql_node(runtime):
         try:
             # ── 独立聚合多表 CROSS JOIN 场景：拉长 timeout 到 300s ──
             invoke_kwargs = {"sql": generated_sql}
+            # 明细查询（无 pt_dt 分区）按方案时间字段透传给执行守卫，
+            # 与 validate_sql_node 保持一致，避免无 pt_dt 的明细表被误判为全表扫描。
+            partition_fields = ["pt_dt"]
+            if confirmed_plan.get("detail_query"):
+                time_field = confirmed_plan.get("time_field", "pt_dt") or "pt_dt"
+                if time_field and time_field not in partition_fields:
+                    partition_fields.append(time_field)
+            invoke_kwargs["partition_fields"] = partition_fields
             if _is_cross_join_aggregation(generated_sql, confirmed_plan):
                 log_node_event(
                     "execute_sql",

@@ -12,8 +12,12 @@ DEFAULT_SQL_QUERY_TIMEOUT_SECONDS = 180
 def build_sql_query_tool(datasource, query_timeout_seconds=DEFAULT_SQL_QUERY_TIMEOUT_SECONDS):
     sql_query_tool = SQLQueryTool(datasource, query_timeout_seconds=query_timeout_seconds)
 
-    def run_sql_query(sql: str):
-        return sql_query_tool.run({"sql": sql})
+    def run_sql_query(sql: str, partition_fields: list[str] | None = None):
+        # partition_fields 可选：明细查询（无 pt_dt 分区）时透传方案时间字段，供执行守卫识别。
+        args = {"sql": sql}
+        if partition_fields:
+            args["partition_fields"] = partition_fields
+        return sql_query_tool.run(args)
 
     return StructuredTool.from_function(
         func=run_sql_query,

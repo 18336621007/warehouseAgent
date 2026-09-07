@@ -3,8 +3,8 @@
 #       plan_synthesizer 多指标确定性构建、草稿收尾
 import unittest
 
-from agentTest.config.advisor import MAX_PLAN_REPAIR_ROUNDS
-from agentTest.langgraph_app.routers.seeker_router import route_after_seeker
+from agentTest.config.advisor import MAX_PLAN_REPAIR_ROUNDS, MAX_ADVISOR_AUTO_CONTINUE
+from agentTest.langgraph_app.routers.seeker_router import route_after_seeker, route_after_advisor
 from agentTest.langgraph_app.graphs.supervisor_graph import plan_error_fallback_node
 from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
@@ -12,6 +12,7 @@ from agentTest.langgraph_app.services.plan_synthesizer import (
     build_plan_from_semantic,
     finalize_draft_plan,
 )
+from agentTest.langgraph_app.state.query_plan import validate_query_plan
 
 
 class SeekerRepairRoutingTest(unittest.TestCase):
@@ -31,6 +32,41 @@ class SeekerRepairRoutingTest(unittest.TestCase):
     def test_success_goes_end(self):
         self.assertEqual(route_after_seeker({"seeker_plan_error": ""}), "end")
         self.assertEqual(route_after_seeker({}), "end")
+
+
+class AdvisorAutoContinueRoutingTest(unittest.TestCase):
+    """Advisor 收尾结构化 next_step 决定是否自动回 Planner 的分派逻辑。"""
+
+    def test_return_to_planner_goes_planner(self):
+        state = {
+            "advisor_next_step": "return_to_planner",
+            "advisor_auto_rounds": 1,
+        }
+        self.assertEqual(route_after_advisor(state), "planner")
+
+    def test_wait_user_goes_end(self):
+        # 收尾要求等用户回复：即使文本没有问号也不自动回 Planner
+        state = {
+            "advisor_next_step": "wait_user",
+            "advisor_auto_rounds": 1,
+        }
+        self.assertEqual(route_after_advisor(state), "end")
+
+    def test_missing_next_step_goes_end(self):
+        # 没有结构化收尾结果（异常兜底/旧状态）时保守等用户
+        self.assertEqual(route_after_advisor({"advisor_next_step": None}), "end")
+        self.assertEqual(route_after_advisor({}), "end")
+
+    def test_auto_continue_budget_exhausted_goes_end(self):
+        state = {
+            "advisor_next_step": "return_to_planner",
+            "advisor_auto_rounds": MAX_ADVISOR_AUTO_CONTINUE + 1,
+        }
+        self.assertEqual(route_after_advisor(state), "end")
+
+
+class PlanErrorFallbackTest(unittest.TestCase):
+    """Seeker 方案不可行且修复机会耗尽时给用户的兜底回复。"""
 
     def test_fallback_node_returns_friendly_message(self):
         result = plan_error_fallback_node({
@@ -70,6 +106,92 @@ class PlanSynthesizerTest(unittest.TestCase):
         )
         # 分子分母复合表达式无法确定为单度量 → 交 Advisor
         self.assertIsNone(plan)
+
+    def test_detail_metric_with_draft_builds_plan(self):
+        # 返厂明细：明细型指标 + advisor 已确认 create_time 草稿 → 可直达 Seeker
+        sl = get_semantic_layer_provider()
+        sp = self._provider()
+        draft = {
+            "status": "draft",
+            "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
+            "measures": [],
+            "dimensions": [],
+            "time_field": "create_time",
+            "time_range": "今年",
+            "filters": "region_name = '徐州大区' AND status = '同意返厂'",
+            "field_sources": [],
+            "result_limit": 1000,
+            "complex": False,
+        }
+        plan = build_plan_from_semantic(
+            [sl.get_metric_by_id("device_return_detail")], sp,
+            dimension_mentions=[], time_range="今年",
+            filters="region_name = '徐州大区' AND status = '同意返厂'",
+            draft=draft,
+        )
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan.get("detail_query"))
+        self.assertEqual(plan.get("time_field"), "create_time")
+        self.assertEqual(plan.get("measures"), [])
+
+    def test_detail_metric_without_draft_returns_none(self):
+        # 无分区明细表且无草稿时间字段时禁止回退 pt_dt，交 Advisor 澄清日期字段
+        sl = get_semantic_layer_provider()
+        sp = self._provider()
+        plan = build_plan_from_semantic(
+            [sl.get_metric_by_id("device_return_detail")], sp,
+            dimension_mentions=[], time_range="今年",
+        )
+        self.assertIsNone(plan)
+
+    def test_finalize_detail_draft(self):
+        # 无度量无维度分组的草稿视为明细查询，可收尾锁定
+        draft = {
+            "status": "draft",
+            "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
+            "measures": [],
+            "dimensions": [],
+            "time_field": "create_time",
+            "time_range": "今年",
+            "filters": "region_name = '徐州大区' AND status = '同意返厂'",
+            "field_sources": [],
+            "result_limit": 1000,
+            "complex": False,
+        }
+        plan = finalize_draft_plan(draft)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.get("status"), "locked")
+        self.assertTrue(plan.get("detail_query"))
+
+    def test_locked_detail_plan_passes_seeker_validation(self):
+        # Planner 直接构建的 locked 明细方案应通过 Seeker 入口校验（无用户确认环节）
+        locked = {
+            "status": "locked",
+            "table": "ads_trip.ads_gundam_device_return_detail_hour",
+            "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
+            "measures": [],
+            "dimensions": [],
+            "time_field": "create_time",
+            "time_range": "今年",
+            "filters": "region_name = '徐州大区' AND status = '同意返厂'",
+            "fields": ["create_time", "region_name", "status"],
+            "field_sources": {},
+            "detail_query": True,
+            "table_plans": [
+                {
+                    "table": "ads_trip.ads_gundam_device_return_detail_hour",
+                    "time_field": "create_time",
+                    "time_range": "今年",
+                    "filters": "region_name = '徐州大区' AND status = '同意返厂'",
+                }
+            ],
+            "result_limit": 1000,
+            "complex": False,
+            "order_by": [],
+            "having": "",
+        }
+        errors = validate_query_plan(locked, require_confirmed=False)
+        self.assertEqual(errors, [])
 
     def test_finalize_draft_valid(self):
         draft = {

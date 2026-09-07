@@ -9,7 +9,7 @@ from agentTest.langgraph_app.graphs.seeker_graph import build_seeker_subgraph
 from langgraph.checkpoint.memory import MemorySaver
 from agentTest.langgraph_app.nodes.capture_user_message_node import capture_user_message_node
 from agentTest.langgraph_app.routers.planner_router import route_after_planner
-from agentTest.langgraph_app.routers.seeker_router import route_after_seeker
+from agentTest.langgraph_app.routers.seeker_router import route_after_seeker, route_after_advisor
 
 
 def plan_error_fallback_node(state):
@@ -71,7 +71,15 @@ def build_supervisor_graph(runtime):
         },
     )
     supervisor.add_edge("plan_error_fallback", END)
-    supervisor.add_edge("advisor", END)
+    # Advisor 更新草稿后可自动回 Planner 再判定；否则结束等用户输入
+    supervisor.add_conditional_edges(
+        "advisor",
+        route_after_advisor,
+        {
+            "planner": "planner",
+            "end": END,
+        },
+    )
 
     checkpointer = MemorySaver()
     return supervisor.compile(checkpointer=checkpointer)

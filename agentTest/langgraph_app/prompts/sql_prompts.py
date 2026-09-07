@@ -24,7 +24,8 @@ def build_sql_generation_prompt():
         - 昨天：pt_dt = date_format(date_sub(current_date(), 1), 'yyyyMMdd')（也可直接写 8 位字面量，如 pt_dt = '20260826'）
         - 今天：pt_dt = date_format(current_date(), 'yyyyMMdd')
         - 近N天：pt_dt >= date_format(date_sub(current_date(), N), 'yyyyMMdd') AND pt_dt <= date_format(current_date(), 'yyyyMMdd')
-    11. 所有查询必须包含 pt_dt 分区过滤条件
+    11. 所有查询必须包含方案指定的时间字段过滤条件（时间字段见 confirmed_section：
+        通常是 pt_dt 分区，明细查询可能是 create_time 等业务时间字段），比较值格式按该字段类型确定
     12. 如果 {example_section} 不为空，请参考历史优质案例：
         - 字段的聚合方式（SUM/COUNT/AVG/窗口函数等模式）
         - GROUP BY 包含哪些维度

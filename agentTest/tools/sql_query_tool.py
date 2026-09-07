@@ -41,7 +41,10 @@ class SQLQueryTool:
                 raise ValueError(f"illegal hive sql: {message}")
 
              # 再做 AST Guardrails 资源保护校验
-            is_valid, message = validate_sql_with_guardrails(sql)
+            # partition_fields 允许调用方透传方案时间/分区字段（如明细表无 pt_dt 时用 create_time），
+            # 未传时回退默认 pt_dt（与 hive_guardrails.PARTITION_FIELDS 一致）。
+            partition_fields = args.get("partition_fields")
+            is_valid, message = validate_sql_with_guardrails(sql, partition_fields=partition_fields)
             if not is_valid:
                 raise ValueError(f"illegal hive sql: {message}")
 

@@ -77,3 +77,10 @@ class BaseState(TopicState, total=False):
     seeker_plan_error: str
     # 已消费的执行失败修复轮次，用于限制回 Planner 次数
     plan_repair_rounds: int
+
+    # Advisor 本轮是否推进了草稿（兼容旧字段，供 trace 参考；路由已改用 advisor_next_step）
+    advisor_draft_updated: bool
+    # Advisor 连续自动回 Planner 的轮次（防 planner↔advisor 死循环）
+    advisor_auto_rounds: int
+    # Advisor 收尾结构化动作：wait_user=等用户，return_to_planner=回 Planner 再判定
+    advisor_next_step: str

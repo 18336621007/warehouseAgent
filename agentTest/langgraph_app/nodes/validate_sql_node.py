@@ -107,7 +107,13 @@ def validate_sql_node(state: AgentState):
             "topic_status": "validating_sql",
         }
     # 资源保护校验
-    is_valid, message = validate_sql_with_guardrails(generated_sql)
+    confirmed_plan = state.get("confirmed_plan") or {}
+    # 明细查询（无 pt_dt 分区）时间过滤按方案时间字段，与下方逐表过滤校验保持一致；
+    # 普通聚合查询默认只认 pt_dt。
+    partition_fields = ["pt_dt"]
+    if confirmed_plan.get("detail_query"):
+        partition_fields.append(confirmed_plan.get("time_field", "pt_dt") or "pt_dt")
+    is_valid, message = validate_sql_with_guardrails(generated_sql, partition_fields=partition_fields)
     if not is_valid:
         return {
             "sql_valid": False,
@@ -143,10 +149,15 @@ def validate_sql_node(state: AgentState):
         }
 
     # 逐表过滤属于执行前硬门禁，防止历史分区重复参与Join导致数据膨胀。
+    # 明细查询（无 pt_dt 分区）按方案时间字段校验过滤，不再强求 pt_dt。
+    detail_required = ["pt_dt"]
+    if confirmed_plan.get("detail_query"):
+        detail_required = [confirmed_plan.get("time_field", "pt_dt") or "pt_dt"]
     table_filter_issues = validate_table_plan_filters(
         generated_sql,
         confirmed_plan.get("tables") or [confirmed_plan.get("table", "")],
         confirmed_plan.get("table_plans") or [],
+        required_filter_fields=detail_required,
     )
     if table_filter_issues:
         return {

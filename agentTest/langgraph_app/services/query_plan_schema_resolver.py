@@ -98,9 +98,10 @@ class QueryPlanSchemaResolver:
 
     def resolve(self, confirmed_plan: dict) -> dict:
         # Seeker 入口必须再次执行完整方案校验
+        # 新架构下无用户确认环节：Planner 确定性构建/锁定的 locked 方案即可执行
         plan_errors = validate_query_plan(
             confirmed_plan,
-            require_confirmed=True,
+            require_confirmed=False,
         )
         if plan_errors:
             raise ValueError(

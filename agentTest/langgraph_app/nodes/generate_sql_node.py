@@ -218,11 +218,23 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     return "\n".join(sql_lines)
 
 
+def _detail_required_fields(confirmed_plan: dict) -> list[str]:
+    """明细查询（无 pt_dt 分区）按方案时间字段校验过滤，否则用全局默认 pt_dt。"""
+    if confirmed_plan.get("detail_query"):
+        return [confirmed_plan.get("time_field", "pt_dt") or "pt_dt"]
+    return ["pt_dt"]
+
+
 def _repair_missing_table_filters(sql: str, confirmed_plan: dict) -> tuple[str, list[str]]:
     """简单查询缺少逐表过滤时，使用已确认方案确定性重建安全SQL。"""
     tables = confirmed_plan.get("tables") or []
     table_plans = confirmed_plan.get("table_plans") or []
-    filter_issues = validate_table_plan_filters(sql, tables, table_plans)
+    filter_issues = validate_table_plan_filters(
+        sql,
+        tables,
+        table_plans,
+        required_filter_fields=_detail_required_fields(confirmed_plan),
+    )
     if not filter_issues or confirmed_plan.get("complex", False):
         return sql, filter_issues
 
@@ -243,6 +255,7 @@ def _repair_missing_table_filters(sql: str, confirmed_plan: dict) -> tuple[str, 
         fallback_sql,
         tables,
         table_plans,
+        required_filter_fields=_detail_required_fields(confirmed_plan),
     )
     if repaired_issues:
         return sql, filter_issues
@@ -257,7 +270,6 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
     time_field = confirmed_plan.get("time_field", "pt_dt")
-    filters = confirmed_plan.get("filters", "")
 
     if not table:
         return issues
@@ -310,15 +322,9 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
         sql,
         tables or [table],
         confirmed_plan.get("table_plans") or [],
+        required_filter_fields=_detail_required_fields(confirmed_plan),
     )
     issues.extend(table_filter_issues)
-
-    # 6. filters 校验
-    if filters and filters.strip():
-        filter_normalized = filters.strip().lower().replace(" ", "")
-        sql_normalized = sql.lower().replace(" ", "")
-        if filter_normalized not in sql_normalized:
-            issues.append(f"过滤条件 '{filters}' 未出现在 SQL 的 WHERE 中")
 
     return issues
 
@@ -448,6 +454,13 @@ def build_generate_sql_node(runtime):
                 parts.append(f"- 度量字段（必须用聚合函数 SUM/COUNT/AVG）: {', '.join(measures)}")
             if dimensions:
                 parts.append(f"- 维度字段（必须在 SELECT 和 GROUP BY 中）: {', '.join(dimensions)}")
+            # 明细查询：无度量字段，不聚合不分组，直接查明细行
+            if confirmed_plan.get("detail_query"):
+                parts.append(
+                    "- 查询类型：明细查询（detail）——不聚合、不 GROUP BY，"
+                    "直接 SELECT 需要展示的字段（无指定字段时可用 *），"
+                    "必须带 WHERE 时间过滤与 LIMIT"
+                )
             time_range_cs = confirmed_plan.get("time_range", "") or "昨天"
             parts.append(f"- 主表时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
             if filters:

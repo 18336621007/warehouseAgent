@@ -120,7 +120,8 @@ def validate_query_plan(
             errors.append(f"{field_name} 中存在非法字段名")
 
     # 纯维度查询允许 measures 为空，但不能连维度也没有
-    if not measures and not dimensions:
+    # 明细查询（detail_query）直接返回明细行，允许两者同时为空
+    if not measures and not dimensions and not plan.get("detail_query"):
         errors.append("measures 和 dimensions 不能同时为空")
 
     if not isinstance(time_field, str) or not time_field.strip():

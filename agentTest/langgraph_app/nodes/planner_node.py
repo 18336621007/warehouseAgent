@@ -212,6 +212,8 @@ def build_planner_node(runtime):
     def planner_node(state):
         # 每次调用只要求传入本轮输入
         current_user_input = state["current_user_input"]
+        # 区分本轮触发来源：Advisor 收尾结构化 return_to_planner（自动回 Planner）还是用户新输入
+        from_advisor = state.get("advisor_next_step") == "return_to_planner"
 
         # 去 Topic 化：不再使用 original_question 固定基线，
         # 当前需求由 LLM 结合【完整对话历史】+【本轮输入】每轮判断（query 改写 effective_query）
@@ -736,6 +738,12 @@ def build_planner_node(runtime):
                 "analysis_spec": analysis_spec,
                 "follow_up_mode": planner_output.follow_up_mode,  # 供 web 层决定后续处理
             }
+            # 消费 Advisor 自动回环标记：本轮结束后清空，避免下轮误判
+            return_value["advisor_draft_updated"] = False
+            return_value["advisor_next_step"] = None
+            if not from_advisor:
+                # 用户新输入触发：重置 Advisor 自动回环计数（防死循环）
+                return_value["advisor_auto_rounds"] = 0
             # 去 Topic 化：不再写入 original_question（当前需求以 effective_query 为准）
             # 用户最终确认后，写回 status=confirmed 的查询方案
             if updated_plan is not None:

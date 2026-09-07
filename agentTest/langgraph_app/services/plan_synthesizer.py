@@ -89,7 +89,9 @@ def build_plan_from_semantic(
 ):
     """从语义层指标命中确定性构建完整查询方案，失败返回 None（由 Planner 降级 Advisor）。
 
-    只支持表达式能唯一解析出单个物理字段的指标（新增/退租/租赁等计数指标）；
+    支持两类指标：
+    - 计数指标：表达式能唯一解析出单个物理字段（新增/退租/租赁等）；
+    - 明细指标（query_type=detail 或 expression='*')：不聚合，无度量字段。
     续租率等分子分母复合表达式指标返回 None，交由 Advisor 澄清落草稿。
     """
     if not metric_hits:
@@ -100,6 +102,8 @@ def build_plan_from_semantic(
     tables = []
     field_sources = {}
     concept_resolutions = {}
+    # 是否存在明细型指标（query_type=detail 或 expression='*')：无度量字段
+    detail_flag = False
 
     # 每个指标 → 来源表 + 物理字段（语义层权威）
     for hit in metric_hits:
@@ -107,6 +111,13 @@ def build_plan_from_semantic(
         expression = str(hit.get("expression") or "")
         if not src:
             return None
+        # 明细型指标：不聚合、无度量字段，只登记来源表
+        is_detail = (
+            str(hit.get("query_type") or "").lower() == "detail"
+            or str(expression) == "*"
+        )
+        if is_detail:
+            detail_flag = True
         candidate_fields = set()
         model = sl.get_semantic_model(src)
         if model:
@@ -116,6 +127,17 @@ def build_plan_from_semantic(
         phys = sl.get_physical_table(src)
         if phys:
             candidate_fields.update((phys.get("fields") or {}).keys())
+        if is_detail:
+            # 明细查询：来源表登记，无单一度量字段
+            if src not in tables:
+                tables.append(src)
+            concept_resolutions[str(hit.get("name") or hit.get("id") or "")] = {
+                "field": "*",
+                "table": src,
+                "source": "semantic_layer",
+                "concept_type": "metric",
+            }
+            continue
         fields_found = _extract_measure_fields(expression, candidate_fields)
         # 复合表达式（0 或多个物理字段）无法确定为单个度量 → 交给 Advisor
         if len(fields_found) != 1:
@@ -189,13 +211,18 @@ def build_plan_from_semantic(
 
     draft = draft or {}
 
-    # 时间：草稿确认 > Planner 槽位 > 默认
+    # 时间：草稿确认 > Planner 槽位 > 分区字段
     main_table = tables[0] if tables else ""
     time_field = (
         str(draft.get("time_field") or "")
         or semantic_provider.get_table_time_field(main_table)
-        or "pt_dt"
+        or ""
     )
+    # 无分区明细表（如返厂明细）必须由 Advisor 确认业务时间字段，禁止回退默认 pt_dt
+    if detail_flag and not time_field:
+        return None
+    if not time_field:
+        time_field = "pt_dt"
     final_time_range = str(draft.get("time_range") or "") or time_range or "昨天"
 
     # 过滤：草稿确认与 Planner 槽位合并去重
@@ -218,7 +245,8 @@ def build_plan_from_semantic(
             if owner_table not in tables:
                 tables.append(owner_table)
 
-    if not measures and not dimensions:
+    # 明细查询允许无度量字段；普通聚合方案必须至少有度量或维度
+    if not measures and not dimensions and not detail_flag:
         return None
     if not tables:
         return None
@@ -227,6 +255,7 @@ def build_plan_from_semantic(
         "tables": tables,
         "measures": list(dict.fromkeys(measures)),
         "dimensions": list(dict.fromkeys(dimensions)),
+        "detail_query": detail_flag,
         "time_field": time_field,
         "time_range": final_time_range,
         "filters": final_filters,
@@ -252,8 +281,12 @@ def finalize_draft_plan(draft):
     if not draft:
         return None
     try:
+        plan = dict(draft)
+        # 无度量且无维度分组的草稿视为明细查询（detail_query），放行空度量校验
+        if not plan.get("measures") and not plan.get("dimensions"):
+            plan["detail_query"] = True
         locked = lock_query_plan(
-            dict(draft),
+            plan,
             concept_resolutions=draft.get("concept_resolutions"),
         )
         if validate_field_table_bindings(locked):

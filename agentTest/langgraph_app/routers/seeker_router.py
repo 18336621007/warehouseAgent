@@ -1,5 +1,5 @@
 # Seeker 子图内/父图路由：处理方案不可行时的回退与修复
-from agentTest.config.advisor import MAX_PLAN_REPAIR_ROUNDS
+from agentTest.config.advisor import MAX_PLAN_REPAIR_ROUNDS, MAX_ADVISOR_AUTO_CONTINUE
 
 
 def route_after_schema(state):
@@ -21,4 +21,19 @@ def route_after_seeker(state):
         if (state.get("plan_repair_rounds") or 0) < MAX_PLAN_REPAIR_ROUNDS:
             return "repair"
         return "fallback"
+    return "end"
+
+
+def route_after_advisor(state):
+    """Supervisor 父图：Advisor 结束后是否需要自动回 Planner 再判定。
+
+    - Advisor 收尾结构化输出 next_step=return_to_planner 且自动回环未超上限 → 回 planner
+    - 否则 → 结束，等待用户下一轮输入
+    程序只读结构化字段，不解析最终回复文本/标点判断是否提问。
+    """
+    if (
+        state.get("advisor_next_step") == "return_to_planner"
+        and (state.get("advisor_auto_rounds") or 0) <= MAX_ADVISOR_AUTO_CONTINUE
+    ):
+        return "planner"
     return "end"

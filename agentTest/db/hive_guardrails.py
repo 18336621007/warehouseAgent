@@ -42,9 +42,11 @@ def is_table_allowed(table_name: str, database_name: str = "") -> bool:
     return _scope_is_allowed_table(table_name, database_name)
 
 
-def validate_sql_with_guardrails(sql: str):
+def validate_sql_with_guardrails(sql: str, partition_fields: list[str] | None = None):
+    # partition_fields 允许调用方覆盖默认时间/分区字段：
+    # 明细查询（无 pt_dt 分区）按方案时间字段校验，普通查询默认只认 pt_dt。
     return validate_sql_ast_guardrails(
         sql=sql,
         allow_table_fn=is_table_allowed,
-        partition_fields=PARTITION_FIELDS,
+        partition_fields=partition_fields or PARTITION_FIELDS,
     )

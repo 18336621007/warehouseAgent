@@ -5,6 +5,7 @@
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
+from langchain_core.prompts import ChatPromptTemplate
 from agentTest.langgraph_app.state.advisor_state import AdvisorState
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body, get_stream_output_enabled
 from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
@@ -14,11 +15,16 @@ from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
 from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
-from agentTest.langgraph_app.prompts.advisor_prompt import ADVISOR_SYSTEM_PROMPT
+from agentTest.langgraph_app.prompts.advisor_prompt import (
+    ADVISOR_SYSTEM_PROMPT,
+    ADVISOR_WRAPUP_SYSTEM_PROMPT,
+    ADVISOR_WRAPUP_TEMPLATE,
+    AdvisorOutput,
+)
 from agentTest.config.advisor import (
     MAX_COLUMN_CHECK_RETRIES,
 )
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.callbacks import BaseCallbackHandler
 from agentTest.langgraph_app.services.query_plan_service import (
     merge_draft_plan,
@@ -196,6 +202,22 @@ def build_advisor_subgraph(runtime):
         tools,
         system_prompt=ADVISOR_SYSTEM_PROMPT,
     )
+
+    # 收尾结构化输出：独立 LLM（不带思考 token 处理器），
+    # 避免结构化 JSON token 混入思考流；结果由程序只读字段，不解析文本/标点
+    wrapup_llm = ChatOpenAI(
+        api_key=get_openai_api_key(),
+        base_url=get_openai_base_url(),
+        model=get_model_name(),
+        temperature=0,
+        extra_body=get_model_extra_body(),
+        callbacks=[build_llm_logging_handler("advisor")],
+    )
+    wrapup_structured_llm = wrapup_llm.with_structured_output(AdvisorOutput)
+    wrapup_prompt = ChatPromptTemplate.from_messages([
+        ("system", ADVISOR_WRAPUP_SYSTEM_PROMPT),
+        ("human", ADVISOR_WRAPUP_TEMPLATE),
+    ])
 
     graph = StateGraph(AdvisorState)
 
@@ -483,13 +505,68 @@ def build_advisor_subgraph(runtime):
             draft_args, _ = draft_args_list[-1]
             draft_plan = merge_draft_plan(current_plan, draft_args)
 
-        # 最终回复：LLM 自主决定对用户说什么（问题/解释/简短告知）
-        final_answer = str(getattr(last_msg, "content", "") or "").strip()
-        if not final_answer:
+        # 最终回复底稿：取最后一条不含工具调用的 AIMessage 文本作为兜底。
+        # ReAct 最后一步若以工具调用结尾，其 content 只是内部叙述（如"草稿已更新"），
+        # 不能当作给用户的回复；真正给用户的回复由下方收尾结构化输出统一生成。
+        answer_msg = None
+        draft_answer = ""
+        for msg in reversed(current_round_messages):
+            if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                answer_msg = msg
+                draft_answer = str(msg.content or "").strip()
+                break
+        if not draft_answer:
             if draft_plan is not None:
-                final_answer = "已更新当前方案的草稿，请继续补充或确认缺失的口径。"
+                draft_answer = "已更新当前方案的草稿，请继续补充或确认缺失的口径。"
             else:
-                final_answer = _normalize_clarification_message("")
+                draft_answer = _normalize_clarification_message("")
+
+        # ── 收尾：结构化输出最终回复与下一步动作 ──
+        # 不靠解析文本/标点判断是否等用户，由 LLM 明确输出 final_answer + next_step；
+        # 程序只按结构化字段执行：wait_user=等用户，return_to_planner=回 Planner 再判定
+        recent_agent_lines = []
+        for m in current_round_messages[-6:]:
+            if isinstance(m, ToolMessage):
+                # 工具结果通常很长，不进入收尾判断
+                continue
+            if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+                # 工具调用只记工具名，避免把完整参数带进收尾判断
+                tool_names = ", ".join(
+                    tc.get("name", "?") for tc in m.tool_calls
+                )
+                recent_agent_lines.append(f"调用工具: {tool_names}")
+            else:
+                m_content = str(m.content or "").strip()
+                if m_content:
+                    recent_agent_lines.append(m_content[:300])
+        if draft_plan is not None:
+            draft_text = (
+                f"状态：{draft_plan.get('status', '未设置')}\n"
+                f"数据表：{', '.join(draft_plan.get('tables') or []) or '未设置'}\n"
+                f"度量：{', '.join(draft_plan.get('measures') or []) or '无'}\n"
+                f"维度：{', '.join(draft_plan.get('dimensions') or []) or '无'}\n"
+                f"时间字段：{draft_plan.get('time_field', '未设置')}\n"
+                f"时间范围：{draft_plan.get('time_range', '未设置')}\n"
+                f"过滤条件：{draft_plan.get('filters', '') or '无'}"
+            )
+        else:
+            draft_text = "无（本轮未更新草稿）"
+        wrapup_prompt_value = wrapup_prompt.invoke({
+            "effective_query": effective_query or current_user_input,
+            "draft_plan": draft_text,
+            "recent_messages": "\n".join(recent_agent_lines) or "无",
+        })
+        try:
+            advisor_output = wrapup_structured_llm.invoke(wrapup_prompt_value)
+        except Exception as _e:
+            # 收尾结构化输出失败时安全兜底：沿用底稿回复并等用户，避免程序崩溃
+            log_node_event("advisor_agent", f"收尾结构化输出失败，回退兜底: {_e}")
+            advisor_output = AdvisorOutput(
+                final_answer=draft_answer,
+                next_step="wait_user",
+            )
+        final_answer = (advisor_output.final_answer or "").strip() or draft_answer
+        next_step = advisor_output.next_step
 
         log_node_end(
             "advisor_agent",
@@ -506,7 +583,7 @@ def build_advisor_subgraph(runtime):
             if isinstance(message, HumanMessage):
                 continue
             # Agent原始最终回复由带name的标准消息代替
-            if message is last_msg:
+            if answer_msg is not None and message is answer_msg:
                 continue
             messages_to_persist.append(message)
 
@@ -526,11 +603,24 @@ def build_advisor_subgraph(runtime):
             "advisor_thinking": thinking_collector.lines,
             # Advisor 只负责澄清与维护草稿，本轮结束后等 Planner 再判定
             "topic_status": "clarifying",
+            # 收尾结构化动作：wait_user=等用户，return_to_planner=回 Planner 再判定
+            "advisor_next_step": next_step,
+            # 兼容旧字段：草稿是否推进等价于是否回 Planner（供 trace 参考）
+            "advisor_draft_updated": next_step == "return_to_planner",
         }
 
         if draft_plan is not None:
             # 草稿以 draft 状态持久化，供 Planner 下一轮合并收尾
             return_value["confirmed_plan"] = draft_plan
+
+        if next_step == "return_to_planner":
+            # 本轮回 Planner 再判定：累计自动回环轮次（防 planner↔advisor 死循环）
+            return_value["advisor_auto_rounds"] = (
+                state.get("advisor_auto_rounds") or 0
+            ) + 1
+        else:
+            # 本轮等用户回复：重置自动回环计数，新一轮用户输入重新计数
+            return_value["advisor_auto_rounds"] = 0
 
         # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
         log_state_snapshot("advisor", {**state, **return_value})
