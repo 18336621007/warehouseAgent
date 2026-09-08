@@ -16,6 +16,10 @@ from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
 from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
 from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
+from agentTest.langgraph_app.tools.result_query_tool import (
+    set_result_conversation,
+    reset_result_conversation,
+)
 from agentTest.langgraph_app.prompts.advisor_prompt import (
     ADVISOR_SYSTEM_PROMPT,
     ADVISOR_WRAPUP_SYSTEM_PROMPT,
@@ -222,7 +226,7 @@ def build_advisor_subgraph(runtime):
 
     graph = StateGraph(AdvisorState)
 
-    def run_advisor(state):
+    def _run_advisor_inner(state):
         """处理用户问题：澄清口径 + 校验表/字段 + 更新共享草稿。
 
         Planner 提供还原后的完整需求；Advisor 不锁定方案、不决定是否执行，
@@ -629,6 +633,14 @@ def build_advisor_subgraph(runtime):
         log_state_snapshot("advisor", {**state, **return_value})
 
         return return_value
+
+    def run_advisor(state):
+        # 注入当前会话上下文，query_stored_result 工具只读本会话落盘目录
+        token = set_result_conversation(str(state.get("conversation_id") or ""))
+        try:
+            return _run_advisor_inner(state)
+        finally:
+            reset_result_conversation(token)
 
     # 简单单节点子图：START -> run_advisor -> END
     graph.add_node("run_advisor", run_advisor)

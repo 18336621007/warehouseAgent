@@ -60,6 +60,19 @@ class ResultStoreTest(unittest.TestCase):
         self.assertEqual(index[0]["round_no"], 1)
         self.assertEqual(index[0]["row_count"], 5)
 
+    def test_save_writes_meta(self):
+        state = self._state(rid="req-1", query="查询返厂明细")
+        result_store.save_query_result(state, self._sql_result(5))
+        conv_dir = result_store._conversation_dir("conv1")
+        meta_path = conv_dir / "req-1_meta.json"
+        self.assertTrue(meta_path.exists())
+        import json
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(meta["round_no"], 1)
+        self.assertEqual(meta["effective_query"], "查询返厂明细")
+        self.assertEqual(meta["row_count"], 5)
+        self.assertEqual(meta["full_csv"], "req-1_full.csv")
+
     def test_resolve_by_round_and_id(self):
         result_store.save_query_result(self._state(rid="req-1"), self._sql_result(3))
         result_store.save_query_result(self._state(rid="req-2", query="查询新增订单"), self._sql_result(4))
@@ -83,9 +96,10 @@ class ResultStoreTest(unittest.TestCase):
         # 保留最近 3 轮
         self.assertEqual(len(index), 3)
         self.assertEqual(index[0]["round_no"], 3)
-        # 被挤出的结果文件应被清理
+        # 被挤出的结果文件应被清理（含 meta）
         conv_dir = result_store._conversation_dir("conv1")
         self.assertFalse((conv_dir / "req-0.json").exists())
+        self.assertFalse((conv_dir / "req-0_meta.json").exists())
         self.assertTrue((conv_dir / "req-4.json").exists())
 
     def test_same_conversation_reuses_dir_across_days(self):

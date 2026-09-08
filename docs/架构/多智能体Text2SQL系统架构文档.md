@@ -696,12 +696,12 @@ lock_query_plan
 连续问答在现有状态契约上实现，不新增 FollowUp Agent，由现有 Capture / Planner / Advisor / Seeker 链路完成：
 
 ```text
-Capture → Planner（结合完整对话历史 + last_query_result 判断 user_selection / follow_up_mode；去 pending 后不再依赖跨轮候选证据）
+Capture → Planner（结合完整对话历史 + last_query_result 判断 user_selection 与连续问答类型；去 pending 后不再依赖跨轮候选证据）
   ↓
 Advisor / Seeker
 ```
 
-- Planner LLM 结合【完整对话历史 + 结果快照】判断 `user_selection` 与 `follow_up_mode`，程序 `validate_user_selection` 只做白名单校验，不写死编号/字段名解析规则。
+- Planner LLM 结合【完整对话历史 + 结果快照】自行判断连续问答类型（新查询 / 追问历史结果 / 改方案 / 问口径），不再输出 `follow_up_mode` 结构化字段；程序只做白名单校验等安全兜底，不写死编号/字段名解析规则。
 - 结果追问、方案增量修改、候选解释或新查询由 Planner 统一判断，不再单独拆 FollowUpAnalyzer。
 - Planner 继续负责形成完整有效需求和 AnalysisSpec。
 - Advisor 继续负责元数据核验与业务澄清。

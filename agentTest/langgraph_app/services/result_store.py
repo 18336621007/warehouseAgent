@@ -199,13 +199,40 @@ def save_query_result(state, sql_result) -> dict:
         }
         _dump_json(conv_dir / f"{request_id}.json", entry)
 
+        # 每轮任务元数据（仿 Codex rollout 事件流）：原问题/路由/命中的指标/SQL/结果摘要，
+        # 供审计与后续 LLM 读取落盘结果时先看 meta 再决定读哪个 CSV
+        planner_entities = state.get("planner_entities") or {}
+        semantic_metrics = planner_entities.get("semantic_metrics") or []
+        meta = {
+            "request_id": request_id,
+            "round_no": round_no,
+            "created_at": entry.get("created_at"),
+            "effective_query": entry.get("effective_query"),
+            "current_user_input": str(state.get("current_user_input") or ""),
+            "route": str(planner_entities.get("route") or state.get("route") or ""),
+            "semantic_metric_ids": [
+                str(m.get("id") or "") for m in semantic_metrics if isinstance(m, dict)
+            ],
+            "generated_sql": str(state.get("generated_sql") or ""),
+            "row_count": row_count,
+            "columns": columns,
+            "result_file": entry.get("file"),
+            "full_csv": full_csv,
+        }
+        _dump_json(conv_dir / f"{request_id}_meta.json", meta)
+
         # 更新索引：追加 + 只保留最近 MAX_ROUNDS 轮，被挤出的结果文件一并删除
         index["results"].append(entry)
         overflow = index["results"][:-RESULT_STORE_MAX_ROUNDS] if RESULT_STORE_MAX_ROUNDS > 0 else []
         index["results"] = index["results"][-RESULT_STORE_MAX_ROUNDS:] if RESULT_STORE_MAX_ROUNDS > 0 else []
         _dump_json(_index_path(conv_dir), index)
         for old in overflow:
-            _remove_files(conv_dir, old.get("file"), old.get("full_csv"))
+            _remove_files(
+                conv_dir,
+                old.get("file"),
+                old.get("full_csv"),
+                f"{old.get('source_request_id') or ''}_meta.json",
+            )
         _cleanup_old_days()
 
         return {

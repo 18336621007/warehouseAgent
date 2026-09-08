@@ -182,21 +182,8 @@ def _recall_columns(column_vector_store, question: str, table_scope: list[str]) 
         seen.add(key)
         docs.append((doc, distance))
     return docs
-
-
-def _pick_planner_time_field(fields: list) -> str:
-    """从 Planner 识别字段中提取时间字段（pt_dt/day/含 time/date 的字段名）。
-    仅作为草稿时间字段缺失时的推断兜底，字段真实性与归属由构建函数校验。"""
-    for field_ref in (fields or []):
-        name = str(field_ref).rsplit(".", 1)[-1]
-        low = name.lower()
-        if name in ("pt_dt", "day") or "time" in low or "date" in low:
-            return name
-    return ""
-
-
-def _build_minimal_plan(planner_output, shared_plan: dict) -> dict | None:
-    """Planner 判定 seeker 但语义层未命中时，用共享方案 + Planner 输出构造最小方案。
+def _build_minimal_plan(planner_output) -> dict | None:
+    """Planner 判定 seeker 但语义层未命中时，用 Planner 输出构造最小方案。
 
     聚合表达式（count(*)/sum(x)）与时间字段不作为分组维度，
     聚合由 generate_sql 的 LLM 根据 effective_query 生成。"""
@@ -204,11 +191,6 @@ def _build_minimal_plan(planner_output, shared_plan: dict) -> dict | None:
     fields = list(planner_output.fields or [])
     filters = planner_output.filters or ""
     analysis_type = planner_output.analysis_type or ""
-    if shared_plan:
-        tables = list(shared_plan.get("tables") or tables)
-        fields = list(dict.fromkeys((shared_plan.get("select_fields") or []) + fields))
-        filters = shared_plan.get("filters") or filters
-        analysis_type = shared_plan.get("analysis_type") or analysis_type
     if not tables:
         return None
     # 清洗聚合表达式（不是物理字段，由 LLM 负责聚合）；聚合时时间字段不参与分组
@@ -235,7 +217,8 @@ def _build_minimal_plan(planner_output, shared_plan: dict) -> dict | None:
 
 
 def _format_result_index(result_index: list) -> str:
-    """把结果历史索引格式化成轻量文本（只含摘要，供 LLM 指代历史结果轮次）。"""
+    """把结果历史索引格式化成轻量文本（只含摘要，供 LLM 指代历史结果轮次）。
+    含引用标识 result_id 与 CSV 路径，供 LLM 决定是否基于落盘结果回答。"""
     lines = []
     for entry in result_index:
         round_no = entry.get("round_no", "")
@@ -244,6 +227,12 @@ def _format_result_index(result_index: list) -> str:
         row_count = entry.get("row_count", 0)
         columns = ", ".join((entry.get("columns") or [])[:8])
         line = f"- 第{round_no}轮 ({created_at}): {query} | {row_count}行 | 列: {columns}"
+        result_id = entry.get("result_id", "")
+        full_csv = entry.get("full_csv", "")
+        if result_id:
+            line += f" | 引用: {result_id}"
+        if full_csv:
+            line += f" | CSV: {full_csv}"
         entity_keys = entry.get("entity_keys") or []
         if entity_keys:
             line += f" | 实体键: {', '.join(str(k) for k in entity_keys[:5])}"
@@ -674,8 +663,7 @@ def build_planner_node(runtime):
             # ── Planner 是唯一路由者：LLM 判定 route，程序只做方案安全网 ──
             updated_plan = None
             route_llm = planner_output.route or "advisor"
-            # 共享方案（不再区分草稿/提交状态），Advisor 持续更新、Planner 读取
-            shared_plan = confirmed_plan if confirmed_plan else None
+            # 共享方案（不再区分草稿/提交状态）：Advisor 澄清时更新、Planner 执行时覆盖
 
             if route_llm == "seeker":
                 # 只采信 LLM 判定相关（>=候选阈值）的语义层命中
@@ -700,19 +688,19 @@ def build_planner_node(runtime):
                     key=lambda h: _conf_by_id.get(str(h.get("id") or ""), 0.0),
                     reverse=True,
                 )
-                # 语义层确定性构建方案（语义层优先）；未命中时用共享方案构造最小方案直通
+                # 语义层确定性构建方案（语义层优先）；未命中时用 Planner 输出构造最小方案直通
                 plan = build_plan_from_semantic(
                     metric_hits=metric_hits,
                     semantic_provider=runtime.get("semantic_metadata_provider"),
                     dimension_mentions=planner_output.dimension_mentions,
                     # 时间不再单独传槽位：统一由 filters 中的 yyyy-MM-dd 条件派生
                     filters=planner_output.filters,
-                    draft=shared_plan,
+                    # 每轮基于 effective_query 重建方案，不继承旧 confirmed_plan
+                    draft=None,
                     complex_flag=planner_output.complex,
-                    planner_time_field=_pick_planner_time_field(planner_output.fields),
                 )
                 if plan is None:
-                    plan = _build_minimal_plan(planner_output, shared_plan)
+                    plan = _build_minimal_plan(planner_output)
                 if plan is not None:
                     updated_plan = plan
                     tables = plan.get("tables", [])
@@ -729,14 +717,9 @@ def build_planner_node(runtime):
                         "Planner 判定 seeker 但方案构建失败，降级 Advisor 澄清："
                         + planner_output.reason
                     )
-            elif route_llm == "result_review":
-                # 用户引用历史查询结果：不构建新方案，直接回顾对应轮次结果
-                route = "result_review"
-                planner_reason = (
-                    "Planner 判定回顾历史查询结果："
-                    + planner_output.reason
-                )
             else:
+                # 澄清/核验/回顾历史结果统一进入 Advisor：
+                # Advisor 可用 query_stored_result 工具读落盘结果，无需独立路由
                 route = "advisor"
                 planner_reason = (
                     "Planner 判定需要先澄清/核验，进入 Advisor："
@@ -760,8 +743,6 @@ def build_planner_node(runtime):
                 "plan_error": seeker_plan_error,
                 "table_candidates": table_candidates,
                 "column_candidates": column_candidates,
-                "follow_up_mode": planner_output.follow_up_mode,
-                "result_ref": planner_output.result_ref,
                 # 语义层 grep 候选（含 notes 命中）与 LLM 置信度，供 Advisor 复用，
                 # 避免 Advisor 词法匹配漏掉备注命中（如"调出"）
                 "semantic_keywords": semantic_keywords,
@@ -824,7 +805,6 @@ def build_planner_node(runtime):
                 "planner_entities": new_entities,
                 "topic_status": next_topic_status,
                 "analysis_spec": analysis_spec,
-                "follow_up_mode": planner_output.follow_up_mode,  # 供 web 层决定后续处理
             }
             # 消费 Advisor 自动回环标记：本轮结束后清空，避免下轮误判
             return_value["advisor_draft_updated"] = False
@@ -836,19 +816,15 @@ def build_planner_node(runtime):
             # Planner 构建的 locked 方案直接交给 Seeker 执行，无需用户确认环节
             if updated_plan is not None:
                 return_value["confirmed_plan"] = updated_plan
-            elif planner_output.follow_up_mode == "new_query":
-                # 新问数：清空历史遗留方案，避免旧方案干扰新需求理解
-                return_value["confirmed_plan"] = None
-                # 新问数重置执行失败修复计数，给每个新问题一次修复机会
+                # 成功构建新方案即重置执行失败修复计数（不区分新问数/追问）
                 return_value["plan_repair_rounds"] = 0
+            # 未构建出新方案（advisor 澄清/降级）时保留旧 confirmed_plan，由 Advisor 继续更新
             # 执行失败修复：本轮已消费失败原因，清空并累计修复次数
             if seeker_plan_error:
                 return_value["seeker_plan_error"] = None
                 # 清空不可修复错误标志，避免残留影响后续轮次路由
                 return_value["seeker_error_unresolvable"] = None
                 return_value["plan_repair_rounds"] = (state.get("plan_repair_rounds") or 0) + 1
-
-            log_sub_info(f"follow_up_mode: {planner_output.follow_up_mode}", node_name="planner")
 
                         # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
             log_state_snapshot("planner", {**state, **return_value})

@@ -2,6 +2,7 @@
 from langchain.tools import tool
 from agentTest.config.advisor import SEARCH_DB_K, SEARCH_TABLE_K, SEARCH_COLUMN_K, BM25_ALPHA
 from agentTest.langchain_app.rag.hybrid_retriever import HybridRetriever
+from agentTest.langgraph_app.tools.result_query_tool import build_result_query_tool
 
 # 全局变量，由 build_advisor_tools() 注入 FAISS 实例和 BM25 实例
 _db_vector_store = None
@@ -303,4 +304,6 @@ def build_advisor_tools(
         search_tables,
         search_columns,
         update_draft_plan,
+        # 受控读落盘中间结果：会话 id 由 run_advisor 每轮注入 contextvar
+        build_result_query_tool(),
     ]

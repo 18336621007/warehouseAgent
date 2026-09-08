@@ -86,7 +86,6 @@ def build_plan_from_semantic(
     filters="",
     draft=None,
     complex_flag=False,
-    planner_time_field="",
     concept_resolutions=None,
 ):
     """从语义层指标命中确定性构建完整查询方案，失败返回 None（由 Planner 降级 Advisor）。
@@ -216,20 +215,9 @@ def build_plan_from_semantic(
 
     draft = draft or {}
 
-    # 时间：草稿确认 > Planner 推断时间字段 > 分区字段
+    # 时间字段：filters 中的时间条件为口径权威（用户确认的时间字段一定写入 filters），
+    # 其次草稿已确认字段 > 表默认分区字段
     main_table = tables[0] if tables else ""
-    time_field = str(draft.get("time_field") or "")
-    if not time_field and planner_time_field:
-        # 只采信确属可达表的时间字段，避免 Planner 幻觉字段被采纳
-        if _find_field_table(str(planner_time_field), scope_ids, sl) in scope_ids:
-            time_field = str(planner_time_field)
-    if not time_field:
-        time_field = semantic_provider.get_table_time_field(main_table) or ""
-    # 无分区明细表（如返厂明细）必须由 Advisor 确认业务时间字段，禁止回退默认 pt_dt
-    if detail_flag and not time_field:
-        return None
-    if not time_field:
-        time_field = "pt_dt"
     # 过滤：草稿确认与 Planner 槽位合并去重
     filter_parts = []
     for part in (str(draft.get("filters") or ""), filters):
@@ -237,18 +225,23 @@ def build_plan_from_semantic(
         if part and part not in filter_parts:
             filter_parts.append(part)
     final_filters = " AND ".join(filter_parts) if filter_parts else ""
+    _filter_time_field, _filter_time_range = _extract_time_from_filters(final_filters)
+    time_field = _filter_time_field or str(draft.get("time_field") or "")
+    if not time_field:
+        time_field = semantic_provider.get_table_time_field(main_table) or ""
+    # 无分区明细表必须由 filters/草稿明确业务时间字段，禁止回退默认 pt_dt
+    if detail_flag and not time_field:
+        return None
+    if not time_field:
+        time_field = "pt_dt"
 
     # 时间范围：优先从 filters 的 yyyy-MM-dd 条件派生，其次草稿/Planner 槽位，最后默认昨天
-    _filter_time_field, _filter_time_range = _extract_time_from_filters(final_filters)
     final_time_range = (
         _filter_time_range
         or str(draft.get("time_range") or "")
         or time_range
         or "昨天"
     )
-    if _filter_time_field:
-        # filters 中已确认的时间字段优先于语义层默认分区字段
-        time_field = _filter_time_field
 
     # 过滤字段归属表（加入 field_sources 与 tables，保证 Join 规划覆盖）
     if final_filters:

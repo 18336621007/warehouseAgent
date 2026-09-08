@@ -14,5 +14,3 @@ class PlannerState(BaseState, PlannerHandoffState, total=False):
     # Planner 是唯一路由者，负责判定 seeker/advisor 并落盘最终方案
     confirmed_plan: QueryPlan         # 当前查询方案（draft/locked/confirmed）
 
-    # 连续问答类型：new_query / plan_refinement / result_follow_up / clarification_explanation
-    follow_up_mode: str

@@ -631,7 +631,6 @@ def build_state_snapshot(state, node_name=""):
     snapshot = {}
     snapshot["route"] = state.get("route", "")
     snapshot["topic_status"] = state.get("topic_status", "")
-    snapshot["follow_up_mode"] = state.get("follow_up_mode", "")
     snapshot["advisor_turns"] = state.get("advisor_turns", 0)
     snapshot["effective_query"] = _short_text(
         state.get("effective_query", ""),

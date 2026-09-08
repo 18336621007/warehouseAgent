@@ -80,7 +80,6 @@ def _planner_kwargs(**overrides):
         "dimension_mentions": ["山东瀛能"],
         "analysis_type": "detail",
         "reason": "语义层命中调货明细",
-        "follow_up_mode": "new_query",
         "semantic_keywords": ["调出", "明细"],
         "semantic_metrics": [],
     }

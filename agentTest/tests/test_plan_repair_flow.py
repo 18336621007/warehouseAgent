@@ -239,40 +239,38 @@ class PlanSynthesizerTest(unittest.TestCase):
         self.assertEqual(plan.get("status"), "confirmed")
 
 
-    def test_detail_metric_with_planner_time_field_builds_plan(self):
-        # Planner 已识别出时间字段（fields=["create_time"]）时可直接构建，无需再降级 Advisor
+    def test_detail_metric_with_filter_time_field_builds_plan(self):
+        # 无分区明细表：filters 中带 create_time 时间条件（口径权威）时可直接构建，无需降级 Advisor
         sl = get_semantic_layer_provider()
         sp = self._provider()
         plan = build_plan_from_semantic(
             [sl.get_metric_by_id("device_return_detail")], sp,
             dimension_mentions=[], time_range="今年",
-            filters="region_name='徐州大区' AND status='同意返厂'",
-            planner_time_field="create_time",
+            filters="region_name='徐州大区' AND status='同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
         )
         self.assertIsNotNone(plan)
         self.assertTrue(plan.get("detail_query"))
         self.assertEqual(plan.get("time_field"), "create_time")
-        self.assertEqual(plan.get("time_range"), "今年")
+        self.assertEqual(plan.get("time_range"), "2026-01-01 至 2026-12-31")
         self.assertEqual(plan.get("status"), "confirmed")
 
-    def test_detail_metric_with_hallucinated_planner_time_field_returns_none(self):
-        # Planner 推断的字段不属于该表时不应被采信，维持降级行为
+    def test_detail_metric_without_time_field_returns_none(self):
+        # 无分区明细表且 filters 未带时间条件时降级 Advisor（禁止回退默认 pt_dt）
         sl = get_semantic_layer_provider()
         sp = self._provider()
         plan = build_plan_from_semantic(
             [sl.get_metric_by_id("device_return_detail")], sp,
             dimension_mentions=[], time_range="今年",
             filters="region_name='徐州大区' AND status='同意返厂'",
-            planner_time_field="fake_time_col",
         )
         self.assertIsNone(plan)
 
 
 class SeekerDirectFlowTest(unittest.TestCase):
-    """Planner 判定 seeker 但语义层未命中时，用共享方案直通 Seeker 的回归测试。"""
+    """Planner 判定 seeker 但语义层未命中时，用 Planner 输出直通 Seeker 的回归测试。"""
 
-    def test_minimal_plan_from_shared_plan_and_planner_output(self):
-        # 本次 bug 场景：返厂原因聚合，语义层未命中，共享方案 + Planner 输出构造最小方案
+    def test_minimal_plan_from_planner_output(self):
+        # 本次 bug 场景：返厂原因聚合，语义层未命中，用 Planner 输出构造最小方案
         from types import SimpleNamespace
         from agentTest.langgraph_app.nodes.planner_node import _build_minimal_plan
 
@@ -282,12 +280,7 @@ class SeekerDirectFlowTest(unittest.TestCase):
             filters="create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
             analysis_type="aggregation",
         )
-        shared_plan = {
-            "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
-            "select_fields": ["disable_type", "count(*)"],
-            "filters": "region_name='徐州大区' AND status='同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
-        }
-        plan = _build_minimal_plan(planner_output, shared_plan)
+        plan = _build_minimal_plan(planner_output)
         self.assertIsNotNone(plan)
         self.assertEqual(plan.get("status"), "confirmed")
         # count(*) 与时间字段不得作为分组维度，时间字段从 filters 派生
@@ -303,7 +296,7 @@ class SeekerDirectFlowTest(unittest.TestCase):
         from agentTest.langgraph_app.nodes.planner_node import _build_minimal_plan
 
         planner_output = SimpleNamespace(tables=[], fields=[], filters="", analysis_type="aggregation")
-        self.assertIsNone(_build_minimal_plan(planner_output, None))
+        self.assertIsNone(_build_minimal_plan(planner_output))
 
 
 if __name__ == "__main__":
