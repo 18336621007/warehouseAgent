@@ -7,8 +7,8 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 
 
 def build_enrich_schema_context_node(runtime):
-    tools = runtime["tools"]
-    describe_table_tool = next(tool for tool in tools if tool.name == "describe_table")
+    tool_registry = runtime["tool_registry"]
+    describe_table_tool = tool_registry.get_by_name("describe_table").tool
 
     def enrich_schema_context_node(state: AgentState):
         schema_documents = state.get("schema_documents", [])

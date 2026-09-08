@@ -15,7 +15,6 @@ from agentTest.langgraph_app.runtime.graph_logger import log_tools_called, log_a
 from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
 from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_handler
-from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
 from agentTest.langgraph_app.tools.result_query_tool import (
     set_result_conversation,
     reset_result_conversation,
@@ -195,12 +194,8 @@ def build_advisor_subgraph(runtime):
         ],
     )
 
-    tools = build_advisor_tools(
-        runtime["db_vector_store"],
-        runtime["table_vector_store"],
-        runtime["column_vector_store"],
-        runtime.get("bm25_retriever"),
-    )
+    # 工具从统一注册表按组取用（Advisor 组），依赖已在 runtime 构建时闭包注入
+    tools = runtime["tool_registry"].get(group="advisor")
 
     plan_agent = create_agent(
         llm,

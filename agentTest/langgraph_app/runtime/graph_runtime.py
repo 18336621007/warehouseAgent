@@ -3,6 +3,8 @@ from agentTest.langchain_app.embeddings.bailian_embeddings import BailianEmbeddi
 from agentTest.langchain_app.vectorstores.example_vector_store import ExampleVectorStore
 from agentTest.langgraph_app.runtime.graph_logger import get_log_file_path
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
+from agentTest.langgraph_app.tools.advisor_tools import build_advisor_tools
+from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec, ToolSecurity
 from agentTest.llm import LLM
 from agentTest.metadata.mysql_store import load_enriched_columns  # 加载字段类型映射
 from agentTest.metadata.mysql_store import init_evaluator_table  # 初始化 Evaluator 评估表
@@ -42,6 +44,44 @@ def build_graph_runtime():
         meta_provider=metadata_provider,
     )
     llm = LLM()
+
+    # 三层向量库加白名单过滤包装（Advisor 检索用，提前为局部变量供工具注册复用）
+    db_vector_store = WhitelistFilteredVectorStore(db_rag["vector_store"], metadata_provider, key="database")
+    table_vector_store = WhitelistFilteredVectorStore(table_rag["vector_store"], metadata_provider, key="table")
+    column_vector_store = WhitelistFilteredVectorStore(column_rag["vector_store"], metadata_provider, key="table")
+
+    # 构建 Advisor 工具（闭包注入向量库/BM25 依赖，替换模块级全局变量）
+    advisor_tools = build_advisor_tools(
+        db_vector_store,
+        table_vector_store,
+        column_vector_store,
+        bm25_retriever,
+    )
+
+    # 统一工具注册表：Seeker 工具组（SQL 执行 + Schema 查询）
+    tool_registry = ToolRegistry()
+    for t in tools:
+        tool_registry.register(ToolSpec(
+            name=t.name,
+            description=t.description,
+            tool=t,
+            groups=("seeker",),
+        ))
+    # 统一工具注册表：Advisor 工具组（分层检索 + 草稿更新 + 落盘结果查询）
+    for t in advisor_tools:
+        # 安全元数据集中声明：草稿更新非只读，落盘结果查询限制行数，其余默认只读白名单
+        security = ToolSecurity(
+            read_only=(t.name != "update_draft_plan"),
+            row_limit=100 if t.name == "query_stored_result" else 0,
+            whitelist_only=True,
+        )
+        tool_registry.register(ToolSpec(
+            name=t.name,
+            description=t.description,
+            tool=t,
+            groups=("advisor",),
+            security=security,
+        ))
 
     # 从 MySQL 加载字段类型映射（度量/维度）与字段枚举值映射，供 generate_sql/Resolver 使用
     import re as _re
@@ -87,17 +127,17 @@ def build_graph_runtime():
             query_plan_schema_resolver
         ),
         # 新增：三层向量库（Advisor 用）
-        "db_vector_store": WhitelistFilteredVectorStore(db_rag["vector_store"], metadata_provider, key="database"),
-        "table_vector_store": WhitelistFilteredVectorStore(table_rag["vector_store"], metadata_provider, key="table"),
-        "column_vector_store": WhitelistFilteredVectorStore(column_rag["vector_store"], metadata_provider, key="table"),
+        "db_vector_store": db_vector_store,
+        "table_vector_store": table_vector_store,
+        "column_vector_store": column_vector_store,
         "example_vector_store": example_vector_store,  # Evaluator 示例向量库
         # 新增：BM25 倒排索引检索器（混合检索用）
         "bm25_retriever": bm25_retriever,
         "tools": tools,
+        "tool_registry": tool_registry,  # 统一工具注册表：节点按组取工具
         "field_type_map": field_type_map,  # 字段类型映射 {db.table.col: measure|dimension}
         "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}
         "sample_values_map": sample_values_map,  # 字段枚举值 {db.table.col: [values]}
         "sample_values_map_simple": sample_values_map_simple,  # 兜底 {col: [values]}
         "semantic_metadata_provider": SemanticMetadataProvider(),  # join关系
     }
-

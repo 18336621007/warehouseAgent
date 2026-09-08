@@ -44,8 +44,8 @@ def _is_cross_join_aggregation(sql: str, confirmed_plan: dict) -> bool:
 
 def build_execute_sql_node(runtime):
 
-    tools = runtime["tools"]
-    sql_query_tool = next(tool for tool in tools if tool.name == "sql_query")
+    tool_registry = runtime["tool_registry"]
+    sql_query_tool = tool_registry.get_by_name("sql_query").tool
 
     def execute_sql_node(state: AgentState):
 
