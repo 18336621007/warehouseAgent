@@ -10,6 +10,7 @@ import re
 from agentTest.validate.sql_validate import validate_hive_sql
 from agentTest.langgraph_app.services.sql_safety_validator import validate_sql_safety_simple
 from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
+from agentTest.langgraph_app.services.sql_table_filter_validator import resolve_required_filter_fields
 
 
 def _normalize_join_keys(keys) -> list[str]:
@@ -108,11 +109,9 @@ def validate_sql_node(state: AgentState):
         }
     # 资源保护校验
     confirmed_plan = state.get("confirmed_plan") or {}
-    # 明细查询（无 pt_dt 分区）时间过滤按方案时间字段，与下方逐表过滤校验保持一致；
-    # 普通聚合查询默认只认 pt_dt。
-    partition_fields = ["pt_dt"]
-    if confirmed_plan.get("detail_query"):
-        partition_fields.append(confirmed_plan.get("time_field", "pt_dt") or "pt_dt")
+    # 按表分区情况解析时间/分区过滤字段：有 pt_dt 分区强制 pt_dt；
+    # 无 pt_dt 分区（无分区表或按其他字段分区）改用方案业务时间字段。
+    partition_fields = resolve_required_filter_fields(confirmed_plan)
     is_valid, message = validate_sql_with_guardrails(generated_sql, partition_fields=partition_fields)
     if not is_valid:
         return {
@@ -149,15 +148,12 @@ def validate_sql_node(state: AgentState):
         }
 
     # 逐表过滤属于执行前硬门禁，防止历史分区重复参与Join导致数据膨胀。
-    # 明细查询（无 pt_dt 分区）按方案时间字段校验过滤，不再强求 pt_dt。
-    detail_required = ["pt_dt"]
-    if confirmed_plan.get("detail_query"):
-        detail_required = [confirmed_plan.get("time_field", "pt_dt") or "pt_dt"]
+    # 有 pt_dt 分区强制 pt_dt；无 pt_dt 分区改用方案业务时间字段，避免引用不存在的列。
     table_filter_issues = validate_table_plan_filters(
         generated_sql,
         confirmed_plan.get("tables") or [confirmed_plan.get("table", "")],
         confirmed_plan.get("table_plans") or [],
-        required_filter_fields=detail_required,
+        required_filter_fields=resolve_required_filter_fields(confirmed_plan),
     )
     if table_filter_issues:
         return {

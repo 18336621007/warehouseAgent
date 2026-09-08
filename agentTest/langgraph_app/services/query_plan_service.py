@@ -214,7 +214,8 @@ def merge_draft_plan(current_plan: dict, draft_args: dict) -> QueryPlan:
     plan.pop("time_range", None)
     _derive_execution_fields(plan)
 
-    plan["status"] = "draft"
+    # 共享方案统一为 confirmed，不再区分草稿/提交状态
+    plan["status"] = "confirmed"
     return plan
 
 
@@ -333,11 +334,11 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
     # 已解决指标写入可审计解析记录，未解决候选不允许进入锁定方案
     if concept_resolutions:
         plan["concept_resolutions"] = concept_resolutions
-    plan["status"] = "locked"
+    plan["status"] = "confirmed"
     plan["locked_at"] = datetime.now().isoformat()
     plan.pop("confirmed_at", None)
 
-    errors = validate_query_plan(plan)
+    errors = validate_query_plan(plan, require_confirmed=True)
     if errors:
         raise ValueError("查询方案不完整：" + "；".join(errors))
 

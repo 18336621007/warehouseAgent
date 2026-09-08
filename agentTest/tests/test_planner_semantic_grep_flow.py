@@ -186,12 +186,12 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         result = self._run_planner(["新增订单"], planner_kwargs)
         self.assertEqual(result["route"], "seeker")
         plan = result.get("confirmed_plan") or {}
-        self.assertEqual(plan.get("status"), "locked")
+        self.assertEqual(plan.get("status"), "confirmed")
         self.assertIn("ads_trip.ads_region_rent_order_analysis_hour", plan.get("tables", []))
         self.assertIn("new_rent_counts", plan.get("measures", []))
 
-    def test_seeker_route_falls_back_to_advisor_on_build_failure(self):
-        """Planner 判定 seeker 但语义层无法确定性构建（复合指标）时降级 advisor。"""
+    def test_seeker_route_without_tables_falls_back_to_advisor(self):
+        """Planner 判定 seeker 但既无共享方案也无 Planner 表信息时降级 advisor。"""
         planner_kwargs = _planner_kwargs(
             route="seeker",
             effective_query="查询昨天的续租率",

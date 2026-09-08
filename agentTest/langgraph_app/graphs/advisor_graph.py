@@ -498,7 +498,7 @@ def build_advisor_subgraph(runtime):
                 all_tool_names.append(tc.get("name", "?"))
         log_tools_called("advisor_agent", all_tool_names)
 
-        # 处理 Advisor 更新的共享草稿方案（status=draft）
+        # 处理 Advisor 更新的共享方案（统一为 confirmed，不再区分草稿/提交）
         draft_plan = None
         draft_args_list = _get_tool_call_args(
             current_round_messages,
@@ -542,13 +542,15 @@ def build_advisor_subgraph(runtime):
                 m_content = str(m.content or "").strip()
                 if m_content:
                     recent_agent_lines.append(m_content[:300])
-        if draft_plan is not None:
+        # 收尾展示优先本轮更新，否则回退共享状态（跨轮/降级时也能看到已确认口径）
+        display_plan = draft_plan if draft_plan is not None else current_plan
+        if display_plan:
             draft_text = (
-                f"状态：{draft_plan.get('status', '未设置')}\n"
-                f"数据表：{', '.join(draft_plan.get('tables') or []) or '未设置'}\n"
-                f"查看字段：{', '.join(draft_plan.get('select_fields') or []) or '未设置'}\n"
-                f"过滤条件：{draft_plan.get('filters', '') or '无'}\n"
-                f"明细查询：{'是' if draft_plan.get('detail_query') else '否'}"
+                f"状态：{display_plan.get('status', '未设置')}\n"
+                f"数据表：{', '.join(display_plan.get('tables') or []) or '未设置'}\n"
+                f"查看字段：{', '.join(display_plan.get('select_fields') or []) or '未设置'}\n"
+                f"过滤条件：{display_plan.get('filters', '') or '无'}\n"
+                f"明细查询：{'是' if display_plan.get('detail_query') else '否'}"
             )
         else:
             draft_text = "无（本轮未更新草稿）"
@@ -611,7 +613,7 @@ def build_advisor_subgraph(runtime):
         }
 
         if draft_plan is not None:
-            # 草稿以 draft 状态持久化，供 Planner 下一轮合并收尾
+            # 共享方案持久化，供 Planner 下一轮读取与执行
             return_value["confirmed_plan"] = draft_plan
 
         if next_step == "return_to_planner":

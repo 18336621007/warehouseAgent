@@ -10,8 +10,8 @@ from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 from agentTest.langgraph_app.services.plan_synthesizer import (
     build_plan_from_semantic,
-    finalize_draft_plan,
 )
+from agentTest.langgraph_app.services.query_plan_service import lock_query_plan
 from agentTest.langgraph_app.state.query_plan import validate_query_plan
 
 
@@ -113,7 +113,7 @@ class PlanSynthesizerTest(unittest.TestCase):
         ]
         plan = build_plan_from_semantic(hits, sp, dimension_mentions=[], time_range="昨天")
         self.assertIsNotNone(plan)
-        self.assertEqual(plan.get("status"), "locked")
+        self.assertEqual(plan.get("status"), "confirmed")
         self.assertIn("new_rent_counts", plan.get("measures"))
         self.assertIn("rent_order_counts", plan.get("measures"))
 
@@ -132,7 +132,7 @@ class PlanSynthesizerTest(unittest.TestCase):
         sl = get_semantic_layer_provider()
         sp = self._provider()
         draft = {
-            "status": "draft",
+            "status": "confirmed",
             "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
             "measures": [],
             "dimensions": [],
@@ -164,10 +164,10 @@ class PlanSynthesizerTest(unittest.TestCase):
         )
         self.assertIsNone(plan)
 
-    def test_finalize_detail_draft(self):
-        # 无度量无维度分组的草稿视为明细查询，可收尾锁定
+    def test_shared_detail_draft_locks(self):
+        # 无度量无维度分组的共享方案视为明细查询，lock 后进入 Seeker
         draft = {
-            "status": "draft",
+            "status": "confirmed",
             "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
             "measures": [],
             "dimensions": [],
@@ -175,18 +175,19 @@ class PlanSynthesizerTest(unittest.TestCase):
             "time_range": "今年",
             "filters": "region_name = '徐州大区' AND status = '同意返厂'",
             "field_sources": [],
+            "detail_query": True,
             "result_limit": 1000,
             "complex": False,
         }
-        plan = finalize_draft_plan(draft)
+        plan = lock_query_plan(draft)
         self.assertIsNotNone(plan)
-        self.assertEqual(plan.get("status"), "locked")
+        self.assertEqual(plan.get("status"), "confirmed")
         self.assertTrue(plan.get("detail_query"))
 
     def test_locked_detail_plan_passes_seeker_validation(self):
         # Planner 直接构建的 locked 明细方案应通过 Seeker 入口校验（无用户确认环节）
         locked = {
-            "status": "locked",
+            "status": "confirmed",
             "table": "ads_trip.ads_gundam_device_return_detail_hour",
             "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
             "measures": [],
@@ -210,12 +211,12 @@ class PlanSynthesizerTest(unittest.TestCase):
             "order_by": [],
             "having": "",
         }
-        errors = validate_query_plan(locked, require_confirmed=False)
+        errors = validate_query_plan(locked, require_confirmed=True)
         self.assertEqual(errors, [])
 
-    def test_finalize_draft_valid(self):
+    def test_shared_draft_lock_valid(self):
         draft = {
-            "status": "draft",
+            "status": "confirmed",
             "tables": [
                 "ads_trip.ads_region_rent_order_analysis_hour",
                 "dim_trip.dim_exchange_common_company_info_day",
@@ -233,9 +234,9 @@ class PlanSynthesizerTest(unittest.TestCase):
             "result_limit": 1000,
             "complex": False,
         }
-        plan = finalize_draft_plan(draft)
+        plan = lock_query_plan(draft)
         self.assertIsNotNone(plan)
-        self.assertEqual(plan.get("status"), "locked")
+        self.assertEqual(plan.get("status"), "confirmed")
 
 
     def test_detail_metric_with_planner_time_field_builds_plan(self):
@@ -252,7 +253,7 @@ class PlanSynthesizerTest(unittest.TestCase):
         self.assertTrue(plan.get("detail_query"))
         self.assertEqual(plan.get("time_field"), "create_time")
         self.assertEqual(plan.get("time_range"), "今年")
-        self.assertEqual(plan.get("status"), "locked")
+        self.assertEqual(plan.get("status"), "confirmed")
 
     def test_detail_metric_with_hallucinated_planner_time_field_returns_none(self):
         # Planner 推断的字段不属于该表时不应被采信，维持降级行为
@@ -265,6 +266,44 @@ class PlanSynthesizerTest(unittest.TestCase):
             planner_time_field="fake_time_col",
         )
         self.assertIsNone(plan)
+
+
+class SeekerDirectFlowTest(unittest.TestCase):
+    """Planner 判定 seeker 但语义层未命中时，用共享方案直通 Seeker 的回归测试。"""
+
+    def test_minimal_plan_from_shared_plan_and_planner_output(self):
+        # 本次 bug 场景：返厂原因聚合，语义层未命中，共享方案 + Planner 输出构造最小方案
+        from types import SimpleNamespace
+        from agentTest.langgraph_app.nodes.planner_node import _build_minimal_plan
+
+        planner_output = SimpleNamespace(
+            tables=["ads_trip.ads_gundam_device_return_detail_hour"],
+            fields=["disable_type", "create_time", "count(*)"],
+            filters="create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
+            analysis_type="aggregation",
+        )
+        shared_plan = {
+            "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
+            "select_fields": ["disable_type", "count(*)"],
+            "filters": "region_name='徐州大区' AND status='同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
+        }
+        plan = _build_minimal_plan(planner_output, shared_plan)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.get("status"), "confirmed")
+        # count(*) 与时间字段不得作为分组维度，时间字段从 filters 派生
+        self.assertNotIn("count(*)", plan.get("dimensions") or [])
+        self.assertNotIn("create_time", plan.get("dimensions") or [])
+        self.assertIn("disable_type", plan.get("dimensions") or [])
+        self.assertEqual(plan.get("time_field"), "create_time")
+        self.assertTrue(plan.get("table_plans"))
+
+    def test_minimal_plan_requires_tables(self):
+        # 完全没有表信息时返回 None，交由 Advisor 澄清
+        from types import SimpleNamespace
+        from agentTest.langgraph_app.nodes.planner_node import _build_minimal_plan
+
+        planner_output = SimpleNamespace(tables=[], fields=[], filters="", analysis_type="aggregation")
+        self.assertIsNone(_build_minimal_plan(planner_output, None))
 
 
 if __name__ == "__main__":

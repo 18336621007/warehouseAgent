@@ -3,7 +3,7 @@
 import unittest
 
 from agentTest.langgraph_app.services.query_plan_service import merge_draft_plan
-from agentTest.langgraph_app.services.plan_synthesizer import finalize_draft_plan
+from agentTest.langgraph_app.services.query_plan_service import lock_query_plan
 from agentTest.langgraph_app.state.query_plan import validate_query_plan
 
 
@@ -17,7 +17,7 @@ class DraftPlanSimplificationTest(unittest.TestCase):
             "filters": "create_time 今年 AND region_name='徐州大区' AND status='同意返厂'",
             "detail_query": True,
         })
-        self.assertEqual(draft["status"], "draft")
+        self.assertEqual(draft["status"], "confirmed")
         self.assertEqual(draft["time_field"], "create_time")
         self.assertEqual(draft["time_range"], "今年")
         # 明细查询不聚合，measures/dimensions 均应为空
@@ -27,19 +27,19 @@ class DraftPlanSimplificationTest(unittest.TestCase):
         # draft 结构校验通过
         self.assertEqual(validate_query_plan(draft), [])
 
-    def test_detail_draft_finalize_to_locked(self):
+    def test_detail_draft_lock_to_confirmed(self):
         draft = merge_draft_plan({}, {
             "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
             "select_fields": ["goods_no", "company_name", "region_name"],
             "filters": "create_time 今年 AND region_name='徐州大区' AND status='同意返厂'",
             "detail_query": True,
         })
-        locked = finalize_draft_plan(draft)
+        locked = lock_query_plan(draft)
         self.assertIsNotNone(locked)
-        self.assertEqual(locked["status"], "locked")
+        self.assertEqual(locked["status"], "confirmed")
         self.assertTrue(locked.get("detail_query"))
         self.assertEqual(locked["time_field"], "create_time")
-        self.assertEqual(validate_query_plan(locked, require_confirmed=False), [])
+        self.assertEqual(validate_query_plan(locked, require_confirmed=True), [])
 
     def test_draft_aggregate_select_fields_derives_measures_dimensions(self):
         draft = merge_draft_plan({}, {
@@ -55,7 +55,7 @@ class DraftPlanSimplificationTest(unittest.TestCase):
                 "dim_trip.dim_exchange_common_company_info_day.company_name",
             ],
         })
-        self.assertEqual(draft["status"], "draft")
+        self.assertEqual(draft["status"], "confirmed")
         self.assertEqual(draft["time_field"], "pt_dt")
         self.assertEqual(draft["time_range"], "近7天")
         # select_fields 应全部被拆到 measures/dimensions 中的任意一边

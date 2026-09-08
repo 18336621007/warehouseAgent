@@ -30,6 +30,9 @@ class QueryResultSnapshot(TypedDict, total=False):
     result_summary: str       # 一句话摘要
     entity_keys: list[str]    # 实体键（首个维度字段值），结果追问用
     created_at: str           # ISO 时间
+    result_file: str          # 结果 JSON 文件路径（result_store 落盘引用）
+    full_csv: str             # 全量 CSV 文件路径（交付/导出用）
+    round_no: int             # 会话内结果轮次（跨轮引用用）
 
 
 # 负责身份信息：它们会自动被 Planner、Advisor、Seeker 继承。

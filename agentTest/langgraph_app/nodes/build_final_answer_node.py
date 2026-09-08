@@ -16,6 +16,7 @@ from agentTest.langgraph_app.prompts.final_answer_prompt import (
     FINAL_ANSWER_SYSTEM_PROMPT,
 )
 from agentTest.langgraph_app.state.agent_state import AgentState
+from agentTest.langgraph_app.services.result_store import save_query_result
 
 
 # 结果快照只保存预览与引用，避免把全量结果写入 checkpoint
@@ -141,10 +142,17 @@ def build_build_final_answer_node(runtime):
 
             # 空结果与成功分支都刷新结果快照，避免旧结果被后续追问错误复用
             snapshot = _build_result_snapshot(state, sql_result)
+            # 结果历史落盘（旁路，失败不阻断主流程）：JSON 元数据 + CSV 全量行
+            stored = save_query_result(state, sql_result)
+            if stored:
+                snapshot["round_no"] = stored.get("round_no")
+                snapshot["result_file"] = stored.get("result_file")
+                snapshot["full_csv"] = stored.get("full_csv")
             result_update = {
                 "last_query_result": snapshot,
                 "result_id": snapshot["result_id"],
                 "result_preview": snapshot["preview_rows"],
+                "result_csv": snapshot.get("full_csv", ""),
             }
 
             if row_count == 0:

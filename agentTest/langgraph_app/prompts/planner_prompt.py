@@ -39,9 +39,9 @@ class PlannerOutput(BaseModel):
         description="结合对话上下文还原出的完整有效查数需求"
     )
 
-    route: Literal["seeker", "advisor"] = Field(
+    route: Literal["seeker", "advisor", "result_review"] = Field(
         default="advisor",
-        description="本轮路由判定：seeker=可直接执行（语义层唯一解析、槽位齐全）；advisor=需先澄清/核验"
+        description="本轮路由判定：seeker=可直接执行（语义层唯一解析、槽位齐全）；advisor=需先澄清/核验；result_review=用户引用历史查询结果，直接回顾展示"
     )
 
     filters: str = Field(
@@ -113,13 +113,18 @@ class PlannerOutput(BaseModel):
         description="连续问答类型：new_query=新查询/换话题，result_follow_up=引用上一轮结果追问，plan_refinement=沿用方案只改部分槽位，clarification_explanation=只询问口径区别"
     )
 
+    result_ref: str = Field(
+        default="",
+        description="用户引用的历史查询结果标识（见【最近查询结果索引】），如第3轮填 3 或填 result_id；仅 route=result_review 时输出"
+    )
+
 PLANNER_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，不要输出解释文字。
 
 你是 Text2SQL 系统中的 Planner，负责理解用户查询意图、判断需求完整度，并通过元数据完成表字段映射。
 
 你需要输出：
 1. effective_query：当前完整有效需求
-2. route：本轮路由判定（seeker=可直接执行，advisor=需先澄清/核验）
+2. route：本轮路由判定（seeker=可直接执行，advisor=需先澄清/核验，result_review=回顾历史查询结果）
 3. filters：用户明确的口径过滤条件（含时间，时间按【当前日期】换算成 yyyy-MM-dd 日期区间）
 4. tables：候选目标表
 5. fields：已确定字段
@@ -128,6 +133,7 @@ PLANNER_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，不要�
 8. metric_mentions：用户提到的指标业务概念
 9. dimension_mentions：用户提到的维度业务概念
 10. analysis_type：分析类型
+11. result_ref：用户引用的历史查询结果（仅 result_review 路由时输出）
 
 禁止：
 - 生成SQL
@@ -162,9 +168,11 @@ Advisor：
 无法确定选项含义时，保留原需求，并将 completeness 判定为 partial。
 
 【route判定规则】
-route 决定本轮是否直接执行，还是先由 Advisor 澄清/核验。你是唯一路由者：
+route 决定本轮是直接执行、回顾历史结果，还是先由 Advisor 澄清/核验。你是唯一路由者：
 - seeker：当前有效需求的全部指标都能被语义层唯一解析（semantic_metrics 中每个指标 confidence>=0.55
   且口径唯一），时间、过滤、维度已明确（含从已有草稿继承），不需要用户补充任何信息，可直接生成方案执行。
+- result_review：用户明确引用历史查询结果（"给我完整的明细""第三轮那个""刚才的结果""之前查的经销商"），
+  且能在【最近查询结果索引】中定位到对应轮次时，直接回顾该结果，无需重新查询。
 - advisor：存在口径歧义、多个冲突候选、时间/过滤/维度缺失，需要向用户确认；
   或命中指标无法唯一解析，需要先用工具核验表/字段是否真实存在。
 
@@ -248,9 +256,16 @@ tables/fields 只作为 Advisor 核验参考，最终物理字段由语义层确
 
 【follow_up_mode规则】
 - new_query：全新需求或明显换话题（与当前需求无关）。
-- result_follow_up：用户引用上一轮查询结果（"第一名""这些经销商""刚才的结果"）。
+- result_follow_up：用户引用历史查询结果（"第一名""这些经销商""刚才的结果"），
+  此时若能在【最近查询结果索引】定位到具体轮次 → route=result_review 并输出 result_ref；
+  定位不到 → 保持 advisor 澄清确认是哪一轮。
 - plan_refinement：沿用当前方案只修改时间、过滤、维度、排序或指标中的部分内容。
 - clarification_explanation：用户只询问候选区别或解释，尚未做出选择。
+
+【result_review规则】
+- result_review 时不需要输出 tables/fields/filters/semantic_metrics（历史结果已存在），
+  只需 result_ref 指向对应轮次（round_no 或 result_id），并保持 effective_query 表达用户对历史结果的诉求。
+- 用户要"完整明细/导出/只看某列/按某维度看"等基于历史结果的诉求，都归 result_review。
 
 【semantic_keywords规则】
 - 输出从当前有效需求中提取的业务检索关键词，用于语义层全文 grep。

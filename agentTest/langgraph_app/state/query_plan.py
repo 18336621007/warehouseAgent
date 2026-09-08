@@ -2,8 +2,8 @@
 from typing import Literal, TypedDict
 
 
-# draft 表示追问中逐步完善的方案，locked 表示程序校验通过、可交给 Seeker 执行的完整方案
-PlanStatus = Literal["draft", "locked"]
+# 方案不再区分草稿/提交：共享方案统一为 confirmed，是否完整由 Planner 判定
+PlanStatus = Literal["confirmed"]
 
 
 class QueryPlan(TypedDict, total=False):
@@ -49,7 +49,7 @@ class QueryPlan(TypedDict, total=False):
     # 已解决指标概念到物理字段的映射，未解决候选不允许进入 QueryPlan
     concept_resolutions: dict  # {指标概念: {field, table, source}}
 
-    # 方案确认状态和时间
+    # 方案状态（统一为 confirmed）与审计时间
     status: PlanStatus
     locked_at: str
     confirmed_at: str
@@ -65,22 +65,23 @@ def validate_query_plan(
     if not isinstance(plan, dict):
         return ["查询方案必须是字典"]
 
-    # draft：追问过程中逐步完善的方案，允许槽位为空，只做最小结构校验
-    if plan.get("status") == "draft":
-        draft_errors = []
-        draft_tables = plan.get("tables") or []
-        draft_select_fields = plan.get("select_fields") or []
-        if not isinstance(draft_select_fields, list) or any(
-            not isinstance(item, str) for item in draft_select_fields
+    # 宽松模式（共享方案/澄清阶段）：允许槽位为空，只做最小结构校验；
+    # 严格模式（require_confirmed=True）在 lock 后调用，要求完整可执行字段。
+    if not require_confirmed:
+        loose_errors = []
+        loose_tables = plan.get("tables") or []
+        loose_select_fields = plan.get("select_fields") or []
+        if not isinstance(loose_select_fields, list) or any(
+            not isinstance(item, str) for item in loose_select_fields
         ):
-            draft_errors.append("select_fields 必须是字符串列表")
+            loose_errors.append("select_fields 必须是字符串列表")
         if (
-            not draft_tables
-            and not draft_select_fields
+            not loose_tables
+            and not loose_select_fields
             and not str(plan.get("filters") or "").strip()
         ):
-            draft_errors.append("草稿方案至少需要数据表、查看字段或过滤条件")
-        return draft_errors
+            loose_errors.append("查询方案至少需要数据表、查看字段或过滤条件")
+        return loose_errors
 
     table = plan.get("table", "")
     tables = plan.get("tables") or []
@@ -94,7 +95,6 @@ def validate_query_plan(
     order_by = plan.get("order_by") or []
     result_limit = plan.get("result_limit", 1000)
     complex_flag = plan.get("complex", False)
-    status = plan.get("status", "")
     table_plans = plan.get("table_plans") or []
 
     # table 由 lock_query_plan 从 tables[0] 推导
@@ -184,9 +184,6 @@ def validate_query_plan(
                 errors.append(f"表 {table_name} 缺少独立时间字段 time_field")
             elif not str(table_time_range).strip():
                 errors.append(f"表 {table_name} 设置了 time_field 但缺少 time_range")
-
-    if status != "locked":
-        errors.append("status 必须是 locked")
 
     # 指标解析证据为可选审计字段，存在时必须是字典
     concept_resolutions = plan.get("concept_resolutions")

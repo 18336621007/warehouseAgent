@@ -136,3 +136,25 @@ def validate_table_plan_filters(
                 )
 
     return issues
+
+
+def resolve_required_filter_fields(confirmed_plan: dict) -> list[str]:
+    """解析逐表必选过滤字段：有 pt_dt 分区的表仍强制 pt_dt；
+    无 pt_dt 分区（无分区表或按 pt_platform 等分区）时改用方案业务时间字段，
+    避免对不存在 pt_dt 列的表强制 pt_dt 导致 SQL 执行报错。"""
+    # 延迟导入语义层 provider，避免模块加载期耦合
+    from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider
+
+    tables = confirmed_plan.get("tables") or []
+    table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
+    time_field = (confirmed_plan.get("time_field") or "").strip() or "pt_dt"
+    if not table:
+        return list(REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES)
+    info = get_semantic_layer_provider().get_physical_table(table)
+    # 表不在语义层（如 RAG 兜底表）时保持默认 pt_dt，行为不变
+    if info is None:
+        return list(REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES)
+    if "pt_dt" in (info.get("partition") or []):
+        return ["pt_dt"]
+    # 无 pt_dt 分区：使用方案确认的业务时间字段（如 create_time）
+    return [time_field]

@@ -32,3 +32,11 @@ RERANK_MIN_CANDIDATES = 2
 
 # 优秀案例命中字段的排序加权：只影响候选展示顺序，不产生解析证据
 EXAMPLE_FIELD_BOOST = 0.1
+
+# 查询结果历史存储（Result History Store）配置
+RESULT_STORE_ENABLED = True            # 总开关
+RESULT_STORE_DIR = "agentTest/query_results"   # 目录根（相对项目根，按日期/对话分类）
+RESULT_STORE_MAX_ROUNDS = 20           # 对话内保留最近结果轮数
+RESULT_STORE_MAX_DAYS = 7              # 日期层保留天数，超期整目录清理
+RESULT_STORE_MAX_PREVIEW_ROWS = 20     # 索引里预览行数（prompt 只进摘要，防止 token 膨胀）
+RESULT_MAX_ROWS = 1000                 # 单次查询返回行数上限（原 hive_guardrails 100）

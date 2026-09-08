@@ -8,6 +8,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.state.agent_state import AgentState
+from agentTest.langgraph_app.services.sql_table_filter_validator import resolve_required_filter_fields
 
 
 # ── 独立聚合多表场景的扩展 timeout：默认 300s（与 Hive 手动执行实测对齐） ──
@@ -78,11 +79,12 @@ def build_execute_sql_node(runtime):
             invoke_kwargs = {"sql": generated_sql}
             # 明细查询（无 pt_dt 分区）按方案时间字段透传给执行守卫，
             # 与 validate_sql_node 保持一致，避免无 pt_dt 的明细表被误判为全表扫描。
-            partition_fields = ["pt_dt"]
-            if confirmed_plan.get("detail_query"):
-                time_field = confirmed_plan.get("time_field", "pt_dt") or "pt_dt"
-                if time_field and time_field not in partition_fields:
-                    partition_fields.append(time_field)
+            # 扩展：聚合查询同样按表实际分区字段透传，无 pt_dt 分区时用方案业务时间字段。
+            try:
+                partition_fields = resolve_required_filter_fields(confirmed_plan)
+            except Exception:
+                # 语义层不可用时回退默认分区字段，不阻断执行
+                partition_fields = ["pt_dt"]
             invoke_kwargs["partition_fields"] = partition_fields
             if _is_cross_join_aggregation(generated_sql, confirmed_plan):
                 log_node_event(

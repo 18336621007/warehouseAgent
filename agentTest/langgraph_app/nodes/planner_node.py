@@ -4,17 +4,21 @@
 # 流程：
 #   ① 语义层 grep + FAISS/BM25 检索增强元数据
 #   ② LLM 解析：输出 effective_query / route / 槽位 / semantic_metrics（置信度）
-#   ③ 路由：route=seeker 时由语义层确定性构建方案（plan_synthesizer），校验通过才执行；
-#       构建失败或 route=advisor 时进入 Advisor
+#   ③ 路由：route=seeker 时优先语义层确定性构建方案，未命中时用共享方案构造最小方案直通；
+#       route=advisor 时进入 Advisor 澄清
+import re
 from datetime import date
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage
 from agentTest.langgraph_app.services.plan_synthesizer import (
     build_plan_from_semantic,
-    finalize_draft_plan,
 )
-from agentTest.langgraph_app.services.query_plan_service import _extract_time_from_filters
+from agentTest.langgraph_app.services.query_plan_service import (
+    _extract_time_from_filters,
+    lock_query_plan,
+)
+from agentTest.langgraph_app.services.result_store import list_result_index
 from agentTest.semantic_layer.metric_matcher import (
     format_metric_context,
     grep_metrics_from_keywords,
@@ -189,6 +193,62 @@ def _pick_planner_time_field(fields: list) -> str:
         if name in ("pt_dt", "day") or "time" in low or "date" in low:
             return name
     return ""
+
+
+def _build_minimal_plan(planner_output, shared_plan: dict) -> dict | None:
+    """Planner 判定 seeker 但语义层未命中时，用共享方案 + Planner 输出构造最小方案。
+
+    聚合表达式（count(*)/sum(x)）与时间字段不作为分组维度，
+    聚合由 generate_sql 的 LLM 根据 effective_query 生成。"""
+    tables = list(planner_output.tables or [])
+    fields = list(planner_output.fields or [])
+    filters = planner_output.filters or ""
+    analysis_type = planner_output.analysis_type or ""
+    if shared_plan:
+        tables = list(shared_plan.get("tables") or tables)
+        fields = list(dict.fromkeys((shared_plan.get("select_fields") or []) + fields))
+        filters = shared_plan.get("filters") or filters
+        analysis_type = shared_plan.get("analysis_type") or analysis_type
+    if not tables:
+        return None
+    # 清洗聚合表达式（不是物理字段，由 LLM 负责聚合）；聚合时时间字段不参与分组
+    is_detail = str(analysis_type).lower() in ("detail", "detail_query")
+    clean_fields = [
+        f for f in fields
+        if re.fullmatch(r"[A-Za-z_]+\([^)]*\)", str(f).strip()) is None
+    ]
+    time_field, _ = _extract_time_from_filters(filters)
+    if time_field and not is_detail:
+        clean_fields = [f for f in clean_fields if f != time_field]
+    plan = {
+        "table": tables[0],
+        "tables": tables,
+        "select_fields": clean_fields,
+        "filters": filters,
+        "detail_query": is_detail,
+        "result_limit": 1000,
+    }
+    try:
+        return lock_query_plan(plan)
+    except Exception:
+        return None
+
+
+def _format_result_index(result_index: list) -> str:
+    """把结果历史索引格式化成轻量文本（只含摘要，供 LLM 指代历史结果轮次）。"""
+    lines = []
+    for entry in result_index:
+        round_no = entry.get("round_no", "")
+        created_at = str(entry.get("created_at") or "")[11:16]
+        query = str(entry.get("effective_query") or "")[:80]
+        row_count = entry.get("row_count", 0)
+        columns = ", ".join((entry.get("columns") or [])[:8])
+        line = f"- 第{round_no}轮 ({created_at}): {query} | {row_count}行 | 列: {columns}"
+        entity_keys = entry.get("entity_keys") or []
+        if entity_keys:
+            line += f" | 实体键: {', '.join(str(k) for k in entity_keys[:5])}"
+        lines.append(line)
+    return "\n".join(lines)
 
 def build_planner_node(runtime):
     # 三层索引中的表层和字段层
@@ -444,6 +504,10 @@ def build_planner_node(runtime):
                 sections.append(metadata_section)
             if example_context:
                 sections.append(f"【历史相似问题】\n{example_context}")
+            # 注入最近几轮查询结果索引（只含摘要），供模型识别"第三轮/刚才的结果"等指代
+            result_index = list_result_index(state.get("conversation_id") or "", limit=8)
+            if result_index:
+                sections.append("【最近查询结果索引】\n" + _format_result_index(result_index))
             user_content = "\n\n".join(sections)
             prompt_value = prompt.invoke({"sections": user_content})
             planner_output = structured_llm.invoke(prompt_value)
@@ -610,11 +674,8 @@ def build_planner_node(runtime):
             # ── Planner 是唯一路由者：LLM 判定 route，程序只做方案安全网 ──
             updated_plan = None
             route_llm = planner_output.route or "advisor"
-            draft_plan = (
-                confirmed_plan
-                if (confirmed_plan or {}).get("status") == "draft"
-                else None
-            )
+            # 共享方案（不再区分草稿/提交状态），Advisor 持续更新、Planner 读取
+            shared_plan = confirmed_plan if confirmed_plan else None
 
             if route_llm == "seeker":
                 # 只采信 LLM 判定相关（>=候选阈值）的语义层命中
@@ -639,19 +700,19 @@ def build_planner_node(runtime):
                     key=lambda h: _conf_by_id.get(str(h.get("id") or ""), 0.0),
                     reverse=True,
                 )
-                # 语义层确定性构建方案；失败时回退 Advisor 已落盘的完整草稿
+                # 语义层确定性构建方案（语义层优先）；未命中时用共享方案构造最小方案直通
                 plan = build_plan_from_semantic(
                     metric_hits=metric_hits,
                     semantic_provider=runtime.get("semantic_metadata_provider"),
                     dimension_mentions=planner_output.dimension_mentions,
                     # 时间不再单独传槽位：统一由 filters 中的 yyyy-MM-dd 条件派生
                     filters=planner_output.filters,
-                    draft=draft_plan,
+                    draft=shared_plan,
                     complex_flag=planner_output.complex,
                     planner_time_field=_pick_planner_time_field(planner_output.fields),
                 )
-                if plan is None and draft_plan:
-                    plan = finalize_draft_plan(draft_plan)
+                if plan is None:
+                    plan = _build_minimal_plan(planner_output, shared_plan)
                 if plan is not None:
                     updated_plan = plan
                     tables = plan.get("tables", [])
@@ -668,6 +729,13 @@ def build_planner_node(runtime):
                         "Planner 判定 seeker 但方案构建失败，降级 Advisor 澄清："
                         + planner_output.reason
                     )
+            elif route_llm == "result_review":
+                # 用户引用历史查询结果：不构建新方案，直接回顾对应轮次结果
+                route = "result_review"
+                planner_reason = (
+                    "Planner 判定回顾历史查询结果："
+                    + planner_output.reason
+                )
             else:
                 route = "advisor"
                 planner_reason = (
@@ -693,6 +761,7 @@ def build_planner_node(runtime):
                 "table_candidates": table_candidates,
                 "column_candidates": column_candidates,
                 "follow_up_mode": planner_output.follow_up_mode,
+                "result_ref": planner_output.result_ref,
                 # 语义层 grep 候选（含 notes 命中）与 LLM 置信度，供 Advisor 复用，
                 # 避免 Advisor 词法匹配漏掉备注命中（如"调出"）
                 "semantic_keywords": semantic_keywords,

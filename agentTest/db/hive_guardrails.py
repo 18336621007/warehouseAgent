@@ -29,8 +29,9 @@ REQUIRE_LIMIT = True
 #是否允许with
 ALLOW_WITH = True
 
-# 最大返回行数
-MAX_RESULT_ROWS = 100
+# 最大返回行数（可配置，见 config/advisor.py RESULT_MAX_ROWS）
+from agentTest.config.advisor import RESULT_MAX_ROWS
+MAX_RESULT_ROWS = RESULT_MAX_ROWS
 # Hive 查询超时时间，单位秒
 QUERY_TIMEOUT_SECONDS = 30
 

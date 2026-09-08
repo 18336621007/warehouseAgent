@@ -295,23 +295,3 @@ def build_plan_from_semantic(
         return locked
     except Exception:
         return None
-
-
-def finalize_draft_plan(draft):
-    """Advisor 已落盘完整草稿（如复合指标）时，校验后直接收尾为 locked 方案。"""
-    if not draft:
-        return None
-    try:
-        plan = dict(draft)
-        # 无度量且无维度分组的草稿视为明细查询（detail_query），放行空度量校验
-        if not plan.get("measures") and not plan.get("dimensions"):
-            plan["detail_query"] = True
-        locked = lock_query_plan(
-            plan,
-            concept_resolutions=draft.get("concept_resolutions"),
-        )
-        if validate_field_table_bindings(locked):
-            return None
-        return locked
-    except Exception:
-        return None

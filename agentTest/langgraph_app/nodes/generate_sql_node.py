@@ -16,6 +16,7 @@ from agentTest.llm import set_llm_caller
 from agentTest.langgraph_app.message_utils import get_last_ai_content
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
+from agentTest.langgraph_app.services.sql_table_filter_validator import resolve_required_filter_fields
 from agentTest.langgraph_app.prompts.sql_prompts import (
     SQL_AUDIT_HUMAN_TEMPLATE,
     SQL_AUDIT_SYSTEM_PROMPT,
@@ -232,10 +233,9 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
 
 
 def _detail_required_fields(confirmed_plan: dict) -> list[str]:
-    """明细查询（无 pt_dt 分区）按方案时间字段校验过滤，否则用全局默认 pt_dt。"""
-    if confirmed_plan.get("detail_query"):
-        return [confirmed_plan.get("time_field", "pt_dt") or "pt_dt"]
-    return ["pt_dt"]
+    """按表分区情况解析逐表必选过滤字段：有 pt_dt 分区强制 pt_dt；
+    无 pt_dt 分区（无分区表或按其他字段分区）改用方案业务时间字段。"""
+    return resolve_required_filter_fields(confirmed_plan)
 
 
 def _repair_missing_table_filters(sql: str, confirmed_plan: dict) -> tuple[str, list[str]]:

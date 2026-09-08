@@ -5,6 +5,7 @@ from langchain_core.messages import AIMessage
 from agentTest.langgraph_app.graphs.advisor_graph import build_advisor_subgraph
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.nodes.planner_node import build_planner_node
+from agentTest.langgraph_app.nodes.result_review_node import build_result_review_node
 from agentTest.langgraph_app.graphs.seeker_graph import build_seeker_subgraph
 from langgraph.checkpoint.memory import MemorySaver
 from agentTest.langgraph_app.nodes.capture_user_message_node import capture_user_message_node
@@ -56,6 +57,9 @@ def build_supervisor_graph(runtime):
     # 注册 advisor 子图
     supervisor.add_node("advisor", build_advisor_subgraph(runtime))
 
+    # 注册历史结果回顾节点：result_follow_up 时直接读取落盘结果回答
+    supervisor.add_node("result_review", build_result_review_node(runtime))
+
     # 设置边：START先记录用户消息，再由Planner路由到Seeker或Advisor
     supervisor.add_edge(START, "capture_user_message")
     supervisor.add_edge("capture_user_message", "planner")
@@ -65,8 +69,11 @@ def build_supervisor_graph(runtime):
         {
             "seeker": "seeker",
             "advisor": "advisor",
+            "result_review": "result_review",
         }
     )
+    # 历史结果回顾节点直接结束本轮
+    supervisor.add_edge("result_review", END)
     # Seeker 方案不可行时回 Planner 修复；修复机会耗尽后给用户具体失败原因
     supervisor.add_node("plan_error_fallback", plan_error_fallback_node)
     supervisor.add_conditional_edges(
