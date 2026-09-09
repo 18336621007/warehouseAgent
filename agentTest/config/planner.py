@@ -14,3 +14,5 @@ COLUMN_SEARCH_K = 15
 PER_TABLE_COLUMN_QUOTA = 4
 
 EXAMPLE_SIMILARITY_THRESHOLD = 0.7  # 优秀示例检索最低余弦相似度
+# M2：Planner ReAct 工具调用最大步数（防止工具循环失控、token 膨胀）
+MAX_PLANNER_TOOL_STEPS = 4

@@ -3,6 +3,7 @@
 import unittest
 from unittest import mock
 
+from langchain_core.messages import AIMessage
 from agentTest.langgraph_app.prompts.planner_prompt import (
     PlannerOutput,
     SemanticKeywordsOutput,
@@ -22,39 +23,80 @@ class _FakeReranker:
         return []
 
 
+class _FakeTool:
+    """轻量工具桩：可调用、返回固定结果，模拟 Planner registry 工具。"""
+
+    def __init__(self, name, result="工具结果"):
+        self.name = name
+        self.result = result
+
+    def invoke(self, args):
+        return f"{self.name} -> {self.result}"
+
+
+class _FakeReactLLM:
+    """ReAct 循环桩：按预设序列返回 tool_calls，序列耗尽后返回无 tool_calls。"""
+
+    def __init__(self, tool_calls_list):
+        self._tool_calls_list = list(tool_calls_list)
+        self._step = 0
+
+    def invoke(self, messages):
+        if self._step < len(self._tool_calls_list):
+            tc = self._tool_calls_list[self._step]
+            self._step += 1
+            return AIMessage(content="", tool_calls=[tc])
+        return AIMessage(content="信息已充分，直接输出判定")
+
+
 class _FakeStructuredLLM:
     """按结构化模型类型返回预设输出（keyword 小调用 / 完整 PlannerOutput）。"""
 
-    def __init__(self, keyword_list, planner_kwargs):
+    def __init__(self, keyword_list, planner_kwargs, react_tool_calls=None, seen_messages=None):
         self._keyword_list = keyword_list
         self._planner_kwargs = planner_kwargs
+        self._react_tool_calls = react_tool_calls or []
+        self._seen_messages = seen_messages  # 记录传给结构化 LLM 的 messages，供断言工具回填
 
     def invoke(self, prompt_value):
         return self  # 简化：invoke 直接返回
+
+    def bind_tools(self, tools):
+        return _FakeReactLLM(self._react_tool_calls)
 
     def with_structured_output(self, model):
         if model is SemanticKeywordsOutput:
             return _FakeStructuredCallable(
                 SemanticKeywordsOutput(semantic_keywords=self._keyword_list)
             )
-        return _FakeStructuredCallable(PlannerOutput(**self._planner_kwargs))
+        return _FakeStructuredCallable(PlannerOutput(**self._planner_kwargs), self._seen_messages)
 
 
 class _FakeStructuredCallable:
-    def __init__(self, value):
+    def __init__(self, value, seen_messages=None):
         self._value = value
+        self._seen_messages = seen_messages
 
     def invoke(self, prompt_value):
+        # 工具链场景：记录最终结构化输入，供测试断言工具结果已回填
+        if self._seen_messages is not None:
+            self._seen_messages.append(prompt_value)
         return self._value
 
 
 def _build_runtime():
     from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
+    from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec
+    # M2：Planner 从统一注册表取 planner 组工具（本测试用桩工具）
+    registry = ToolRegistry()
+    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result"):
+        registry.register(ToolSpec(name=name, description="stub", tool=_FakeTool(name), groups=("planner",)))
     return {
         "table_vector_store": _FakeVectorStore(),
         "column_vector_store": _FakeVectorStore(),
         "bm25_retriever": None,
         "example_vector_store": None,
+        "tool_registry": registry,
         "semantic_metadata_provider": SemanticMetadataProvider(),
     }
 
@@ -90,10 +132,10 @@ def _planner_kwargs(**overrides):
 class PlannerSemanticGrepFlowTest(unittest.TestCase):
     """Planner 两阶段语义层流程测试。"""
 
-    def _run_planner(self, keyword_list, planner_kwargs):
+    def _run_planner(self, keyword_list, planner_kwargs, react_tool_calls=None, seen_messages=None):
         from agentTest.langgraph_app.nodes import planner_node
 
-        fake_llm = _FakeStructuredLLM(keyword_list, planner_kwargs)
+        fake_llm = _FakeStructuredLLM(keyword_list, planner_kwargs, react_tool_calls, seen_messages)
         with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
             return node(_state("查询昨天从山东瀛能公司调出的调出明细"))
@@ -157,7 +199,7 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         self.assertIn("device_return_detail", ids)
 
     def test_no_semantic_grep_goes_rag(self):
-        """无 grep 命中：走 RAG（FAISS），semantic_metrics 为空。"""
+        """无 grep 命中：semantic_metrics 为空，路由由 LLM 判定（M2b 后检索改为工具自主调用）。"""
         planner_kwargs = _planner_kwargs(
             semantic_keywords=["排产"],
             semantic_metrics=[],
@@ -206,6 +248,25 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         result = self._run_planner(["续租率"], planner_kwargs)
         self.assertEqual(result["route"], "advisor")
         self.assertIsNone(result.get("confirmed_plan"))
+
+    def test_react_tool_loop_feeds_tool_result(self):
+        """Planner ReAct：LLM 调用 search_columns 后，工具结果以 ToolMessage 回填进最终结构化输入。"""
+        seen = []
+        planner_kwargs = _planner_kwargs()
+        self._run_planner(
+            ["调出"],
+            planner_kwargs,
+            react_tool_calls=[{
+                "name": "search_columns",
+                "args": {"question": "山东瀛能", "table": "ads_trip.ads_gundam_device_transfer_detail_hour"},
+                "id": "call_1",
+            }],
+            seen_messages=seen,
+        )
+        self.assertTrue(seen, "结构化 LLM 应收到 messages")
+        tool_msgs = [m for m in seen[0] if getattr(m, "type", "") == "tool"]
+        self.assertTrue(tool_msgs, "工具结果应以 ToolMessage 回填")
+        self.assertIn("search_columns", tool_msgs[0].content)
 
 
 if __name__ == "__main__":

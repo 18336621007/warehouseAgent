@@ -68,6 +68,7 @@ def build_graph_runtime():
             groups=("seeker",),
         ))
     # 统一工具注册表：Advisor 工具组（分层检索 + 草稿更新 + 落盘结果查询）
+    # 检索类与落盘结果工具同时注册进 planner 组，供 M2 Planner ReAct 自主调用
     for t in advisor_tools:
         # 安全元数据集中声明：草稿更新非只读，落盘结果查询限制行数，其余默认只读白名单
         security = ToolSecurity(
@@ -75,11 +76,12 @@ def build_graph_runtime():
             row_limit=100 if t.name == "query_stored_result" else 0,
             whitelist_only=True,
         )
+        groups = ("advisor", "planner") if t.name != "update_draft_plan" else ("advisor",)
         tool_registry.register(ToolSpec(
             name=t.name,
             description=t.description,
             tool=t,
-            groups=("advisor",),
+            groups=groups,
             security=security,
         ))
 
