@@ -87,5 +87,8 @@ class BaseState(TopicState, total=False):
     advisor_draft_updated: bool
     # Advisor 连续自动回 Planner 的轮次（防 planner↔advisor 死循环）
     advisor_auto_rounds: int
+    # Seeker 执行成功但 0 行时的自愈标记与轮次（回 Planner 用 probe_values 确认实际取值）
+    seeker_empty_result: bool
+    empty_result_rounds: int
     # Advisor 收尾结构化动作：wait_user=等用户，return_to_planner=回 Planner 再判定
     advisor_next_step: str

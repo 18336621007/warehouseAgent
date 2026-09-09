@@ -10,7 +10,7 @@ import re
 from datetime import date
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from agentTest.langgraph_app.services.plan_synthesizer import (
     build_plan_from_semantic,
 )
@@ -48,6 +48,7 @@ from agentTest.langgraph_app.tools.result_query_tool import (
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.config.planner import (
     MAX_PLANNER_TOOL_STEPS,
+    MAX_EMPTY_RESULT_ROUNDS,
 )
 from agentTest.config.semantic import (
     SEMANTIC_UNIQUE_GAP_THRESHOLD,
@@ -74,7 +75,7 @@ def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
             if getattr(msg, "tool_calls", None):
                 continue
             msg_id = str(getattr(msg, "id", "") or "")
-            if not (msg_id.endswith(":advisor") or msg_id.endswith(":seeker")):
+            if not (msg_id.endswith(":advisor") or msg_id.endswith(":seeker") or msg_id.endswith(":answer")):
                 continue
             role = f"助手({name})" if name else "助手"
         else:
@@ -207,6 +208,8 @@ def build_planner_node(runtime):
         current_user_input = state["current_user_input"]
         # 区分本轮触发来源：Advisor 收尾结构化 return_to_planner（自动回 Planner）还是用户新输入
         from_advisor = state.get("advisor_next_step") == "return_to_planner"
+        # Seeker 0 行自愈回环：上次执行成功但无数据，需判断是否过滤值不匹配
+        from_empty_result = state.get("seeker_empty_result") or False
 
         # 去 Topic 化：不再使用 original_question 固定基线，
         # 当前需求由 LLM 结合【完整对话历史】+【本轮输入】每轮判断（query 改写 effective_query）
@@ -316,6 +319,21 @@ def build_planner_node(runtime):
             if seeker_plan_error:
                 sections.append(
                     f"【上次执行失败原因（必须调整方案避开该问题）】\n{seeker_plan_error}"
+                )
+            if from_empty_result:
+                _prev_plan = state.get("confirmed_plan") or {}
+                _prev_sql = state.get("generated_sql") or ""
+                _empty_rounds = state.get("empty_result_rounds") or 0
+                _empty_hint = ""
+                if _empty_rounds >= MAX_EMPTY_RESULT_ROUNDS:
+                    _empty_hint = "\n已达重试上限，若确认无匹配数据请直接 route=answer 告知用户，不要继续探查重试。"
+                sections.append(
+                    "【上次执行 0 行反馈（SQL 执行成功但无数据，需判断是否过滤值不匹配）】\n"
+                    f"方案过滤条件：{(_prev_plan.get('filters') or '无')}\n"
+                    f"执行的 SQL：{str(_prev_sql)[:800] or '无'}\n"
+                    "若过滤值来源的字段在语义层没有枚举值，请先用 probe_values 探查实际取值并修正 filters 后 route=seeker 重跑；"
+                    "这是查库可解决的事实问题，不要 route=advisor 询问用户。"
+                    f"{_empty_hint}"
                 )
             if metric_context_text:
                 sections.append(f"【语义层指标候选】\n{metric_context_text}")
@@ -471,6 +489,42 @@ def build_planner_node(runtime):
             route_llm = planner_output.route or "advisor"
             # 共享方案（不再区分草稿/提交状态）：Advisor 澄清时更新、Planner 执行时覆盖
 
+            if route_llm == "answer" and (planner_output.final_answer or "").strip():
+                # Planner 直接回答：本轮无需再查，把 final_answer 作为最终答复返回结束
+                final_answer = (planner_output.final_answer or "").strip()
+                planner_reason = "Planner 判定可直接回答，无需查询：" + planner_output.reason
+                return_value = {
+                    "route": "answer",
+                    "final_answer": final_answer,
+                    "effective_query": effective_query,
+                    "topic_status": "completed",
+                    "messages": [
+                        AIMessage(
+                            content=final_answer,
+                            name="planner",
+                            id=f"{state.get('request_id', '')}:answer",
+                        )
+                    ],
+                    # 消费回环标记，避免残留影响后续轮次路由
+                    "seeker_empty_result": False,
+                    "advisor_draft_updated": False,
+                    "advisor_next_step": None,
+                }
+                log_node_end(
+                    "planner",
+                    route="answer",
+                    route_source="planner_llm",
+                    completeness=completeness,
+                    tables=str(tables),
+                    fields=str(fields),
+                    high_sim_tables=0,
+                    high_sim_columns=0,
+                    reason=planner_reason,
+                    ms=elapsed_ms(timer),
+                )
+                log_state_snapshot("planner", {**state, **return_value})
+                return return_value
+
             if route_llm == "seeker":
                 # 只采信 LLM 判定相关（>=候选阈值）的语义层命中
                 _confirmed_ids = {
@@ -527,10 +581,17 @@ def build_planner_node(runtime):
                 # 澄清/核验/回顾历史结果统一进入 Advisor：
                 # Advisor 可用 query_stored_result 工具读落盘结果，无需独立路由
                 route = "advisor"
-                planner_reason = (
-                    "Planner 判定需要先澄清/核验，进入 Advisor："
-                    + planner_output.reason
-                )
+                if route_llm == "answer":
+                    # answer 但未给出 final_answer：回退 Advisor 澄清，避免给用户空回复
+                    planner_reason = (
+                        "Planner 判定 answer 但未给出 final_answer，降级 Advisor 澄清："
+                        + planner_output.reason
+                    )
+                else:
+                    planner_reason = (
+                        "Planner 判定需要先澄清/核验，进入 Advisor："
+                        + planner_output.reason
+                    )
 
             new_entities = {
                 # Advisor 后续使用完整有效需求，不能直接拿“1”“A”检索
@@ -546,6 +607,7 @@ def build_planner_node(runtime):
                 "time_range": _extract_time_from_filters(planner_output.filters)[1],
                 "complex": planner_output.complex,
                 "completeness": completeness,
+                "unresolved_dimensions": (updated_plan or {}).get("unresolved_dimensions") or [],
                 "plan_error": seeker_plan_error,
                 "table_candidates": table_candidates,
                 "column_candidates": column_candidates,
@@ -565,6 +627,7 @@ def build_planner_node(runtime):
                 fields=str(fields),
                 high_sim_tables=high_similarity_table_count,
                 high_sim_columns=high_similarity_column_count,
+                unresolved_dimensions=(updated_plan or {}).get("unresolved_dimensions") or [],
                 reason=planner_reason,
                 ms=elapsed_ms(timer),
             )
@@ -613,6 +676,8 @@ def build_planner_node(runtime):
             # 消费 Advisor 自动回环标记：本轮结束后清空，避免下轮误判
             return_value["advisor_draft_updated"] = False
             return_value["advisor_next_step"] = None
+            # 消费 Seeker 0 行自愈标记：本轮已处理，清空避免下轮误判
+            return_value["seeker_empty_result"] = False
             if not from_advisor:
                 # 用户新输入触发：重置 Advisor 自动回环计数（防死循环）
                 return_value["advisor_auto_rounds"] = 0

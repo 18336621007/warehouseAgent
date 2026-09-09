@@ -17,6 +17,7 @@ from agentTest.langgraph_app.prompts.final_answer_prompt import (
 )
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.services.result_store import save_query_result
+from agentTest.config.planner import MAX_EMPTY_RESULT_ROUNDS
 
 
 # 结果快照只保存预览与引用，避免把全量结果写入 checkpoint
@@ -156,6 +157,26 @@ def build_build_final_answer_node(runtime):
             }
 
             if row_count == 0:
+                # 0 行自愈：优先回 Planner 判断是否过滤值不匹配（如大区/公司名称被截断），
+                # 未达重试上限时设置 seeker_empty_result 标记，交由父图回 Planner 修正后再执行；
+                # 达到上限才如实告知"无数据"。
+                empty_rounds = state.get("empty_result_rounds") or 0
+                if empty_rounds < MAX_EMPTY_RESULT_ROUNDS:
+                    log_node_end(
+                        "build_final_answer",
+                        branch="empty_self_heal",
+                        rows=0,
+                        rounds=empty_rounds,
+                        ms=elapsed_ms(timer),
+                    )
+                    update = {
+                        "seeker_empty_result": True,
+                        "empty_result_rounds": empty_rounds + 1,
+                        "topic_status": "generating_sql",
+                        **result_update,
+                    }
+                    log_state_snapshot("build_final_answer", {**state, **update})
+                    return update
 
                 # 记录空结果分支日志
                 log_node_end(

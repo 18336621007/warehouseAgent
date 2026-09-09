@@ -18,6 +18,9 @@ def route_after_seeker(state):
     - 有 seeker_plan_error 但轮次耗尽 → 走 fallback（给用户具体失败原因）
     - 正常完成 → END
     """
+    # 0 行自愈：执行成功但无数据 → 回 Planner 判断是否过滤值不匹配
+    if state.get("seeker_empty_result"):
+        return "repair"
     if state.get("seeker_plan_error"):
         if state.get("seeker_error_unresolvable"):
             return "fallback"

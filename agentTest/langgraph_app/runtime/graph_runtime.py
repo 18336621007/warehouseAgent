@@ -84,6 +84,18 @@ def build_graph_runtime():
             groups=groups,
             security=security,
         ))
+    # 统一工具注册表：Planner 专属值探查工具（0 行自愈时用 LIKE 实时确认字段实际取值）
+    # 参考 Codex：查不到数据返回用 LIKE 确认具体值，而不是依赖元数据采样猜测
+    from agentTest.datasource.hive_datasource import HiveDataSource
+    from agentTest.langgraph_app.tools.probe_values_tool import build_probe_values_tool
+    probe_values_tool = build_probe_values_tool(HiveDataSource(), metadata_provider)
+    tool_registry.register(ToolSpec(
+        name="probe_values",
+        description=probe_values_tool.description,
+        tool=probe_values_tool,
+        groups=("planner",),
+        security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
+    ))
 
     # 从 MySQL 加载字段类型映射（度量/维度）与字段枚举值映射，供 generate_sql/Resolver 使用
     import re as _re

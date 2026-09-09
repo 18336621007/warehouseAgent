@@ -39,9 +39,9 @@ class PlannerOutput(BaseModel):
         description="结合对话上下文还原出的完整有效查数需求"
     )
 
-    route: Literal["seeker", "advisor"] = Field(
+    route: Literal["seeker", "advisor", "answer"] = Field(
         default="advisor",
-        description="本轮路由判定：seeker=可直接执行（语义层唯一解析、槽位齐全）；advisor=需先澄清/核验或回顾历史查询结果"
+        description="本轮路由判定：seeker=可直接执行（语义层唯一解析、槽位齐全）；advisor=需先澄清/核验或回顾历史查询结果；answer=无需再查，直接用 final_answer 给用户最终答复并结束本轮"
     )
 
     filters: str = Field(
@@ -93,6 +93,11 @@ class PlannerOutput(BaseModel):
         description="确认判断和模糊度判断的主要依据"
     )
 
+    final_answer: str = Field(
+        default="",
+        description="route=answer 时给用户的最终答复；其余路由必须留空"
+    )
+
     semantic_keywords: list[str] = Field(
         default_factory=list,
         description="从用户问题拆出的语义层检索关键词（第0层输出，用于全文 grep）"
@@ -111,14 +116,17 @@ PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责理解�
 - search_columns(question, table): 检索字段（含枚举提示）；过滤值不确定时确认，如大区/公司名称。
 - search_databases(question): 检索数据库，低频。
 - query_stored_result(ref, operation, ...): 读取本会话已落盘的查询结果，判断用户追问能否直接复用历史结果。
+- probe_values(table, column, keyword, limit): 实时探查某表某字段的实际存储值（LIKE 模糊匹配），用于确认过滤值是否与库中一致（如大区/公司名称被截断、格式不同）。
 规则：
-- 【语义层指标候选】已给出唯一强命中指标时，禁止调用检索类工具，直接输出判定。
-- 语义层未命中或信息不足（如过滤值不确定、字段枚举缺失、用户追问历史结果）时，先调用工具补充，再输出最终 JSON。
+- 语义层已唯一强命中时默认直接输出判定；但若某过滤维度在【语义层指标候选】中未提供枚举值，可调用 search_columns（元数据采样）或 probe_values（实时查库）确认该字段实际取值，避免精确匹配落空。
+- 语义层未命中或信息不足（如过滤值不确定、用户追问历史结果）时，先调用工具补充，再输出最终 JSON。
+- 收到【上次执行 0 行反馈】时，先判断是否因过滤值与实际存储值不匹配导致；若是且语义层未提供该过滤字段的枚举值，必须先调用 probe_values 用 LIKE 实时探查实际取值，修正 filters 后 route=seeker 重跑——这类事实问题查库可解，禁止 route=advisor 去问用户。
+- 探查后确认过滤值无误、确属无数据，route=answer 并给出 final_answer 直接告知用户，不要反复重试；只有在存在真正的口径歧义（需要用户在多个候选之间选择）时才允许 route=advisor。
 - 不要用工具执行 SQL，执行由 Seeker 负责；工具调用应克制，避免反复调用。
 
 你需要输出：
 1. effective_query：当前完整有效需求
-2. route：本轮路由判定（seeker=可直接执行，advisor=需先澄清/核验）
+2. route：本轮路由判定（seeker=可直接执行，advisor=需先澄清/核验，answer=无需再查、直接用 final_answer 给最终答复并结束）
 3. filters：用户明确的口径过滤条件（含时间，时间按【当前日期】换算成 yyyy-MM-dd 日期区间）
 4. tables：候选目标表
 5. fields：SELECT 业务字段（度量/维度/展示字段；时间与过滤字段一律不写，属于 filters）
@@ -127,6 +135,7 @@ PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责理解�
 8. metric_mentions：用户提到的指标业务概念
 9. dimension_mentions：用户提到的维度业务概念
 10. analysis_type：分析类型
+11. final_answer：仅当 route=answer 时填写，给用户的最终答复；其余路由必须留空
 
 禁止：
 - 生成SQL
@@ -168,6 +177,8 @@ route 决定本轮是直接执行，还是先由 Advisor 澄清/核验。你是�
   或命中指标无法唯一解析，需要先用工具核验表/字段是否真实存在；
   或用户引用/追问历史查询结果（"给我完整的明细""刚才的结果""统计各个原因多少条"），
   此时 Advisor 可用 query_stored_result 读取已落盘 CSV 直接回答，无需重新查询数据库（见【最近查询结果索引】）。
+- answer：本轮无需查询、可直接给用户最终答复并结束（如已确认无数据、用户问的是非查数类问题、工具信息已足够）。
+  route=answer 时必须同时提供 final_answer。
 
 要点：
 - 用户一次问多个指标时，只要每个指标都能唯一映射、槽位齐全，即使命中多个语义层指标也应判定 seeker。
@@ -234,18 +245,16 @@ tables/fields 只作为 Advisor 核验参考，最终物理字段由语义层确
 - 候选展示含义只是字段的原始备注（如候选1展示为“新增订单数”），不是业务概念字符串；已确认概念“新增订单”必须逐字沿用，禁止改写成“新增订单数”。
 - 反例：上轮已确认“新增订单”，即使候选展示写的是“新增订单数”，metric_mentions 仍必须输出“新增订单”；改写会导致已确认口径断链、触发重复澄清。
 - 用户本轮选定单一候选口径时，保留当前完整需求中的全部业务概念（已确认与未确认概念都保留）；用户改选或明确放弃某概念后，只保留当前仍有效的概念，被替换的口径不得保留。
-- 用户用已知维度枚举值限定指标时（如"A类"，见【语义层指标候选】的"可用枚举值"），
-  指标概念只保留核心指标名，枚举值限定词拆入 dimension_mentions。
-  例：用户说"A类新增订单" → metric_mentions=["新增订单"]、dimension_mentions=["A类"]；
-  禁止把枚举值限定词并入指标概念（不得输出 ["A类新增订单"]）。
+- 用户用限定词修饰指标（渠道/类型/区域等枚举值）时，指标概念只保留核心指标名，
+  禁止把限定词并入指标概念（不得输出 ["A类新增订单"] 这类组合名）；
+  限定词是否作为过滤条件/维度由后续环节结合字段上下文自行判断。
 - 无法从自然语言中识别指标时返回空列表。
 
 【dimension_mentions规则】
-- 提取用户提到的维度/属性业务概念，如"经销商名称""负责人""业务经理"，只写业务概念不写物理字段名。
+- 只填写你确定需要按它分组/展示的业务概念，如"经销商""平台""型号"这类实体概念；只写业务概念不写物理字段名。
 - "负责人""业务经理"这类展示属性属于维度概念，必须写入 dimension_mentions，禁止写入 metric_mentions。
-- 与【已确认口径】中的维度概念含义相同时，同样必须逐字沿用上轮字符串（如已确认“经销商”不得改写成“经销商名称”），除非用户本轮明确使用了新表述。
-- 枚举值限定词（如"A类""B类"，来自【语义层指标候选】的"可用枚举值"）属于维度概念，
-  必须单独写入 dimension_mentions，禁止并入 metric_mentions。
+- 与【已确认口径】中的维度概念含义相同时，同样必须逐字沿用上轮字符串（如已确认"经销商"不得改写成"经销商名称"），除非用户本轮明确使用了新表述。
+- 用途不确定的词（可能是过滤值、别名或未建模维度）不要强行分类写入，交由后续 SQL 生成环节结合需求文本与字段上下文自行判断。
 - 无法从自然语言中识别维度时返回空列表。
 
 【semantic_keywords规则】

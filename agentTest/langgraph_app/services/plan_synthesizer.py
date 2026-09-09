@@ -165,6 +165,9 @@ def build_plan_from_semantic(
             scope_ids.add(str(contract.get("left_model") or ""))
             scope_ids.add(str(contract.get("right_model") or ""))
     dimensions = []
+    # 未命中实体的维度词：软失败跳过（可能是过滤值/别名/未建模维度），
+    # 交由 generate_sql 结合 effective_query 与字段上下文自行判断，不阻塞方案构建
+    unresolved_dimensions = []
     for word in (dimension_mentions or []):
         entity = None
         for candidate in _entity_aliases(word):
@@ -172,10 +175,8 @@ def build_plan_from_semantic(
             if entity:
                 break
         if not entity:
-            # 过滤限定词误入维度（如"徐州大区"已作为过滤值出现在 filters 中）：跳过不阻断
-            if word and filters and word in filters:
-                continue
-            return None
+            unresolved_dimensions.append(word)
+            continue
         entity_fields = resolve_entity_dimension_fields(
             entity,
             all_models,
@@ -183,7 +184,8 @@ def build_plan_from_semantic(
             provider=sl,
         )
         if not entity_fields:
-            return None
+            unresolved_dimensions.append(word)
+            continue
         # 优先选来源表上的本地维度字段；跨表时取第一个可达结果
         chosen = None
         for entry in entity_fields:
@@ -195,7 +197,8 @@ def build_plan_from_semantic(
         dim_field = str(chosen.get("field") or "")
         dim_table = str(chosen.get("table") or "")
         if not dim_field or not dim_table:
-            return None
+            unresolved_dimensions.append(word)
+            continue
         if dim_field not in dimensions:
             dimensions.append(dim_field)
         if dim_table not in tables:
@@ -280,6 +283,9 @@ def build_plan_from_semantic(
         "complex": bool(complex_flag or draft.get("complex") or False),
         "table_plans": [],
     }
+    if unresolved_dimensions:
+        # 未解析维度词写入方案供日志审计（不参与执行字段）
+        plan["unresolved_dimensions"] = list(dict.fromkeys(unresolved_dimensions))
     try:
         locked = lock_query_plan(plan, concept_resolutions=concept_resolutions or None)
         # 字段-表归属确定性校验：挂错表的一律不进入执行

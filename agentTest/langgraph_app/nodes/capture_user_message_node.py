@@ -23,4 +23,7 @@ def capture_user_message_node(state: AgentState):
     if not state.get("messages"):
         return_value["topic_status"] = "new"
 
+    # 用户新输入开启新的查询意图：重置 0 行自愈计数（自愈回环不经本节点，计数得以保留累加）
+    return_value["empty_result_rounds"] = 0
+
     return return_value

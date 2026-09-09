@@ -65,6 +65,7 @@ def build_supervisor_graph(runtime):
         {
             "seeker": "seeker",
             "advisor": "advisor",
+            "answer": END,
         }
     )
     # Seeker 方案不可行时回 Planner 修复；修复机会耗尽后给用户具体失败原因

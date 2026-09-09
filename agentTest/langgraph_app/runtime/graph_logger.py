@@ -647,6 +647,7 @@ def build_state_snapshot(state, node_name=""):
             "tables": entities.get("tables") or [],
             "fields": entities.get("fields") or [],
             "completeness": entities.get("completeness", ""),
+            "unresolved_dimensions": entities.get("unresolved_dimensions") or [],
         }
     if state.get("planner_reason"):
         snapshot["planner_reason"] = _short_text(
