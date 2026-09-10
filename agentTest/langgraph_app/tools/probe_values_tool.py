@@ -67,7 +67,8 @@ def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_V
                 real_column = c["name"]
                 break
         if real_column is None:
-            return f"字段 {column} 不存在于表 {table} 中，无法探查。"
+            # 字段不存在：提示改用 search_columns 检索正确字段名，让 LLM 自动切换到字段核验路径
+            return f"字段 {column} 不存在于表 {table} 中，无法探查。可改用 search_columns 检索该表正确字段名后重试。"
         limit_int = _clamp_limit(limit, limit_default, limit_max)
 
         database_name = schema.get("database_name") or ""

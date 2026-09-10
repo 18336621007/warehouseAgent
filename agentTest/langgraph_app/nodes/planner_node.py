@@ -20,7 +20,6 @@ from agentTest.langgraph_app.services.query_plan_service import (
 )
 from agentTest.langgraph_app.services.result_store import list_result_index
 from agentTest.semantic_layer.metric_matcher import (
-    format_metric_context,
     grep_metrics_from_keywords,
 )
 from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
@@ -119,6 +118,26 @@ def _build_recent_candidates_text(recent_shown_candidates, resolutions=None):
                 comment = str(candidate.get("comment") or "").strip()
                 lines.append(f"- {field}（含义：{comment}，表：{table}）")
     return "\n".join(lines)
+
+def _resolve_semantic_matches(semantic_metrics, provider) -> list[dict]:
+    """用 Planner LLM 声明的指标 id 反查语义层完整口径（来源表/表达式/维度/备注）。
+
+    search_semantic 工具只负责把候选展示给 LLM，命中判定与置信度由 LLM 输出；
+    程序据此反查 provider 拿权威定义，供 build_plan_from_semantic 确定性构建与 Advisor 复用。
+    """
+    if not semantic_metrics or provider is None:
+        return []
+    matches = []
+    for m in semantic_metrics:
+        metric = provider.get_metric_by_id(str(m.id or ""))
+        if not metric:
+            continue
+        entry = dict(metric)
+        entry["confidence"] = float(m.confidence or 0)
+        entry["mention"] = str(m.mention or "")
+        matches.append(entry)
+    return matches
+
 
 def _build_minimal_plan(planner_output) -> dict | None:
     """Planner 判定 seeker 但语义层未命中时，用 Planner 输出构造最小方案。
@@ -242,49 +261,13 @@ def build_planner_node(runtime):
             ]
             log_sub_info(f"semantic_keywords: {semantic_keywords}", node_name="planner")
 
-            # ── 第1层：全文 grep 检索语义层指标（含 notes/definition，避免备注命中静默漏召）──
-            semantic_matches = grep_metrics_from_keywords(
-                semantic_keywords, limit=SEMANTIC_GREP_TOP_K
-            )
-            metric_context_text = format_metric_context(semantic_matches)
-            log_metric_event(
-                "semantic.grep",
-                node_name="planner",
-                mention=current_user_input[:100],
-                keywords=semantic_keywords,
-                hit_count=len(semantic_matches),
-                metric_ids=[m.get("id", "") for m in semantic_matches],
-                metric_names=[m.get("name", "") for m in semantic_matches],
-                hit_types=[m.get("hit_type", "") for m in semantic_matches],
-                grep_confidences=[
-                    round(float(m.get("confidence", 0) or 0), 2)
-                    for m in semantic_matches
-                ],
-            )
-
-            # 强命中（名称/别名）视为语义层主导，短路跳过 FAISS 双路召回；
-            # 弱命中/无命中保留 FAISS 补充物理字段（RAG 兜底）
-            _grep_strong = any(
-                str(m.get("hit_type", "")) == "strong"
-                for m in semantic_matches
-            )
-            if _grep_strong:
-                # 语义层强命中：候选表直接来自语义层推荐（FAISS 不再程序召回）
-                table_candidates = [
-                    {
-                        "table": _sm.get("source_model", ""),
-                        "score": 1.0,
-                        "comment": f"语义层推荐：{_sm.get('name', '')}",
-                    }
-                    for _sm in semantic_matches
-                    if _sm.get("source_model")
-                ]
-                column_candidates = []
-            else:
-                # ── M2b：FAISS 双路召回改为 Planner 工具自主调用（search_tables/search_columns）──
-                # 不再程序强制注入元数据；LLM 信息不足时在 ReAct 循环中主动检索
-                table_candidates = []
-                column_candidates = []
+            # ── 第1层：语义层候选由 Planner ReAct 自主调用 search_semantic 获取 ──
+            # 不再程序强制 grep/注入 prompt；命中指标 id 由 LLM 在 semantic_metrics 中声明，
+            # 程序在步骤②后用 id 反查 provider 组装完整候选（见 _resolve_semantic_matches）
+            semantic_matches = []
+            # 候选表/字段：语义层命中后由反查结果填充；RAG 元数据由 agent 自主调 search_tables/search_columns
+            table_candidates = []
+            column_candidates = []
 
             # ── 检索历史优质示例（仅对话首轮注入，避免历史相似问题干扰当前需求）──
             example_vs = runtime.get("example_vector_store")
@@ -328,15 +311,16 @@ def build_planner_node(runtime):
                 if _empty_rounds >= MAX_EMPTY_RESULT_ROUNDS:
                     _empty_hint = "\n已达重试上限，若确认无匹配数据请直接 route=answer 告知用户，不要继续探查重试。"
                 sections.append(
-                    "【上次执行 0 行反馈（SQL 执行成功但无数据，需判断是否过滤值不匹配）】\n"
+                    "【上次执行 0 行反馈（SQL 执行成功但无数据，需先自行核实原因再决定动作）】\n"
                     f"方案过滤条件：{(_prev_plan.get('filters') or '无')}\n"
                     f"执行的 SQL：{str(_prev_sql)[:800] or '无'}\n"
-                    "若过滤值来源的字段在语义层没有枚举值，请先用 probe_values 探查实际取值并修正 filters 后 route=seeker 重跑；"
+                    "0 行可能有多种原因（过滤值与库中实际存储不一致、字段选错、数据本身为空等），"
+                    "请先自行核实原因（可用 probe_values 探查实际取值、search_columns 核验字段）再决定："
+                    "可修正后 route=seeker 重跑，或确认确实无数据时 route=answer 直接告知用户。"
                     "这是查库可解决的事实问题，不要 route=advisor 询问用户。"
+                    "请在 reason 中说明你发现 0 行的判断依据与本次修正动作（如改用模糊匹配确认实际值），便于向用户展示修正过程。"
                     f"{_empty_hint}"
                 )
-            if metric_context_text:
-                sections.append(f"【语义层指标候选】\n{metric_context_text}")
             if history_context:
                 sections.append(f"【对话历史（最近 N 轮）】\n{history_context}")
             if example_context:
@@ -353,6 +337,8 @@ def build_planner_node(runtime):
                 HumanMessage(content=user_content),
             ]
             planner_tool_map = {t.name: t for t in planner_tools}
+            # 标记本轮是否调用了 search_semantic（决定是否走语义层确定性构建）
+            called_semantic_tool = False
             # query_stored_result 依赖会话上下文：循环期间注入，结束后复位
             _conv_token = set_result_conversation(str(state.get("conversation_id") or ""))
             try:
@@ -364,6 +350,8 @@ def build_planner_node(runtime):
                         break
                     log_tools_called("planner", [str(tc.get("name", "?")) for tc in _tool_calls])
                     for _tc in _tool_calls:
+                        if str(_tc.get("name", "")) == "search_semantic":
+                            called_semantic_tool = True
                         _tool = planner_tool_map.get(_tc.get("name"))
                         if _tool is None:
                             _result = f"未知工具: {_tc.get('name')}"
@@ -396,6 +384,22 @@ def build_planner_node(runtime):
                 key=lambda m: float(m.confidence or 0),
                 reverse=True,
             )
+            # 用 LLM 声明的指标 id 反查语义层完整口径（权威定义，供确定性构建与 Advisor 复用）
+            semantic_matches = _resolve_semantic_matches(
+                semantic_metrics,
+                runtime.get("semantic_metadata_provider"),
+            )
+            if semantic_matches:
+                # 语义层命中：候选表来自语义层推荐，供 Advisor/Seeker 参考
+                table_candidates = [
+                    {
+                        "table": _sm.get("source_model", ""),
+                        "score": 1.0,
+                        "comment": f"语义层推荐：{_sm.get('name', '')}",
+                    }
+                    for _sm in semantic_matches
+                    if _sm.get("source_model")
+                ]
             if semantic_metrics:
                 _top_confidence = max(
                     (float(m.confidence or 0) for m in semantic_metrics),
@@ -412,18 +416,6 @@ def build_planner_node(runtime):
                         - float(semantic_metrics[1].confidence or 0)
                     ) >= SEMANTIC_UNIQUE_GAP_THRESHOLD
                 )
-            elif (
-                len(semantic_matches) == 1
-                and str(semantic_matches[0].get("hit_type", "")) == "strong"
-            ):
-                # LLM 未输出语义判定但 grep 唯一强命中：回退按语义层唯一短路
-                semantic_metrics = [{
-                    "id": semantic_matches[0]["id"],
-                    "confidence": SEMANTIC_CONFIDENCE_UNIQUE,
-                    "mention": "",
-                }]
-                _top_confidence = SEMANTIC_CONFIDENCE_UNIQUE
-                _semantic_unique = True
             else:
                 semantic_metrics = []
                 _top_confidence = 0.0
@@ -532,13 +524,14 @@ def build_planner_node(runtime):
                     for m in (planner_output.semantic_metrics or [])
                     if float(m.confidence or 0) >= SEMANTIC_CONFIDENCE_CANDIDATE
                 }
+                if not called_semantic_tool:
+                    # agent 未调用 search_semantic（如追问落盘结果/RAG 直通）：
+                    # 不走语义层确定性构建，交由 minimal 方案直通
+                    _confirmed_ids = set()
                 metric_hits = [
                     sc for sc in semantic_candidates
                     if str(sc.get("id") or "") in _confirmed_ids
                 ]
-                if not metric_hits and semantic_candidates:
-                    # LLM 未输出语义判定但 grep 唯一强命中时，回退采信最强候选
-                    metric_hits = [semantic_candidates[0]]
                 _conf_by_id = {
                     str(m.id): float(m.confidence or 0)
                     for m in (planner_output.semantic_metrics or [])
@@ -567,10 +560,13 @@ def build_planner_node(runtime):
                     fields = plan.get("fields", [])
                     completeness = "full"
                     route = "seeker"
-                    planner_reason = (
-                        "Planner 判定可直接执行，语义层确定性构建方案通过："
-                        + planner_output.reason
+                    # 0 行自愈轮在前缀体现修正语义，便于前端思考过程区分轮次
+                    _reason_prefix = (
+                        "Planner 判定 0 行自愈修正后可直接执行："
+                        if from_empty_result
+                        else "Planner 判定可直接执行，语义层确定性构建方案通过："
                     )
+                    planner_reason = _reason_prefix + planner_output.reason
                 else:
                     route = "advisor"
                     planner_reason = (
@@ -592,6 +588,14 @@ def build_planner_node(runtime):
                         "Planner 判定需要先澄清/核验，进入 Advisor："
                         + planner_output.reason
                     )
+
+            # ── Advisor 澄清材料预检：Planner 未命中语义层但判 advisor 时，
+            # 用第0层检索词补一次 grep 写共享状态，供 Advisor 澄清列口径候选
+            # （只作澄清材料，不注入 prompt、不影响路由）
+            if route != "seeker" and not semantic_candidates and semantic_keywords:
+                semantic_candidates = grep_metrics_from_keywords(
+                    semantic_keywords, limit=SEMANTIC_GREP_TOP_K
+                )
 
             new_entities = {
                 # Advisor 后续使用完整有效需求，不能直接拿“1”“A”检索

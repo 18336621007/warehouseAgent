@@ -34,7 +34,6 @@ from agentTest.langgraph_app.services.query_plan_service import (
     merge_draft_plan,
 )
 from agentTest.semantic_layer.metric_matcher import (
-    match_metrics_from_query,
     format_metric_context,
 )
 
@@ -243,16 +242,12 @@ def build_advisor_subgraph(runtime):
         advisor_turns = state.get("advisor_turns", 0)
 
         # ── 语义层权威口径注入：供 Advisor 核验字段参考 ──
-        # 优先复用 Planner 的 grep 候选（含 notes/definition 命中，避免漏召"调出"等），
-        # 无候选时回退本节点词法匹配
+        # 只复用 Planner 检索并写入共享状态的语义层候选（含 notes/definition 命中），
+        # Advisor 不再自行词法检索，避免两套口径不一致；无候选时走自然语言澄清
         metric_search_text = effective_query or current_user_input
-        _planner_semantic_candidates = list(
+        semantic_matches = list(
             planner_entities.get("semantic_candidates") or []
         )
-        if _planner_semantic_candidates:
-            semantic_matches = _planner_semantic_candidates
-        else:
-            semantic_matches = match_metrics_from_query(metric_search_text, limit=5)
         # 语义层命中日志：便于排查"走了语义层还是召回"
         log_metric_event(
             "semantic.match",

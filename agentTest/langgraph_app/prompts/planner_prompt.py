@@ -112,15 +112,18 @@ PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责理解�
 你可以调用工具补充信息（工具结果会自动回填，供最终判定参考），最终必须只输出 PlannerOutput 的纯 JSON，不要 markdown 代码块，不要输出解释文字。
 
 【可用工具与调用时机】
+- search_semantic：检索语义层业务指标候选（权威口径：来源表/表达式/维度/枚举值/备注）。新查询或需确认指标口径时优先调用；语义层优先于 RAG 检索。
 - search_tables：检索数据表；信息不足时补充。
 - search_columns：检索字段（含枚举提示）；过滤值不确定时确认，如大区/公司名称。
 - search_databases：检索数据库，低频。
 - query_stored_result：读取本会话已落盘的查询结果，判断用户追问能否直接复用历史结果。
 - probe_values：实时探查某表某字段的实际存储值（LIKE 模糊匹配），用于确认过滤值是否与库中一致（如大区/公司名称被截断、格式不同）。
 规则：
-- 语义层已唯一强命中时默认直接输出判定；但若某过滤维度在【语义层指标候选】中未提供枚举值，可调用 search_columns（元数据采样）或 probe_values（实时查库）确认该字段实际取值，避免精确匹配落空。
-- 语义层未命中或信息不足（如过滤值不确定、用户追问历史结果）时，先调用工具补充，再输出最终 JSON。
-- 收到【上次执行 0 行反馈】时，先判断是否因过滤值与实际存储值不匹配导致；若是且语义层未提供该过滤字段的枚举值，必须先调用 probe_values 用 LIKE 实时探查实际取值，修正 filters 后 route=seeker 重跑——这类事实问题查库可解，禁止 route=advisor 去问用户。
+- 新查询/口径确认：优先调用 search_semantic 获取语义层候选（来源表/表达式/维度/枚举值），命中指标在 semantic_metrics 中声明 id 与置信度；未命中时再用 search_tables/search_columns（RAG 兜底）。
+- 基于上次落盘结果的追问（"统计各个原因多少条""刚才的结果"等）：优先用 query_stored_result 读落盘 CSV 直接回答，不需要 search_semantic。
+- 语义层候选不再自动提供，需主动调用 search_semantic 获取；若某过滤维度候选未提供枚举值，可调用 search_columns（元数据采样）或 probe_values（实时查库）确认该字段实际取值，避免精确匹配落空。
+- 语义层未命中或信息不足（如过滤值不确定）时，先调用工具补充，再输出最终 JSON。
+- 收到【上次执行 0 行反馈】时，先自行核实 0 行原因（可能为过滤值与实际存储值不匹配、字段选错、数据本身为空等），可用 probe_values 探查实际取值、search_columns 核验字段；确认原因后修正 filters 并 route=seeker 重跑，这类事实问题查库可解，禁止 route=advisor 去问用户。
 - 探查后确认过滤值无误、确属无数据，route=answer 并给出 final_answer 直接告知用户，不要反复重试；只有在存在真正的口径歧义（需要用户在多个候选之间选择）时才允许 route=advisor。
 - 不要用工具执行 SQL，执行由 Seeker 负责；工具调用应克制，避免反复调用。
 
@@ -184,7 +187,7 @@ route 决定本轮是直接执行，还是先由 Advisor 澄清/核验。你是�
 - 用户一次问多个指标时，只要每个指标都能唯一映射、槽位齐全，即使命中多个语义层指标也应判定 seeker。
 - 多指标不等于 advisor；含糊不清、口径冲突才判 advisor。
 - 不确定时判 advisor 更安全（Advisor 会继续澄清），但不要把可以确定的查询推给 Advisor。
-- 结合【语义层指标候选】的置信度与【对话历史】判断，不允许仅根据关键词判断。
+- 结合 search_semantic 检索到的指标候选与【对话历史】判断，不允许仅根据关键词判断。
 
 【时间写入 filters 规则】
 - 系统没有独立的时间槽位，时间条件一律写入 filters。

@@ -173,6 +173,8 @@ def build_build_final_answer_node(runtime):
                         "seeker_empty_result": True,
                         "empty_result_rounds": empty_rounds + 1,
                         "topic_status": "generating_sql",
+                        # 0 行自愈旁白：向用户展示"发现空结果 → 返回修正"的思考过程
+                        "self_heal_note": "执行返回 0 行，需核实是过滤条件与实际存储值不一致，还是确实无匹配数据，返回核实后决定重查或直接告知。",
                         **result_update,
                     }
                     log_state_snapshot("build_final_answer", {**state, **update})

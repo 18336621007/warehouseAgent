@@ -79,6 +79,10 @@ def _extract_node_detail(node_name, node_update):
     elif node_name == "generate_sql":
         if node_update.get("generated_sql"):
             parts.append("SQL: " + str(node_update.get("generated_sql")))
+    elif node_name == "build_final_answer":
+        # 0 行自愈等旁白：向用户展示"发现空结果 → 返回修正"的思考过程
+        if node_update.get("self_heal_note"):
+            parts.append(str(node_update.get("self_heal_note")))
     return "\n".join(parts)
 
 @app.before_request
@@ -235,7 +239,8 @@ def chat():
         )
         bind_stream_bus(bus)
         thinking_parts = ["[intent] query"]
-        seen = set()
+        seen = set()          # 出现过哪些节点（用于 evaluator/sql 判断）
+        node_seq = {}         # 节点出现次数：0 行自愈等回环时展示为 node#2 区分轮次
         advisor_history_recorded = False
         try:
             for chunk in APP.stream(state_input, config, subgraphs=True):
@@ -260,9 +265,13 @@ def chat():
                             )
                             observed_topic_status = next_topic_status
 
-                    if not node_name or node_name in seen:
+                    if not node_name:
                         continue
                     seen.add(node_name)
+                    # 回环轮次计数：首轮用节点名，0 行自愈等二次出现用 node#2 区分
+                    seq = node_seq.get(node_name, 0) + 1
+                    node_seq[node_name] = seq
+                    display_node = node_name if seq == 1 else f"{node_name}#{seq}"
                     label = NODE_LABELS.get(node_name, node_name)
                     if node_name in ("advisor", "advisor_agent"):
                         # Advisor 思考内容已由 token 流逐字展示（标签在首个 token 前发出），
@@ -271,20 +280,20 @@ def chat():
                             advisor_history_recorded = True
                             detail = _extract_node_detail(node_name, node_update)
                             thinking_parts.append(
-                                "[" + node_name + "] " + label
+                                "[" + display_node + "] " + label
                                 + ("\n" + detail if detail else "")
                             )
                             # 非流式时整段发送，避免关闭流式后 advisor 无内容可见
                             if not get_stream_output_enabled():
                                 display_text = label + ("\n" + detail if detail else "")
-                                bus.emit({"type": "thinking", "node": node_name, "text": display_text})
+                                bus.emit({"type": "thinking", "node": display_node, "text": display_text})
                         else:
-                            thinking_parts.append("[" + node_name + "] " + label)
+                            thinking_parts.append("[" + display_node + "] " + label)
                     else:
                         detail = _extract_node_detail(node_name, node_update)
                         display_text = label + ("\n" + detail if detail else "")
-                        thinking_parts.append("[" + node_name + "] " + display_text)
-                        bus.emit({"type": "thinking", "node": node_name, "text": display_text})
+                        thinking_parts.append("[" + display_node + "] " + display_text)
+                        bus.emit({"type": "thinking", "node": display_node, "text": display_text})
 
             final_state = APP.get_state(config)
             result = (final_state and final_state.values) or {}

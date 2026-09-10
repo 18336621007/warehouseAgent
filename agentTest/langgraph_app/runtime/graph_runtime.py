@@ -96,6 +96,17 @@ def build_graph_runtime():
         groups=("planner",),
         security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
     ))
+    # 统一工具注册表：Planner 专属语义层检索工具（agent 自主调用，优先级高于 RAG）
+    # 语义层候选不再程序强制注入 prompt，由 Planner ReAct 按需调用 search_semantic 获取
+    from agentTest.langgraph_app.tools.semantic_tool import build_search_semantic_tool
+    semantic_tool = build_search_semantic_tool()
+    tool_registry.register(ToolSpec(
+        name="search_semantic",
+        description=semantic_tool.description,
+        tool=semantic_tool,
+        groups=("planner",),
+        security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
+    ))
 
     # 从 MySQL 加载字段类型映射（度量/维度）与字段枚举值映射，供 generate_sql/Resolver 使用
     import re as _re

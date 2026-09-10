@@ -90,5 +90,7 @@ class BaseState(TopicState, total=False):
     # Seeker 执行成功但 0 行时的自愈标记与轮次（回 Planner 用 probe_values 确认实际取值）
     seeker_empty_result: bool
     empty_result_rounds: int
+    # 0 行自愈旁白：自然语言说明"发现空结果 → 返回修正"，供前端思考过程展示
+    self_heal_note: str
     # Advisor 收尾结构化动作：wait_user=等用户，return_to_planner=回 Planner 再判定
     advisor_next_step: str

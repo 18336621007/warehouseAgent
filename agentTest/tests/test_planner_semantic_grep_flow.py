@@ -89,7 +89,7 @@ def _build_runtime():
     from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec
     # M2：Planner 从统一注册表取 planner 组工具（本测试用桩工具）
     registry = ToolRegistry()
-    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result"):
+    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "search_semantic"):
         registry.register(ToolSpec(name=name, description="stub", tool=_FakeTool(name), groups=("planner",)))
     return {
         "table_vector_store": _FakeVectorStore(),
@@ -224,7 +224,15 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
                 )
             ],
         )
-        result = self._run_planner(["新增订单"], planner_kwargs)
+        result = self._run_planner(
+            ["新增订单"],
+            planner_kwargs,
+            react_tool_calls=[{
+                "name": "search_semantic",
+                "args": {"question": "新增订单"},
+                "id": "call_semantic_1",
+            }],
+        )
         self.assertEqual(result["route"], "seeker")
         plan = result.get("confirmed_plan") or {}
         self.assertEqual(plan.get("status"), "confirmed")

@@ -9,6 +9,7 @@ from agentTest.langgraph_app.prompts.planner_prompt import (
     PLANNER_SYSTEM_PROMPT,
     PlannerOutput,
     SemanticKeywordsOutput,
+    SemanticMetricHit,
 )
 
 
@@ -80,7 +81,7 @@ def _build_runtime():
     from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
     from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec
     registry = ToolRegistry()
-    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "probe_values"):
+    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "probe_values", "search_semantic"):
         registry.register(ToolSpec(name=name, description="stub", tool=_FakeTool(name), groups=("planner",)))
     return {
         "table_vector_store": _FakeVectorStore(),
@@ -129,8 +130,8 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
     """0 行自愈路由策略：事实问题由 Planner 探查，禁止降级 Advisor 问用户。"""
 
     def test_prompt_requires_probe_values_on_zero_rows(self):
-        # 0 行规则强化：必须探查、禁止 route=advisor 问用户、口径歧义才允许 advisor
-        self.assertIn("必须先调用 probe_values", PLANNER_SYSTEM_PROMPT)
+        # 0 行规则强化：可用工具探查、禁止 route=advisor 问用户、口径歧义才允许 advisor
+        self.assertIn("可用 probe_values 探查实际取值", PLANNER_SYSTEM_PROMPT)
         self.assertIn("route=seeker 重跑", PLANNER_SYSTEM_PROMPT)
         self.assertIn("禁止 route=advisor", PLANNER_SYSTEM_PROMPT)
         self.assertIn("口径歧义", PLANNER_SYSTEM_PROMPT)
@@ -167,6 +168,12 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
         # 0 行自愈链路：react 先调 probe_values 探查，structured 修正 filters 后 route=seeker
         react_tool_calls = [
             {
+                "name": "search_semantic",
+                "args": {"question": "返厂明细"},
+                "id": "call_semantic_1",
+                "type": "tool_call",
+            },
+            {
                 "name": "probe_values",
                 "args": {
                     "table": "ads_trip.ads_gundam_device_return_detail_hour",
@@ -180,7 +187,15 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
         ]
         from agentTest.langgraph_app.nodes import planner_node
         fake_llm = _FakeStructuredLLM(
-            ["返厂", "明细"], _planner_kwargs(), react_tool_calls=react_tool_calls
+            ["返厂", "明细"],
+            _planner_kwargs(semantic_metrics=[
+                SemanticMetricHit(
+                    id="device_return_detail",
+                    confidence=0.95,
+                    mention="返厂明细",
+                )
+            ]),
+            react_tool_calls=react_tool_calls,
         )
         with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
