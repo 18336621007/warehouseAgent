@@ -1,19 +1,7 @@
-﻿from agentTest.tests.test_agent_schema_rag import run_agent_schema_rag_tests
-from agentTest.tests.test_embedder_factory import run_embedder_factory_tests
-from agentTest.tests.test_hive_sql_guardrails import run_hive_sql_guardrails_tests
+﻿from agentTest.tests.test_hive_sql_guardrails import run_hive_sql_guardrails_tests
 from agentTest.tests.test_metadata_cache import run_metadata_cache_tests
-from agentTest.tests.test_planner_prompt_schema_rag import run_planner_prompt_schema_rag_tests
-from agentTest.tests.test_planner_validation import run_planner_validation_tests
-from agentTest.tests.test_real_embedder import run_real_embedder_tests
-from agentTest.tests.test_schema_context import run_schema_context_tests
-from agentTest.tests.test_schema_embedding_cache import run_schema_embedding_cache_tests
-from agentTest.tests.test_schema_snapshot_cache import run_schema_snapshot_cache_tests
-from agentTest.tests.test_tool_validation import run_tool_validation_tests
 from agentTest.tests.test_sql_validation import run_sql_validation_tests
 from agentTest.tests.test_hive_metadata_provider import run_hive_metadata_provider_tests
-from agentTest.tests.test_hive_schema_documents import run_hive_schema_documents_tests
-from agentTest.tests.test_schema_document_retriever import run_schema_document_retriever_tests
-from agentTest.tests.test_schema_vector_retriever import run_schema_vector_retriever_tests
 
 import dotenv
 
@@ -23,87 +11,23 @@ def main():
     total_passed = 0
     total_count = 0
 
-    # passed, count = run_planner_validation_tests()
-    # total_passed += passed
-    # total_count += count
-    #
-    # passed, count = run_tool_validation_tests()
-    # total_passed += passed
-    # total_count += count
-    #
-    # passed, count = run_sql_validation_tests()
-    # total_passed += passed
-    # total_count += count
+    # 无 Hive 依赖的回归测试：SQL 安全校验
+    passed, count = run_hive_sql_guardrails_tests()
+    total_passed += passed
+    total_count += count
 
-    #hive连接
-    # try:
-    #     from agentTest.tests.test_hive_smoke import run_hive_smoke_tests
-    #
-    #     passed, count = run_hive_smoke_tests()
-    #     total_passed += passed
-    #     total_count += count
-    # except Exception as error:
-    #     print("=" * 60)
-    #     print("[WARN] Hive smoke test 未执行")
-    #     print(f"原因: {error}")
-    #     print("=" * 60)
+    passed, count = run_sql_validation_tests()
+    total_passed += passed
+    total_count += count
 
-    #hive sql安全校验
-    # passed, count = run_hive_sql_guardrails_tests()
-    # total_passed += passed
-
-    #hive获取metadata测试
-    # passed, count = run_hive_metadata_provider_tests()
-    # total_passed += passed
-    # total_count += count
-
-    #表召回测试
-    # passed, count = run_schema_context_tests()
-    # total_passed += passed
-    # total_count += count
-
-    #rag documents 构建测试
-    # passed, count = run_hive_schema_documents_tests()
-    # total_passed += passed
-    # total_count += count
-
-    #schema document 检索测试
-    # passed, count = run_schema_document_retriever_tests()
-    # total_passed += passed
-    # total_count += count
-
-    # passed, count = run_agent_schema_rag_tests()
-    # total_passed += passed
-    # total_count += count
-
-    # passed, count = run_planner_prompt_schema_rag_tests()
-    # total_passed += passed
-    # total_count += count
-
+    # 依赖真实 Hive 的测试（可单独运行，默认跳过）
     # passed, count = run_metadata_cache_tests()
     # total_passed += passed
     # total_count += count
 
-    # passed, count = run_schema_snapshot_cache_tests()
+    # passed, count = run_hive_metadata_provider_tests()
     # total_passed += passed
     # total_count += count
-
-    # passed, count = run_schema_vector_retriever_tests()
-    # total_passed += passed
-    # total_count += count
-
-    # passed, count = run_embedder_factory_tests()
-    # total_passed += passed
-    # total_count += count
-
-    # passed, count = run_real_embedder_tests()
-    # total_passed += passed
-    # total_count += count
-
-    passed, count = run_schema_embedding_cache_tests()
-    total_passed += passed
-    total_count += count
-
 
     print("=" * 60)
     print(f"全部测试完成，通过 {total_passed}/{total_count}")

@@ -1,6 +1,6 @@
 ﻿# 该文件用于测试 SQLQueryTool 是否真正接入了 Guardrails，并在执行前拦截高风险 SQL。
 from agentTest.datasource.hive_datasource import HiveDataSource
-from agentTest.tools.sql_query_tool import SQLQueryTool
+from agentTest.langgraph_app.tools.sql_query_tool import SQLQueryTool
 
 
 class FakeHiveDataSource(HiveDataSource):

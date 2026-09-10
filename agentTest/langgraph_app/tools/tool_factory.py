@@ -1,7 +1,7 @@
-
+﻿
 from agentTest.datasource.hive_datasource import HiveDataSource
-from agentTest.langchain_app.tools.schema_tool import build_list_tables_tool, build_describe_table_tool
-from agentTest.langchain_app.tools.sql_tool import build_sql_query_tool
+from agentTest.langgraph_app.tools.schema_tool import build_list_tables_tool, build_describe_table_tool
+from agentTest.langgraph_app.tools.sql_tool import build_sql_query_tool
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 
 

@@ -2,7 +2,7 @@
 from agentTest.db.hive_guardrails import MAX_RESULT_ROWS
 from agentTest.db.hive_guardrails import QUERY_TIMEOUT_SECONDS
 from agentTest.datasource.hive_datasource import HiveDataSource
-from agentTest.tools.sql_query_tool import SQLQueryTool
+from agentTest.langgraph_app.tools.sql_query_tool import SQLQueryTool
 
 
 class FakeSafeHiveDataSource(HiveDataSource):

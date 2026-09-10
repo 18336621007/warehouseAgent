@@ -1,9 +1,32 @@
-openai
-python-dotenv
-pymysql
-
+# 核心框架（LangChain/LangGraph 生态）
 langchain
 langchain-core
 langchain-community
-faiss-cpu
 langchain-openai
+langgraph
+openai
+
+# 数据访问（Hive + Doris/MySQL）
+pyhive
+thrift
+thrift-sasl
+pymysql
+
+# 向量检索与 BM25
+faiss-cpu
+rank-bm25
+jieba
+numpy
+
+# Web 服务
+flask
+flask-cors
+
+# SQL 解析与配置
+sqlglot
+sqlparse
+pyyaml
+
+# 通用
+pydantic
+python-dotenv

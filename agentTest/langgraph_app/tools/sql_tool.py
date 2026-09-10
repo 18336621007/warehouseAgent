@@ -1,7 +1,7 @@
-# 简要注释：SQL 标准工具模块，负责把现有 SQL 查询能力包装成 LangChain StructuredTool。
+﻿# 简要注释：SQL 标准工具模块，负责把现有 SQL 查询能力包装成 LangChain StructuredTool。
 from langchain_core.tools import StructuredTool
 
-from agentTest.tools.sql_query_tool import SQLQueryTool
+from agentTest.langgraph_app.tools.sql_query_tool import SQLQueryTool
 
 
 # 简要注释：创建标准 SQL 查询 Tool，复用现有 SQLQueryTool。
