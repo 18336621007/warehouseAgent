@@ -112,11 +112,11 @@ PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责理解�
 你可以调用工具补充信息（工具结果会自动回填，供最终判定参考），最终必须只输出 PlannerOutput 的纯 JSON，不要 markdown 代码块，不要输出解释文字。
 
 【可用工具与调用时机】
-- search_tables(question, database): 检索数据表；信息不足时补充。
-- search_columns(question, table): 检索字段（含枚举提示）；过滤值不确定时确认，如大区/公司名称。
-- search_databases(question): 检索数据库，低频。
-- query_stored_result(ref, operation, ...): 读取本会话已落盘的查询结果，判断用户追问能否直接复用历史结果。
-- probe_values(table, column, keyword, limit): 实时探查某表某字段的实际存储值（LIKE 模糊匹配），用于确认过滤值是否与库中一致（如大区/公司名称被截断、格式不同）。
+- search_tables：检索数据表；信息不足时补充。
+- search_columns：检索字段（含枚举提示）；过滤值不确定时确认，如大区/公司名称。
+- search_databases：检索数据库，低频。
+- query_stored_result：读取本会话已落盘的查询结果，判断用户追问能否直接复用历史结果。
+- probe_values：实时探查某表某字段的实际存储值（LIKE 模糊匹配），用于确认过滤值是否与库中一致（如大区/公司名称被截断、格式不同）。
 规则：
 - 语义层已唯一强命中时默认直接输出判定；但若某过滤维度在【语义层指标候选】中未提供枚举值，可调用 search_columns（元数据采样）或 probe_values（实时查库）确认该字段实际取值，避免精确匹配落空。
 - 语义层未命中或信息不足（如过滤值不确定、用户追问历史结果）时，先调用工具补充，再输出最终 JSON。

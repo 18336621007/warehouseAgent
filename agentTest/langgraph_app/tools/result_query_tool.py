@@ -2,6 +2,7 @@
 # 职责：基于 result_store 落盘的 CSV 做确定性计算（查看/分组计数/分组求和/筛选计数），
 #       字段白名单 + 行数上限，只读本会话落盘目录，不执行任意 SQL/Python。
 import re
+import json
 from contextvars import ContextVar
 
 from langchain_core.tools import StructuredTool
@@ -25,6 +26,31 @@ def set_result_conversation(conversation_id: str):
 def reset_result_conversation(token):
     """复位会话上下文，防止跨请求串会话。"""
     _current_conversation_id.reset(token)
+
+
+def _normalize_group_by(group_by) -> list:
+    """把 LLM 传入的分组字段归一化为 list。
+
+    模型序列化时常把 list 参数传成 JSON 数组字符串（如 '["disable_type"]'）
+    或逗号分隔字符串，这里统一解析，避免 Pydantic 校验失败导致工具不可用。
+    """
+    if group_by is None:
+        return []
+    if isinstance(group_by, list):
+        return [str(f).strip() for f in group_by if str(f).strip()]
+    text = str(group_by).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(f).strip() for f in parsed if str(f).strip()]
+    except Exception:
+        pass
+    # 非 JSON 数组字符串：按常见分隔符拆分
+    parts = re.split(r"[,、;]", text)
+    fields = [pt.strip() for pt in parts if pt.strip()]
+    return fields if fields else [text]
 
 
 _FILTER_SEG_RE = re.compile(
@@ -145,7 +171,7 @@ def build_result_query_tool(default_ref: str = ""):
     def query_stored_result(
         ref: str = "",
         operation: str = "view",
-        group_by: list[str] | None = None,
+        group_by: str | list[str] | None = None,
         agg_field: str = "",
         filters: str = "",
         limit: int = 20,
@@ -171,7 +197,8 @@ def build_result_query_tool(default_ref: str = ""):
         round_no = entry.get("round_no", ref)
         full_csv = str(entry.get("full_csv") or "")
         col_set = set(columns)
-        group_by = [str(f) for f in (group_by or []) if str(f).strip()]
+        # LLM 可能把分组字段传成数组/JSON 数组字符串/分隔字符串，统一归一化
+        group_by = _normalize_group_by(group_by)
         if len(group_by) > MAX_GROUP_BY_FIELDS:
             return f"分组字段过多（最多 {MAX_GROUP_BY_FIELDS} 个）。"
         for f in group_by:
@@ -207,7 +234,7 @@ def build_result_query_tool(default_ref: str = ""):
         description=(
             "读取本对话某轮已落盘的查询结果（只读、受控，不查询数据库）。"
             "ref 传轮次 round_no 或 result_id；operation 可选 view/group_by_count/group_by_sum/filter_count；"
-            "group_by 为分组字段列表，agg_field 为求和字段，filters 为过滤条件（如 disable_type='批量召回'），"
+            "group_by 为分组字段（支持数组或字符串），agg_field 为求和字段，filters 为过滤条件（如 disable_type='批量召回'），"
             "所有字段必须是该轮结果中的列。"
         ),
     )

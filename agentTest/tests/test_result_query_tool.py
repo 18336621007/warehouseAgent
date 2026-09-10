@@ -72,6 +72,27 @@ class ResultQueryToolTest(unittest.TestCase):
         self.assertIn("批量召回: 2", out)
         self.assertIn("多次诊断无故障: 2", out)
 
+    def test_group_by_count_with_json_string(self):
+        # 兼容 LLM 把 list 参数序列化成 JSON 数组字符串
+        self._save()
+        out = self.tool.invoke({"ref": "1", "operation": "group_by_count", "group_by": "[\"disable_type\"]"})
+        self.assertIn("按 disable_type 分组计数", out)
+        self.assertIn("批量召回: 2", out)
+        self.assertIn("多次诊断无故障: 2", out)
+
+    def test_group_by_count_with_plain_string(self):
+        # 兼容单字段字符串
+        self._save()
+        out = self.tool.invoke({"ref": "1", "operation": "group_by_count", "group_by": "disable_type"})
+        self.assertIn("按 disable_type 分组计数", out)
+        self.assertIn("批量召回: 2", out)
+
+    def test_group_by_count_with_comma_string(self):
+        # 兼容逗号分隔的多字段字符串
+        self._save()
+        out = self.tool.invoke({"ref": "1", "operation": "group_by_count", "group_by": "model_type, disable_type"})
+        self.assertIn("按 model_type / disable_type 分组计数", out)
+
     def test_group_by_sum(self):
         self._save()
         out = self.tool.invoke({
