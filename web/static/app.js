@@ -447,7 +447,7 @@ function updatePendingMessage(convId) {
     }
     var answerEl = wrapper.querySelector(".pending-answer");
     if (answerEl) {
-        answerEl.textContent = pend.content;
+        answerEl.innerHTML = formatContent(pend.content);
         answerEl.style.display = pend.content ? "block" : "none";
     }
     // 消息区：随内容增长自动滚动，用户上翻历史时保持不动
@@ -546,12 +546,72 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
 }
 
 function formatContent(text) {
+    // 极简 Markdown 渲染（安全：先转义 HTML 防注入，再按块解析）
+    // 支持：代码块 / 标题 / 引用 / 列表 / 表格 / 段落 + 行内粗体斜体代码
     if (!text) return "";
-    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-        .replace(/```(\w*)\n?([\s\S]*?)```/g, "<pre>$2</pre>")
-        .replace(/\n/g, "<br>");
+    var html = "";
+    var lines = String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").split(/\r?\n/);
+    var i = 0, inList = false, inTable = false, para = [];
+    function mdInline(s) {
+        s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+        s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+        s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+        s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+        return s;
+    }
+    function flushPara() { if (para.length) { html += "<p>" + para.map(mdInline).join("<br>") + "</p>"; para = []; } }
+    function flushList() { if (inList) { html += "</ul>"; inList = false; } }
+    function flushTable() { if (inTable) { html += "</table>"; inTable = false; } }
+    while (i < lines.length) {
+        var line = lines[i];
+        if (/^```/.test(line)) { // 代码块
+            flushPara(); flushList(); flushTable();
+            var buf = []; i++;
+            while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+            i++;
+            html += "<pre><code>" + buf.join("\n") + "</code></pre>";
+            continue;
+        }
+        var hm = line.match(/^(#{1,4})\s+(.*)$/); // 标题
+        if (hm) {
+            flushPara(); flushList(); flushTable();
+            var lvl = hm[1].length;
+            html += "<h" + lvl + ">" + mdInline(hm[2]) + "</h" + lvl + ">";
+            i++; continue;
+        }
+        if (/^&gt;\s?/.test(line)) { // 引用
+            flushPara(); flushList(); flushTable();
+            html += "<blockquote>" + mdInline(line.replace(/^&gt;\s?/, "")) + "</blockquote>";
+            i++; continue;
+        }
+        var lm = line.match(/^[-*]\s+(.*)$/) || line.match(/^\d+\.\s+(.*)$/); // 列表
+        if (lm) {
+            flushPara(); flushTable();
+            if (!inList) { html += "<ul>"; inList = true; }
+            html += "<li>" + mdInline(lm[1]) + "</li>";
+            i++; continue;
+        }
+        if (/^\|/.test(line) && /\|$/.test(line)) { // 表格
+            var cells = line.split("|").slice(1, -1).map(function (c) { return c.trim(); });
+            var isSep = cells.every(function (c) { return /^:?-+:?$/.test(c); });
+            if (!inTable && !isSep) {
+                flushPara(); flushList();
+                html += "<table><thead><tr>" + cells.map(function (c) { return "<th>" + mdInline(c) + "</th>"; }).join("") + "</tr></thead><tbody>";
+                inTable = true;
+            } else if (inTable && !isSep) {
+                html += "<tr>" + cells.map(function (c) { return "<td>" + mdInline(c) + "</td>"; }).join("") + "</tr>";
+            }
+            i++; continue;
+        }
+        if (/^\s*$/.test(line)) { flushPara(); flushList(); flushTable(); i++; continue; }
+        flushList(); flushTable();
+        para.push(line);
+        i++;
+    }
+    flushPara(); flushList(); flushTable();
+    return html;
 }
+
 
 (function init() {
     newChat().then(function (ok) {

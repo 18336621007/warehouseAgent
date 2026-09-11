@@ -129,7 +129,9 @@ def validate_query_plan(
     # 纯维度查询允许 measures 为空，但不能连维度也没有
     # 明细查询（detail_query）直接返回明细行，允许两者同时为空
     if not measures and not dimensions and not plan.get("detail_query"):
-        errors.append("measures 和 dimensions 不能同时为空")
+        # minimal 聚合方案允许度量/维度为空：select_fields/filters 由 generate_sql 按 effective_query 生成
+        if not (plan.get("select_fields") or str(plan.get("filters") or "").strip()):
+            errors.append("measures 和 dimensions 不能同时为空")
 
     if not isinstance(time_field, str) or not time_field.strip():
         errors.append("缺少时间字段 time_field")

@@ -1,5 +1,5 @@
 # Evaluator 评估节点：收集指标 → LLM 自评 → 计算综合分 → 入库
-# 放在 Seeker 子图 build_final_answer 之后，只在 Seeker 通道触发
+# A1：放在执行链落盘（persist_result）之后、Planner respond 撰写回答前，父图统一触发
 # 始终入库 MySQL（返回 dialogue_id 供用户后续打分），FAISS 仅高分入库
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -90,9 +90,17 @@ def build_evaluator_node(runtime):
     ])
 
     def evaluator_node(state: AgentState):
+        # A1：仅执行回看后的 respond 触发评估（evaluator_pending）；澄清/直接回答直接跳过
+        if not state.get("evaluator_pending"):
+            return {
+                "evaluator_score": 0,
+                "evaluator_self_score": 0,
+                "evaluator_dialogue_id": 0,
+                "evaluator_pending": False,
+            }
         question = state.get("effective_query", "") or ""
         effective_query = question
-        route = state.get("route", "seeker")
+        route = state.get("route", "execute")
         planner_reason = state.get("planner_reason", "")
         advisor_turns = state.get("advisor_turns", 0)
         generated_sql = state.get("generated_sql", "")
@@ -235,6 +243,7 @@ def build_evaluator_node(runtime):
                 "evaluator_score": comprehensive,
                 "evaluator_self_score": round(llm_self_avg, 1),
                 "evaluator_dialogue_id": dialogue_id or 0,
+                "evaluator_pending": False,
             }
 
         except Exception as error:
@@ -251,6 +260,7 @@ def build_evaluator_node(runtime):
                 "evaluator_score": 0,
                 "evaluator_self_score": 0,
                 "evaluator_dialogue_id": 0,
+                "evaluator_pending": False,
             }
 
     return evaluator_node

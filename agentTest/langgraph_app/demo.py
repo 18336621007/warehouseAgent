@@ -45,13 +45,14 @@ def run_demo():
                 },
                 config)
 
-        route = result.get("route", "seeker")
+        route = result.get("route", "execute")
         topic_status = result.get(
             "topic_status",
             "",
         )
         round_num += 1
 
+        # A1：respond（含执行回看后的最终回答）统一为 clarifying，对话在同一上下文继续
         if topic_status == "clarifying":
             print(f"\nAI: {result.get('final_answer', '')}")
 
@@ -79,7 +80,7 @@ def run_demo():
                 break
             continue
 
-        # seeker：已生成最终答案
+        # 其他终态（如失败/兜底）：打印最终答复后开启新一轮
         print(f"\nAI: {result.get('final_answer', '')}")
 
         current_question = input("\n你: ").strip()

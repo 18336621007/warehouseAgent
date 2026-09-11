@@ -267,6 +267,8 @@ def list_result_index(conversation_id: str, limit: int = 8) -> list:
             "entity_keys": entry.get("entity_keys"),
             "result_id": entry.get("result_id"),
             "full_csv": entry.get("full_csv"),
+            # 绝对路径，供 prompt 展示历史轮次 CSV 的完整保存位置
+            "full_csv_path": str(conv_dir / entry.get("full_csv")) if entry.get("full_csv") else "",
         })
     return out
 

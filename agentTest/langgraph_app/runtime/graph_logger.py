@@ -521,6 +521,18 @@ def log_example_retrieved(node_name, hit_count, top_sim="", top_question="", hin
     )
 
 
+def log_skill_event(node_name, name, hit_count, **kwargs):
+    # 记录 skill 命中：可审计"这次走了 skill / 语义层 / RAG / 落盘结果"的分流
+    _write_log(
+        logging.INFO,
+        "skill.matched",
+        node_name=node_name,
+        name=_short_text(name, max_length=200),
+        hit_count=hit_count,
+        **kwargs,
+    )
+
+
 def log_plan_locked(node_name, table, measures, dimensions, order_by=None, result_limit=1000, table_plans=None):
     # 记录最终锁定的查询方案，替代自由文本 locked_plan 摘要
     _write_log(

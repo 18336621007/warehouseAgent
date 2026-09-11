@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 0 行自愈路由策略测试：事实问题必须由 Planner 探查（probe_values）解决，禁止降级 Advisor 问用户
+# 0 行自愈路由策略测试：事实问题必须由 Planner 探查（probe_values）解决，禁止 respond 向用户询问过滤值
 # 覆盖：prompt 0 行规则强化文本、0 行反馈 section 注入、0 行自愈走 probe_values→seeker 重跑链路
 import unittest
 from unittest import mock
@@ -108,8 +108,8 @@ def _state(user_input, messages=None, **overrides):
 def _planner_kwargs(**overrides):
     base = {
         "effective_query": "查询徐州大区今年同意返厂的返厂明细",
-        "route": "seeker",
-        "final_answer": "",
+        "route": "execute",
+        "respond_text": "",
         "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
         "fields": [],
         "completeness": "full",
@@ -127,13 +127,13 @@ def _planner_kwargs(**overrides):
 
 
 class EmptyResultRoutingPolicyTest(unittest.TestCase):
-    """0 行自愈路由策略：事实问题由 Planner 探查，禁止降级 Advisor 问用户。"""
+    """0 行自愈路由策略：事实问题由 Planner 探查，禁止 respond 向用户询问过滤值。"""
 
     def test_prompt_requires_probe_values_on_zero_rows(self):
-        # 0 行规则强化：可用工具探查、禁止 route=advisor 问用户、口径歧义才允许 advisor
+        # 0 行规则强化：可用工具探查、禁止 route=respond 向用户询问、口径歧义才允许澄清
         self.assertIn("可用 probe_values 探查实际取值", PLANNER_SYSTEM_PROMPT)
-        self.assertIn("route=seeker 重跑", PLANNER_SYSTEM_PROMPT)
-        self.assertIn("禁止 route=advisor", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("route=execute 重跑", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("禁止 route=respond 向用户询问", PLANNER_SYSTEM_PROMPT)
         self.assertIn("口径歧义", PLANNER_SYSTEM_PROMPT)
 
     def test_zero_row_section_injected_with_probe_guidance(self):
@@ -151,7 +151,7 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
         user_content = "".join(str(m) for m in seen)
         self.assertIn("SQL 执行成功但无数据", user_content)
         self.assertIn("probe_values 探查实际取值", user_content)
-        self.assertIn("不要 route=advisor 询问用户", user_content)
+        self.assertIn("不要 route=respond 向用户询问", user_content)
 
     def test_zero_row_section_not_injected_without_flag(self):
         # 无 0 行标记时不注入 0 行反馈 section
@@ -165,7 +165,7 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
         self.assertNotIn("SQL 执行成功但无数据", user_content)
 
     def test_zero_row_self_heal_probe_then_seeker(self):
-        # 0 行自愈链路：react 先调 probe_values 探查，structured 修正 filters 后 route=seeker
+        # 0 行自愈链路：react 先调 probe_values 探查，structured 修正 filters 后 route=execute
         react_tool_calls = [
             {
                 "name": "search_semantic",
@@ -204,8 +204,8 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
                 seeker_empty_result=True,
                 generated_sql="SELECT * FROM ads_trip.ads_gundam_device_return_detail_hour WHERE region_name='徐州'",
             ))
-        # 探查修正后仍由 Planner 重跑 seeker，不降级 advisor
-        self.assertEqual(result.get("route"), "seeker")
+        # 探查修正后仍由 Planner 重跑 execute，不向用户澄清
+        self.assertEqual(result.get("route"), "execute")
         self.assertNotEqual(result.get("topic_status"), "clarifying")
 
 

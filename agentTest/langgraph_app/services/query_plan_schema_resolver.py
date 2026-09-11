@@ -130,25 +130,8 @@ class QueryPlanSchemaResolver:
             _parse_table_identifier(primary_table)
         )
 
-        available_tables = (
-            self.metadata_provider.list_tables()
-        )
-
-        exact_matches = [
-            table
-            for table in available_tables
-            if (
-                    table.get("database_name")
-                    == database_name
-                    and table.get("table_name")
-                    == table_name
-            )
-        ]
-        if len(exact_matches) != 1:
-            raise ValueError(
-                "确认方案中的物理表不存在或不唯一："
-                f"{primary_table}"
-            )
+        # 运行时按 db.table 全名直接定位，跳过全库扫描；
+        # 白名单校验与存在性/一致性校验统一由 describe_table 完成
 
         # Provider 已支持 db.table 全名定位，跨库同名表由 describe_table 精确解析
 

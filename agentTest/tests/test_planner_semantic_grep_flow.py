@@ -113,7 +113,7 @@ def _state(user_input, messages=None):
 def _planner_kwargs(**overrides):
     base = {
         "effective_query": "查询昨天从山东瀛能公司调出的调出明细",
-        "route": "advisor",
+        "route": "execute",
         "tables": ["ads_trip.ads_gundam_device_transfer_detail_hour"],
         "fields": ["origin_company_name", "transfer_no"],
         "completeness": "full",
@@ -121,6 +121,8 @@ def _planner_kwargs(**overrides):
         "metric_mentions": ["调出明细"],
         "dimension_mentions": ["山东瀛能"],
         "analysis_type": "detail",
+        # 明细查询必须由 filters 明确业务时间字段（无分区明细表禁止回退 pt_dt）
+        "filters": "pt_dt 昨天",
         "reason": "语义层命中调货明细",
         "semantic_keywords": ["调出", "明细"],
         "semantic_metrics": [],
@@ -158,7 +160,7 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
             entities["semantic_metrics"][0]["id"],
             "device_transfer_detail",
         )
-        # 语义候选应透传给 Advisor
+        # 语义候选保留在 planner_entities（供日志/trace 与后续轮次参考）
         self.assertTrue(
             any(
                 c.get("id") == "device_transfer_detail"
@@ -173,10 +175,12 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
             )
         )
 
-    def test_candidate_tier_routes_to_advisor(self):
-        """0.55~0.9 候选反问：不短路，保留语义候选供 Advisor 澄清。"""
+    def test_candidate_tier_routes_to_respond(self):
+        """0.55~0.9 候选反问：Planner 直接 respond 澄清（不再降级 Advisor）。"""
         planner_kwargs = _planner_kwargs(
+            route="respond",
             completeness="partial",
+            respond_text="您说的“调出”可能对应多个口径：1) 调货明细；2) 返厂明细。请确认是哪一个？",
             semantic_metrics=[
                 SemanticMetricHit(
                     id="device_transfer_detail",
@@ -191,31 +195,34 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
             ],
         )
         result = self._run_planner(["调出", "明细"], planner_kwargs)
-        self.assertEqual(result["route"], "advisor")
+        self.assertEqual(result["route"], "respond")
         entities = result["planner_entities"]
-        # 两个候选都传给 Advisor，供澄清
+        # 两个候选都保留在 planner_entities，供日志/trace 与后续轮次参考
         ids = {m["id"] for m in entities["semantic_metrics"]}
         self.assertIn("device_transfer_detail", ids)
         self.assertIn("device_return_detail", ids)
 
-    def test_no_semantic_grep_goes_rag(self):
-        """无 grep 命中：semantic_metrics 为空，路由由 LLM 判定（M2b 后检索改为工具自主调用）。"""
+    def test_no_semantic_grep_goes_execute(self):
+        """无 grep 命中：semantic_metrics 为空，Planner 用输出构造最小方案直通执行链。"""
         planner_kwargs = _planner_kwargs(
+            route="execute",
             semantic_keywords=["排产"],
             semantic_metrics=[],
         )
         result = self._run_planner(["排产电人比"], planner_kwargs)
         entities = result["planner_entities"]
         self.assertEqual(entities["semantic_metrics"], [])
-        # 仍走 advisor（正常解析链路）
-        self.assertIn(result["route"], ("advisor", "seeker"))
+        # execute：方案由 Planner 输出构造（最小方案），route 收敛为 execute
+        self.assertEqual(result["route"], "execute")
+        self.assertIsNotNone(result.get("confirmed_plan"))
 
-    def test_seeker_route_builds_plan_from_semantic(self):
-        """Planner 判定 seeker 且语义层唯一强命中时，确定性构建 confirmed_plan。"""
+    def test_execute_route_builds_plan_from_semantic(self):
+        """Planner 判定 execute 且语义层唯一强命中时，确定性构建 confirmed_plan。"""
         planner_kwargs = _planner_kwargs(
-            route="seeker",
+            route="execute",
             effective_query="查询昨天的新增订单数",
             dimension_mentions=[],
+            filters="pt_dt 昨天",
             semantic_metrics=[
                 SemanticMetricHit(
                     id="addition_order_num",
@@ -233,17 +240,19 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
                 "id": "call_semantic_1",
             }],
         )
-        self.assertEqual(result["route"], "seeker")
+        self.assertEqual(result["route"], "execute")
         plan = result.get("confirmed_plan") or {}
         self.assertEqual(plan.get("status"), "confirmed")
         self.assertIn("ads_trip.ads_region_rent_order_analysis_hour", plan.get("tables", []))
         self.assertIn("new_rent_counts", plan.get("measures", []))
 
-    def test_seeker_route_without_tables_falls_back_to_advisor(self):
-        """Planner 判定 seeker 但既无共享方案也无 Planner 表信息时降级 advisor。"""
+    def test_execute_route_without_tables_falls_back_to_respond(self):
+        """Planner 判定 execute 但既无表信息也无法构建方案时，respond 澄清（不再降级 Advisor）。"""
         planner_kwargs = _planner_kwargs(
-            route="seeker",
+            route="execute",
             effective_query="查询昨天的续租率",
+            tables=[],
+            fields=[],
             dimension_mentions=[],
             semantic_metrics=[
                 SemanticMetricHit(
@@ -254,7 +263,7 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
             ],
         )
         result = self._run_planner(["续租率"], planner_kwargs)
-        self.assertEqual(result["route"], "advisor")
+        self.assertEqual(result["route"], "respond")
         self.assertIsNone(result.get("confirmed_plan"))
 
     def test_react_tool_loop_feeds_tool_result(self):

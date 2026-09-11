@@ -6,7 +6,7 @@ MAX_EXEC_RETRY = 2  # SQL 执行失败最大重试次数
 
 
 def route_after_sql_execution(state: AgentState):
-    """执行成功 → build_final_answer，失败未超限 → fix，失败超限 → 降级"""
+    """执行成功 → persist_result（落盘后回 Planner），失败未超限 → fix，失败超限 → 降级"""
     sql_exec_failed = state.get("sql_exec_failed", False)
     exec_retry_count = state.get("exec_retry_count", 0)
 
@@ -14,7 +14,7 @@ def route_after_sql_execution(state: AgentState):
         log_route_decision(
             "sql_exec_router",
             failed=False,
-            decision="build_final_answer",
+            decision="persist_result",
         )
         return "success"
 

@@ -26,9 +26,9 @@ def route_after_sql_validation(state: AgentState):
             "sql_router",
             valid=sql_valid,
             retry=retry_count,
-            decision="end",
+            decision="error_end",
         )
-        return "end"
+        return "error_end"
 
     # 打印修正分支日志
     log_route_decision(

@@ -74,8 +74,16 @@ class HiveMetadataProvider(BaseMetadataProvider):
             # 遍历所有白名单库，查询每个库下的表
             for database_name in get_allowed_databases():
                 sql = f"show tables in {database_name}"
-                cursor.execute(sql)
-                rows = cursor.fetchall()
+                try:
+                    cursor.execute(sql)
+                    rows = cursor.fetchall()
+                except Exception as exc:
+                    # 白名单中可能存在 Hive 侧尚未创建的库（如 data_project），
+                    # 这类库直接跳过，避免整个表清单查询失败
+                    if self._is_database_not_exist(exc):
+                        print(f"[skip] 库 {database_name} 不存在，跳过该库的表清单")
+                        continue
+                    raise
 
                 for row in rows:
                     all_tables.append({
@@ -106,6 +114,15 @@ class HiveMetadataProvider(BaseMetadataProvider):
         finally:
             cursor.close()
             conn.close()
+
+    @staticmethod
+    def _is_database_not_exist(error: Exception) -> bool:
+        # 判断异常是否为"库不存在"（Hive errorCode=10072），用于 list_tables 跳过未创建的库
+        if error.args:
+            status = getattr(error.args[0], "status", None)
+            if getattr(status, "errorCode", None) == 10072:
+                return True
+        return "Database does not exist" in str(error)
 
     @staticmethod
     def _parse_table_comment(rows):
@@ -149,17 +166,23 @@ class HiveMetadataProvider(BaseMetadataProvider):
     def describe_table(self, table_identifier: str):
         # 单表结构查询也要做白名单校验，避免绕过 list_tables 直接访问非白名单表
         # 支持 db.table 全名精确定位；短表名仅在同名表唯一时可用，跨库同名必须显式写 db.table
-        if self._tables_cache is None:
-            self.list_tables()
-
         identifier = str(table_identifier or "").strip()
         if "." in identifier:
+            # 全名路径：纯配置白名单校验 + 直接 describe，不再触发全库扫描。
+            # 运行时（Planner 语义层）一律给 db.table 全名，
+            # 避免白名单中暂不存在的库（如 data_project）拖垮整个查询。
             database_name, table_name = identifier.split(".", 1)
             database_name = database_name.strip()
             table_name = table_name.strip()
-        else:
-            database_name = ""
-            table_name = identifier
+            if not is_table_allowed(table_name, database_name):
+                raise ValueError(f"table not allowed: {identifier}")
+            return self._describe_table(database_name, table_name)
+
+        # 裸表名路径（批处理/历史场景）：需全库扫描判定跨库同名唯一性
+        if self._tables_cache is None:
+            self.list_tables()
+        database_name = ""
+        table_name = identifier
 
         # 在白名单过滤后的表清单中定位物理表，避免跨库同名表歧义
         matches = [
@@ -183,11 +206,13 @@ class HiveMetadataProvider(BaseMetadataProvider):
         table = matches[0]
         database_name = table["database_name"]
         table_name = table["table_name"]
-        cache_key = f"{database_name}.{table_name}"
-
         if not is_table_allowed(table_name, database_name):
             raise ValueError(f"table not allowed: {identifier}")
+        return self._describe_table(database_name, table_name)
 
+    def _describe_table(self, database_name: str, table_name: str) -> dict:
+        """按库表全名执行 DESCRIBE 并缓存（describe_table 全名/裸表名路径共用）。"""
+        cache_key = f"{database_name}.{table_name}"
         if cache_key in self._table_schema_cache:
             return copy.deepcopy(self._table_schema_cache[cache_key])
 

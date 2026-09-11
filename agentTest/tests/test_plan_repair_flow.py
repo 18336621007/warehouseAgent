@@ -1,10 +1,10 @@
-# Planner 唯一路由 + Seeker 方案修复回退测试
-# 覆盖：route_after_seeker 修复/兜底/结束分派、plan_error_fallback 用户提示、
+# Planner 唯一决策 + 执行链方案修复回退测试（A1 路由收敛 execute/respond）
+# 覆盖：route_after_seeker 修复/兜底/回看/结束分派、plan_error_fallback 用户提示、
 #       plan_synthesizer 多指标确定性构建、草稿收尾
 import unittest
 
-from agentTest.config.advisor import MAX_PLAN_REPAIR_ROUNDS, MAX_ADVISOR_AUTO_CONTINUE
-from agentTest.langgraph_app.routers.seeker_router import route_after_seeker, route_after_advisor
+from agentTest.config.advisor import MAX_PLAN_REPAIR_ROUNDS
+from agentTest.langgraph_app.routers.seeker_router import route_after_seeker
 from agentTest.langgraph_app.graphs.supervisor_graph import plan_error_fallback_node
 from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
@@ -33,6 +33,16 @@ class SeekerRepairRoutingTest(unittest.TestCase):
         self.assertEqual(route_after_seeker({"seeker_plan_error": ""}), "end")
         self.assertEqual(route_after_seeker({}), "end")
 
+    def test_execution_review_goes_planner(self):
+        # A1：执行成功且有结果 → 回 Planner 基于落盘结果撰写最终回答
+        state = {"execution_review": True, "seeker_empty_result": False}
+        self.assertEqual(route_after_seeker(state), "review")
+
+    def test_empty_result_goes_empty_self_heal(self):
+        # 0 行自愈：执行成功但无数据 → 回 Planner 用 probe_values 核实
+        state = {"seeker_empty_result": True, "execution_review": False}
+        self.assertEqual(route_after_seeker(state), "empty_self_heal")
+
     def test_unresolvable_plan_error_skips_repair(self):
         # 缺 join 契约等不可修复错误：即使修复轮次未耗尽也直接走 fallback 告知用户
         state = {
@@ -41,37 +51,6 @@ class SeekerRepairRoutingTest(unittest.TestCase):
             "plan_repair_rounds": 0,
         }
         self.assertEqual(route_after_seeker(state), "fallback")
-
-
-class AdvisorAutoContinueRoutingTest(unittest.TestCase):
-    """Advisor 收尾结构化 next_step 决定是否自动回 Planner 的分派逻辑。"""
-
-    def test_return_to_planner_goes_planner(self):
-        state = {
-            "advisor_next_step": "return_to_planner",
-            "advisor_auto_rounds": 1,
-        }
-        self.assertEqual(route_after_advisor(state), "planner")
-
-    def test_wait_user_goes_end(self):
-        # 收尾要求等用户回复：即使文本没有问号也不自动回 Planner
-        state = {
-            "advisor_next_step": "wait_user",
-            "advisor_auto_rounds": 1,
-        }
-        self.assertEqual(route_after_advisor(state), "end")
-
-    def test_missing_next_step_goes_end(self):
-        # 没有结构化收尾结果（异常兜底/旧状态）时保守等用户
-        self.assertEqual(route_after_advisor({"advisor_next_step": None}), "end")
-        self.assertEqual(route_after_advisor({}), "end")
-
-    def test_auto_continue_budget_exhausted_goes_end(self):
-        state = {
-            "advisor_next_step": "return_to_planner",
-            "advisor_auto_rounds": MAX_ADVISOR_AUTO_CONTINUE + 1,
-        }
-        self.assertEqual(route_after_advisor(state), "end")
 
 
 class PlanErrorFallbackTest(unittest.TestCase):
@@ -124,11 +103,11 @@ class PlanSynthesizerTest(unittest.TestCase):
             [sl.get_metric_by_id("renewal_rate")], sp,
             dimension_mentions=[], time_range="昨天",
         )
-        # 分子分母复合表达式无法确定为单度量 → 交 Advisor
+        # 分子分母复合表达式无法确定为单度量 → Planner respond 澄清
         self.assertIsNone(plan)
 
     def test_detail_metric_with_draft_builds_plan(self):
-        # 返厂明细：明细型指标 + advisor 已确认 create_time 草稿 → 可直达 Seeker
+        # 返厂明细：明细型指标 + 已确认 create_time 时间字段 → 可直达执行链
         sl = get_semantic_layer_provider()
         sp = self._provider()
         draft = {
@@ -155,7 +134,7 @@ class PlanSynthesizerTest(unittest.TestCase):
         self.assertEqual(plan.get("measures"), [])
 
     def test_detail_metric_without_draft_returns_none(self):
-        # 无分区明细表且无草稿时间字段时禁止回退 pt_dt，交 Advisor 澄清日期字段
+        # 无分区明细表且无时间字段时禁止回退 pt_dt，由 Planner respond 澄清日期
         sl = get_semantic_layer_provider()
         sp = self._provider()
         plan = build_plan_from_semantic(
@@ -240,7 +219,7 @@ class PlanSynthesizerTest(unittest.TestCase):
 
 
     def test_detail_metric_with_filter_time_field_builds_plan(self):
-        # 无分区明细表：filters 中带 create_time 时间条件（口径权威）时可直接构建，无需降级 Advisor
+        # 无分区明细表：filters 中带 create_time 时间条件（口径权威）时可直接构建
         sl = get_semantic_layer_provider()
         sp = self._provider()
         plan = build_plan_from_semantic(
@@ -255,7 +234,7 @@ class PlanSynthesizerTest(unittest.TestCase):
         self.assertEqual(plan.get("status"), "confirmed")
 
     def test_detail_metric_without_time_field_returns_none(self):
-        # 无分区明细表且 filters 未带时间条件时降级 Advisor（禁止回退默认 pt_dt）
+        # 无分区明细表且 filters 未带时间条件时无法构建方案（禁止回退默认 pt_dt），交由 Planner respond 澄清
         sl = get_semantic_layer_provider()
         sp = self._provider()
         plan = build_plan_from_semantic(
@@ -291,7 +270,7 @@ class SeekerDirectFlowTest(unittest.TestCase):
         self.assertTrue(plan.get("table_plans"))
 
     def test_minimal_plan_requires_tables(self):
-        # 完全没有表信息时返回 None，交由 Advisor 澄清
+        # 完全没有表信息时返回 None，交由 Planner respond 澄清
         from types import SimpleNamespace
         from agentTest.langgraph_app.nodes.planner_node import _build_minimal_plan
 

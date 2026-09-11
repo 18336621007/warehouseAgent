@@ -90,17 +90,12 @@ python web/server.py
 
 ```mermaid
 flowchart TD
-    U["用户自然语言"] --> I["意图识别"]
-    I -->|chat| Chat["闲聊快速回复"]
-    I -->|query| C["capture_user_message"]
-    C --> P["Planner"]
-    P -->|存在未解析口径| AC["Advisor 元数据核验与澄清"]
-    AC --> MC["MetricClarificationService 固化候选"]
-    MC --> P
-    P -->|需求完整或选择已解析| AP["Advisor 提交完整方案"]
-    AP -->|status=locked| P
-    P -->|确认 locked 方案| S["Seeker 精确执行管线"]
-    S --> E["Evaluator"]
+    U["用户自然语言"] --> C["capture_user_message"]
+    C --> P["Planner（唯一决策者）"]
+    P -->|route=execute| S["执行链（原 Seeker）：retrieve_schema → generate_sql → validate_sql → execute_sql → persist_result"]
+    S -->|结果落盘| P
+    P -->|route=respond| R["输出文本给用户（澄清/最终回答）"]
+    P -->|执行回看后 respond| E["Evaluator"]
     E --> L["MySQL + FAISS 长期经验记忆"]
 ```
 
@@ -147,14 +142,12 @@ Project/
 - `request_id` 表示一次 HTTP 或 CLI 图调用。
 - LangGraph checkpoint 使用 `conversation_id`（整个对话共享，跨问数完整保留历史）。
 - Web/CLI 每轮只传身份字段和 `current_user_input`，业务状态由 `AgentState` 管理。
-- `messages + add_messages` 统一保存用户、Advisor、工具和 Seeker 消息。
+- `messages + add_messages` 统一保存用户、Planner 与执行链（原 Seeker）消息。
 - 去 pending 状态机：`AnalysisSpec` 仅保留当轮意图（analysis_type/metric_mentions/dimension_mentions 等），不再跨轮保存解析证据与候选快照；用户改选/追问由 `effective_query` 每轮改写 + 完整对话历史还原。
 - `topic_status` 已覆盖 clarifying/confirmed/generating_sql/validating_sql/executing/completed/failed，作为当轮请求的阶段标识。
-- Planner 返回 `partial/none` 时，Advisor 先检索元数据并向用户追问；未确认口径由程序级指标歧义门禁在 `submit_query_plan → lock_query_plan` 之间拦截。
-- 需求完整或用户本轮解决歧义后，Advisor 直接调用 `submit_query_plan` 生成 `status=locked` 的完整方案。
-- Planner → Advisor 状态交接、同轮锁定和指标门禁已经进入主链路；已确认指标由程序收敛，不依赖 LLM 必须提交可选参数。
-- Planner 在用户最终确认后将方案更新为 `status=confirmed`。
-- Seeker 不再通过向量检索重新选表，而是由 `QueryPlanSchemaResolver` 按 `confirmed_plan` 精确校验并加载物理 Schema。
+- A1 后 Advisor 已并入 Planner：`route=execute` 由 Planner 构建方案进执行链，`route=respond` 直接输出文本给用户（澄清/最终回答），不再降级独立 Advisor。
+- 执行链不再通过向量检索重新选表，而是由 `QueryPlanSchemaResolver` 按 `confirmed_plan` 精确校验并加载物理 Schema。
+- 执行成功由 `persist_result` 强制落盘后回 Planner 撰写最终回答；SQL 校验/执行失败重试耗尽由 `query_error_fallback` 直接给出错误文本。
 - 当前 `MemorySaver` 只提供进程内短期记忆，服务重启恢复属于后续上线改造。
 
 详见 [State 与记忆系统架构](./架构/State与记忆系统架构.md)。

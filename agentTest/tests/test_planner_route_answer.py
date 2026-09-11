@@ -1,5 +1,5 @@
-# Planner route=answer 测试：Planner 直接回答能力（查/问/答三选一，无 0 行专用字段）
-# 覆盖：answer 分支生成 final_answer 并结束、空 final_answer 回退 advisor、消息入历史
+# Planner route=respond 测试：Planner 直接输出文本给用户（澄清/确认/最终回答由 LLM 自定）
+# 覆盖：respond 分支生成 respond_text 并结束、空 respond_text 回退通用引导、消息入历史
 import unittest
 from unittest import mock
 
@@ -90,21 +90,23 @@ def _build_runtime():
     }
 
 
-def _state(user_input, messages=None):
-    return {
+def _state(user_input, messages=None, **overrides):
+    state = {
         "current_user_input": user_input,
         "messages": messages or [],
         "confirmed_plan": {},
         "analysis_spec": {},
         "request_id": "req-answer",
     }
+    state.update(overrides)
+    return state
 
 
 def _planner_kwargs(**overrides):
     base = {
         "effective_query": "查询徐州大区今年同意返厂的返厂明细",
-        "route": "answer",
-        "final_answer": "已确认：2026 年徐州大区没有同意返厂的返厂记录。",
+        "route": "respond",
+        "respond_text": "已确认：2026 年徐州大区没有同意返厂的返厂记录。",
         "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
         "fields": [],
         "completeness": "full",
@@ -120,47 +122,72 @@ def _planner_kwargs(**overrides):
     return base
 
 
-class PlannerRouteAnswerTest(unittest.TestCase):
-    """Planner route=answer：直接回答能力。"""
+class PlannerRouteRespondTest(unittest.TestCase):
+    """Planner route=respond：直接输出文本给用户（澄清/确认/最终回答）。"""
 
-    def _run_planner(self, planner_kwargs, messages=None):
+    def _run_planner(self, planner_kwargs, messages=None, state_overrides=None):
         from agentTest.langgraph_app.nodes import planner_node
         fake_llm = _FakeStructuredLLM(["返厂", "明细"], planner_kwargs)
         with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
-            return node(_state("查询徐州大区今年同意返厂的返厂明细", messages))
+            return node(_state("查询徐州大区今年同意返厂的返厂明细", messages, **(state_overrides or {})))
 
-    def test_answer_route_returns_final_answer(self):
-        """route=answer + final_answer 非空：直接返回最终答复并结束本轮。"""
+    def test_respond_route_returns_text(self):
+        """route=respond + respond_text 非空：直接返回文本并结束本轮。"""
         result = self._run_planner(_planner_kwargs())
-        self.assertEqual(result["route"], "answer")
-        self.assertEqual(result["topic_status"], "completed")
+        self.assertEqual(result["route"], "respond")
+        self.assertEqual(result["topic_status"], "clarifying")
         self.assertIn("没有同意返厂的返厂记录", result["final_answer"])
-        # 最终答复写入消息（id 以 :answer 结尾，供历史过滤）
+        # 文本写入消息（id 以 :respond 结尾，供历史过滤）
         msg = result["messages"][0]
         self.assertIsInstance(msg, AIMessage)
-        self.assertTrue(msg.id.endswith(":answer"))
+        self.assertTrue(msg.id.endswith(":respond"))
         self.assertEqual(msg.name, "planner")
         # 消费 0 行自愈标记，避免残留
         self.assertFalse(result.get("seeker_empty_result"))
+        # 非执行回看的 respond 不触发 Evaluator
+        self.assertFalse(result.get("evaluator_pending"))
 
-    def test_answer_route_empty_answer_falls_back_advisor(self):
-        """route=answer 但 final_answer 为空：回退 advisor 澄清，避免空回复。"""
-        result = self._run_planner(_planner_kwargs(final_answer=""))
-        self.assertEqual(result["route"], "advisor")
-        self.assertIn("answer 但未给出 final_answer", result.get("planner_reason", ""))
-        self.assertNotIn("final_answer", result)
+    def test_respond_route_empty_text_falls_back_guidance(self):
+        """route=respond 但 respond_text 为空（回答未完成）：回退通用引导语，不暴露内部 reason。"""
+        result = self._run_planner(_planner_kwargs(respond_text=""))
+        self.assertEqual(result["route"], "respond")
+        self.assertEqual(
+            result["final_answer"],
+            "请补充最关键的指标、维度或过滤条件，我好继续为您查询。",
+        )
 
-    def test_answer_message_in_history_context(self):
-        """Planner 直接回答的消息应进入对话历史（供后续追问）。"""
+    def test_respond_message_in_history_context(self):
+        """Planner respond 的消息应进入对话历史（供后续追问）。"""
         from agentTest.langgraph_app.nodes.planner_node import _build_history_context
         from langchain_core.messages import HumanMessage
         messages = [
             HumanMessage(content="查询徐州大区返厂明细", id="u1"),
-            AIMessage(content="已确认无数据。", name="planner", id="r1:answer"),
+            AIMessage(content="已确认无数据。", name="planner", id="r1:respond"),
         ]
         ctx = _build_history_context(messages)
         self.assertIn("已确认无数据", ctx)
+
+    def test_execute_route_builds_plan(self):
+        """route=execute 且方案构建成功：进执行链（route=execute），写入 confirmed_plan/plans。"""
+        result = self._run_planner(_planner_kwargs(
+            route="execute",
+            effective_query="查询昨天的新增订单数",
+            dimension_mentions=[],
+            filters="pt_dt 昨天",
+            semantic_metrics=[
+                {
+                    "id": "addition_order_num",
+                    "confidence": 0.95,
+                    "mention": "新增订单",
+                }
+            ],
+        ))
+        self.assertEqual(result["route"], "execute")
+        self.assertEqual(result["topic_status"], "confirmed")
+        self.assertTrue(result.get("confirmed_plan"))
+        self.assertEqual(len(result.get("plans") or []), 1)
+        self.assertEqual(result.get("execution_rounds"), 1)
 
 
 if __name__ == "__main__":

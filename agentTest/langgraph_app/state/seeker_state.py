@@ -20,6 +20,7 @@ class SeekerState(BaseState, total=False):
     # 完整结果后续交由独立存储管理，State只保存引用和预览
     result_id: str
     result_preview: List[Any]
+    result_csv: str
 
     final_answer: str
     retry_count: int

@@ -18,6 +18,7 @@ from agentTest.langgraph_app.services.query_plan_schema_resolver import QueryPla
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
 from agentTest.langgraph_app.services.whitelist_filtered_store import WhitelistFilteredVectorStore
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
+from agentTest.langgraph_app.skills.skill_loader import build_skill_manager
 
 def build_graph_runtime():
     # 结构化日志由TimedRotatingFileHandler按天滚动，服务启动时保留历史日志
@@ -165,4 +166,6 @@ def build_graph_runtime():
         "sample_values_map": sample_values_map,  # 字段枚举值 {db.table.col: [values]}
         "sample_values_map_simple": sample_values_map_simple,  # 兜底 {col: [values]}
         "semantic_metadata_provider": SemanticMetadataProvider(),  # join关系
+        # 通用 skill 管理器：Planner 注入命中 skill 指令（决策策略层，零 LLM 匹配）
+        "skill_manager": build_skill_manager(),
     }

@@ -1,8 +1,8 @@
 ﻿# ── state/agent_state.py ──
-# 父图 AgentState：继承所有子图 State，Supervisor 使用
+# 父图 AgentState：继承 Planner + 执行链（原 Seeker）State，Supervisor 使用
+# A1：Advisor 已并入 Planner，不再继承 AdvisorState
 from typing import TypedDict, Any
 from agentTest.langgraph_app.state.planner_state import PlannerState
-from agentTest.langgraph_app.state.advisor_state import AdvisorState
 from agentTest.langgraph_app.state.seeker_state import SeekerState
 
 
@@ -25,5 +25,5 @@ class GraphOutput(TypedDict, total=False):
     evaluator_score: float
     evaluator_dialogue_id: int
 
-class AgentState(PlannerState, AdvisorState, SeekerState, total=False):
+class AgentState(PlannerState, SeekerState, total=False):
     pass

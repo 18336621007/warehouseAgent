@@ -27,8 +27,8 @@ class SemanticGrepTest(unittest.TestCase):
 
     def test_grep_weak_hit_type(self):
         """只有 notes/definition 命中时标记为 weak。"""
-        hits = grep_metrics_from_keywords(["调出未签收"], limit=10)
-        # "调出未签收" 出现在 haerbin 指标 notes 中
+        hits = grep_metrics_from_keywords(["大区"], limit=10)
+        # "大区" 只出现在指标 notes/definition 中（无指标名/别名含该词）
         self.assertTrue(hits)
         self.assertTrue(all(m["hit_type"] == "weak" for m in hits))
 

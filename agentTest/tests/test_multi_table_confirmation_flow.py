@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 from agentTest.db.hive_guardrails import ALLOW_AI_INFERRED_JOIN
 from agentTest.db.hive_guardrails import REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES
-from agentTest.langgraph_app.graphs.advisor_graph import _normalize_clarification_message
 from agentTest.langgraph_app.nodes.generate_sql_node import _build_fallback_sql
 from agentTest.langgraph_app.nodes.generate_sql_node import _validate_sql_against_plan
 from agentTest.langgraph_app.nodes.generate_sql_node import _repair_missing_table_filters
@@ -89,7 +88,7 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
         self.assertEqual(_validate_sql_against_plan(sql, plan), [])
 
     def test_lock_query_plan_completes_missing_table_filter_plan(self):
-        """Advisor漏交某张表的table_plan时，锁定服务必须自动补齐。"""
+        """方案漏交某张表的table_plan时，锁定服务必须自动补齐。"""
         proposed_plan = {
             "tables": [
                 "ads_trip.ads_exchange_platform_operations_report_day",

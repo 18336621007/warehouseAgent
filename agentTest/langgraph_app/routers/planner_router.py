@@ -3,10 +3,15 @@ from agentTest.langgraph_app.state.agent_state import AgentState
 
 
 def route_after_planner(state: AgentState):
-    # Planner未返回合法路由时，默认进入Advisor继续澄清
-    route = state.get("route") or "advisor"
+    # 路由收敛两值：execute 进执行链，respond 直接结束等用户；
+    # 执行回看后的 respond 携带 evaluator_pending，先走 Evaluator 评估再结束
+    route = state.get("route") or "respond"
     planner_entities = state.get("planner_entities") or {}
     confirmed_plan = state.get("confirmed_plan") or {}
+
+    if route == "respond" and state.get("evaluator_pending"):
+        # 执行链落盘后 Planner 基于结果 respond：触发 Evaluator 评估本轮问答质量
+        route = "evaluator"
 
     log_route_decision(
         "planner_router",

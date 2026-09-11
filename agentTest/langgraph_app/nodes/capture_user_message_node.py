@@ -25,5 +25,12 @@ def capture_user_message_node(state: AgentState):
 
     # 用户新输入开启新的查询意图：重置 0 行自愈计数（自愈回环不经本节点，计数得以保留累加）
     return_value["empty_result_rounds"] = 0
+    # A1：用户新输入重置 execute 轮次与评审/评估标记，防止跨轮残留误判
+    return_value["execution_rounds"] = 0
+    return_value["execution_review"] = False
+    return_value["evaluator_pending"] = False
+    return_value["seeker_empty_result"] = False
+    return_value["seeker_plan_error"] = None
+    return_value["seeker_error_unresolvable"] = None
 
     return return_value

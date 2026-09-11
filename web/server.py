@@ -35,15 +35,14 @@ sessions = {}
 NODE_LABELS = {
     "capture_user_message": "正在记录本轮问题...",
     "planner": "正在分析查询需求...",
-    "advisor": "需求不够明确，正在检索相关信息...",
-    "advisor_agent": "正在核验元数据并确认口径...",
     "retrieve_schema": "正在检索数据表结构...",
     "enrich_schema_context": "正在补充字段信息...",
     "generate_sql": "正在生成 SQL...",
     "validate_sql": "正在校验 SQL...",
     "prepare_sql_fix": "SQL 需修正，正在重新生成...",
     "execute_sql": "正在 Hive 中执行查询...",
-    "build_final_answer": "正在整理查询结果...",
+    "persist_result": "正在落盘查询结果...",
+    "query_error_fallback": "查询未能完成，正在整理错误信息...",
     "evaluator": "正在评估对话质量...",
 }
 
@@ -70,16 +69,10 @@ def _extract_node_detail(node_name, node_update):
             parts.append("路由: " + str(node_update.get("route")))
         if node_update.get("effective_query"):
             parts.append("有效需求: " + str(node_update.get("effective_query")))
-    elif node_name in ("advisor", "advisor_agent"):
-        # ReAct 每步 LLM 输出优先展示，final_answer 是最终回复文本
-        for line in (node_update.get("advisor_thinking") or []):
-            parts.append(str(line))
-        if not parts and node_update.get("final_answer"):
-            parts.append(str(node_update.get("final_answer")))
     elif node_name == "generate_sql":
         if node_update.get("generated_sql"):
             parts.append("SQL: " + str(node_update.get("generated_sql")))
-    elif node_name == "build_final_answer":
+    elif node_name == "persist_result":
         # 0 行自愈等旁白：向用户展示"发现空结果 → 返回修正"的思考过程
         if node_update.get("self_heal_note"):
             parts.append(str(node_update.get("self_heal_note")))
@@ -298,7 +291,7 @@ def chat():
             final_state = APP.get_state(config)
             result = (final_state and final_state.values) or {}
 
-            route = result.get("route", "seeker")
+            route = result.get("route", "execute")
             topic_status = result.get("topic_status", "")
             final_answer = result.get("final_answer", "")
             generated_sql = result.get("generated_sql", "")
@@ -317,7 +310,7 @@ def chat():
                 "prepare_sql_fix",
                 "execute_sql",
                 "prepare_sql_exec_fix",
-                "build_final_answer",
+                "persist_result",
             }
             has_sql_query = bool(seen & sql_query_nodes)
             display_sql = generated_sql if has_sql_query else ""
