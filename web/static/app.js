@@ -551,7 +551,7 @@ function formatContent(text) {
     if (!text) return "";
     var html = "";
     var lines = String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").split(/\r?\n/);
-    var i = 0, inList = false, inTable = false, para = [];
+    var i = 0, inList = false, inTable = false, para = [], listTag = "ul";
     function mdInline(s) {
         s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
         s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
@@ -560,7 +560,7 @@ function formatContent(text) {
         return s;
     }
     function flushPara() { if (para.length) { html += "<p>" + para.map(mdInline).join("<br>") + "</p>"; para = []; } }
-    function flushList() { if (inList) { html += "</ul>"; inList = false; } }
+    function flushList() { if (inList) { html += "</" + listTag + ">"; inList = false; } }
     function flushTable() { if (inTable) { html += "</table>"; inTable = false; } }
     while (i < lines.length) {
         var line = lines[i];
@@ -587,7 +587,14 @@ function formatContent(text) {
         var lm = line.match(/^[-*]\s+(.*)$/) || line.match(/^\d+\.\s+(.*)$/); // 列表
         if (lm) {
             flushPara(); flushTable();
-            if (!inList) { html += "<ul>"; inList = true; }
+            // 数字开头渲染为有序列表 <ol>，-/* 渲染为无序列表 <ul>
+            var nextTag = /^\d+\.\s+/.test(line) ? "ol" : "ul";
+            if (!inList || listTag !== nextTag) {
+                if (inList) { html += "</" + listTag + ">"; }
+                html += "<" + nextTag + ">";
+                listTag = nextTag;
+                inList = true;
+            }
             html += "<li>" + mdInline(lm[1]) + "</li>";
             i++; continue;
         }

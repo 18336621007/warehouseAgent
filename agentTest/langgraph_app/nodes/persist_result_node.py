@@ -18,6 +18,8 @@ from agentTest.config.planner import MAX_EMPTY_RESULT_ROUNDS
 
 # 结果快照只保存预览与引用，避免把全量结果写入 checkpoint
 RESULT_PREVIEW_MAX_ROWS = 20
+# 结果行数不超过该值时全量预览（小结果直接给全，LLM 基于完整查询结果总结更准确）
+RESULT_PREVIEW_FULL_THRESHOLD = 100
 RESULT_ENTITY_KEYS_MAX = 50
 
 
@@ -27,8 +29,10 @@ def _build_result_snapshot(state, sql_result, stored):
     rows = list((sql_result or {}).get("rows") or [])
     row_count = (sql_result or {}).get("row_count", len(rows))
 
+    # 小结果全量预览供 LLM 总结，避免预览截断导致统计不完整；大结果取前 N 行防 token 膨胀
+    _preview_limit = RESULT_PREVIEW_MAX_ROWS if len(rows) > RESULT_PREVIEW_FULL_THRESHOLD else len(rows)
     preview_rows = []
-    for row in rows[:RESULT_PREVIEW_MAX_ROWS]:
+    for row in rows[:_preview_limit]:
         if isinstance(row, dict):
             preview_rows.append(row)
         else:

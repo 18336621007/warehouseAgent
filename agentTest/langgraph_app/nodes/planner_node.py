@@ -84,7 +84,14 @@ def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
             continue
         content = str(msg.content or "")
         if len(content) > max_chars_per_msg:
-            content = content[:max_chars_per_msg] + "..."
+            # 截断时提示内容可能不全：数据类回答可调 query_stored_result 读全量，避免凭残片推断
+            if isinstance(msg, AIMessage):
+                content = (
+                    content[:max_chars_per_msg]
+                    + "……（该条历史回答较长已截断，如需其中字段的完整取值，可调用 query_stored_result 读取对应落盘结果）"
+                )
+            else:
+                content = content[:max_chars_per_msg] + "……（该条历史回答较长已截断）"
         lines.append(f"{role}: {content}")
     return "\n".join(lines)
 
@@ -191,7 +198,8 @@ def _format_result_index(result_index: list) -> str:
         created_at = str(entry.get("created_at") or "")[11:16]
         query = str(entry.get("effective_query") or "")[:80]
         row_count = entry.get("row_count", 0)
-        columns = ", ".join((entry.get("columns") or [])[:8])
+        # 列出该轮全部列名（只含列名不含数据），便于 LLM 判断可对哪些字段做统计/过滤
+        columns = ", ".join(entry.get("columns") or [])
         line = f"- 第{round_no}轮 ({created_at}): {query} | {row_count}行 | 列: {columns}"
         result_id = entry.get("result_id", "")
         # 优先用绝对路径（result_store 新增 full_csv_path），历史轮次也能给出完整保存路径
