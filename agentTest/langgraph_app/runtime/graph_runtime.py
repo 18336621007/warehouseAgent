@@ -108,6 +108,18 @@ def build_graph_runtime():
         groups=("planner",),
         security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
     ))
+    # 统一工具注册表：Planner 专属技能读取工具（渐进式披露，仿 Codex）
+    # 每轮只向 LLM 披露所有技能 name+description 索引，选中某技能后由 read_skill 按需读完整正文
+    skill_manager = build_skill_manager()
+    from agentTest.langgraph_app.tools.skill_tool import build_read_skill_tool
+    read_skill_tool = build_read_skill_tool(skill_manager)
+    tool_registry.register(ToolSpec(
+        name="read_skill",
+        description=read_skill_tool.description,
+        tool=read_skill_tool,
+        groups=("planner",),
+        security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
+    ))
 
     # 从 MySQL 加载字段类型映射（度量/维度）与字段枚举值映射，供 generate_sql/Resolver 使用
     import re as _re
@@ -166,6 +178,6 @@ def build_graph_runtime():
         "sample_values_map": sample_values_map,  # 字段枚举值 {db.table.col: [values]}
         "sample_values_map_simple": sample_values_map_simple,  # 兜底 {col: [values]}
         "semantic_metadata_provider": SemanticMetadataProvider(),  # join关系
-        # 通用 skill 管理器：Planner 注入命中 skill 指令（决策策略层，零 LLM 匹配）
-        "skill_manager": build_skill_manager(),
+        # 通用 skill 管理器：Planner 渐进式披露（注入 name+description 索引，正文由 read_skill 按需读取）
+        "skill_manager": skill_manager,
     }

@@ -121,6 +121,7 @@ PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责理解�
 - query_stored_result：读取本会话已落盘的查询结果，判断用户追问能否直接复用历史结果。
 - probe_values：实时探查某表某字段的实际存储值（LIKE 模糊匹配），仅用于"执行返回 0 行"时核实过滤值是否与库中一致（如大区/公司名称被截断、格式不同），勿在执行前预查。
 - execute_query：执行数据查询并返回结果摘要（列 + 预览行 + 行数 + 全量 CSV 路径）。需要查数时必须调用；结果回填后基于结果直接写最终回答。
+- read_skill：读取某个技能的完整指令（SKILL.md 正文 + 资源目录路径）。当当前任务与【可用技能】列表中某技能的 description 匹配时调用，读取后遵循其中规则；不匹配则不要调用。
 规则：
 - 新查询/口径确认：优先调用 search_semantic 获取语义层候选（来源表/表达式/维度/枚举值），命中指标在 semantic_metrics 中声明 id 与置信度；未命中时再用 search_tables/search_columns（RAG 兜底）。
 - 基于上次落盘结果的追问（"统计各个原因多少条""刚才的结果"等）：优先用 query_stored_result 读落盘 CSV 直接回答，不需要 search_semantic。

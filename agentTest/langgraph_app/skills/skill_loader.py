@@ -1,7 +1,9 @@
-# 通用 skill 机制：扫描 skills/ 目录、解析 SKILL.md frontmatter、关键词匹配、格式化注入文本
+# 通用 skill 机制：扫描 skills/ 目录、解析 SKILL.md frontmatter、渐进式披露（仿 Codex）
 #
-# skill 是"决策策略层"：程序只解析 frontmatter（name/description/trigger_keywords/scope），
-# 正文业务规则全部由 LLM 读取执行；不替代语义层/RAG/落盘结果/工具，只决定"这个场景怎么用它们"。
+# 程序只解析 frontmatter（name/description/scope），每轮向 LLM 披露所有技能的 name+description 索引，
+# 由 LLM 判断当前任务是否匹配某技能；匹配时调用 read_skill 工具按需读取完整 SKILL.md 正文。
+# skill 是"决策策略层"：正文业务规则全部由 LLM 读取执行；不替代语义层/RAG/落盘结果/工具，
+# 只决定"这个场景怎么用它们"。match_skills/format_instruction 保留用于兼容与测试。
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,6 +116,41 @@ class SkillManager:
                 block += f"\n\n技能资源目录（按需读取）：{spec.references_dir}"
             parts.append(block)
         return "\n\n".join(parts)
+
+    def list_skills_index(self, scope: str = "planner", max_chars: int = 4000) -> str:
+        """渐进式披露：输出所有可用技能的 name+description 索引（预算截断），由 LLM 判断是否读取全文。"""
+        specs = [
+            s for s in self._skills
+            if not scope or not s.scope or scope in s.scope
+        ]
+        if not specs:
+            return ""
+        lines = []
+        used = 0
+        for spec in specs:
+            line = f"- {spec.name}：{spec.description or ''}"
+            if used + len(line) + 1 > max_chars:
+                # 预算不足：截短当前行并结束（对齐 Codex：超预算先缩短 description）
+                remain = max_chars - used
+                if remain > 20:
+                    lines.append(line[:remain] + "…")
+                break
+            lines.append(line)
+            used += len(line) + 1
+        return "\n".join(lines)
+
+    def load_skill_instruction(self, name: str, scope: str = "planner") -> str:
+        """按名称读取单个技能的完整指令（含 references 路径），供 LLM 选中后按需加载。"""
+        for spec in self._skills:
+            if spec.name != name:
+                continue
+            if scope and spec.scope and scope not in spec.scope:
+                return f"技能 {name} 不在当前作用域（{scope}），无法读取。"
+            parts = [f"【技能：{spec.name}】\n{spec.instruction_text}"]
+            if Path(spec.references_dir).exists():
+                parts.append(f"技能资源目录（按需读取）：{spec.references_dir}")
+            return "\n\n".join(parts)
+        return f"未找到技能：{name}。可用技能见上下文中的【可用技能】列表。"
 
 
 def build_skill_manager(root: str = "") -> SkillManager:

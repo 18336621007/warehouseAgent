@@ -88,5 +88,54 @@ class TestSkillLoader(unittest.TestCase):
         self.assertEqual(mgr.skills, [])
 
 
+    def test_list_skills_index(self):
+        _write_skill(self.root, "demo", (
+            "---\nname: demo\ndescription: 离线数仓数据查询策略\nscope: [planner]\n---\n## 指令\n正文A\n"
+        ))
+        _write_skill(self.root, "demo2", (
+            "---\nname: demo2\ndescription: 通用小工具\nscope: [advisor]\n---\n## 指令\n正文B\n"
+        ))
+        mgr = build_skill_manager(str(self.root))
+        idx = mgr.list_skills_index(scope="planner")
+        # 只披露 planner 作用域技能，且带 name+description
+        self.assertIn("demo", idx)
+        self.assertIn("离线数仓数据查询策略", idx)
+        self.assertNotIn("demo2", idx)
+        # 预算截断生效：小预算返回更短
+        full = mgr.list_skills_index(scope="planner", max_chars=10000)
+        short = mgr.list_skills_index(scope="planner", max_chars=5)
+        self.assertLess(len(short), len(full))
+
+    def test_load_skill_instruction(self):
+        _write_skill(self.root, "demo", (
+            "---\nname: demo\ndescription: 演示\n---\n## 行为指令\n按规则执行\n"
+        ))
+        (self.root / "demo" / "references").mkdir(exist_ok=True)
+        mgr = build_skill_manager(str(self.root))
+        text = mgr.load_skill_instruction("demo")
+        self.assertIn("【技能：demo】", text)
+        self.assertIn("按规则执行", text)
+        self.assertIn("references", text)
+        # 不存在的技能返回提示
+        self.assertIn("未找到技能", mgr.load_skill_instruction("nope"))
+        # scope 不符拒绝读取
+        _write_skill(self.root, "adv", (
+            "---\nname: adv\ndescription: 演示\nscope: [advisor]\n---\n指令\n"
+        ))
+        mgr = build_skill_manager(str(self.root))
+        self.assertIn("不在当前作用域", mgr.load_skill_instruction("adv", scope="planner"))
+
+    def test_read_skill_tool(self):
+        from agentTest.langgraph_app.tools.skill_tool import build_read_skill_tool
+        _write_skill(self.root, "demo", (
+            "---\nname: demo\ndescription: 演示\n---\n## 行为指令\n按规则执行\n"
+        ))
+        mgr = build_skill_manager(str(self.root))
+        tool = build_read_skill_tool(mgr)
+        res = tool.invoke({"skill_name": "demo"})
+        self.assertIn("按规则执行", res)
+        self.assertIn("未找到技能", tool.invoke({"skill_name": "nope"}))
+
+
 if __name__ == "__main__":
     unittest.main()

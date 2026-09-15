@@ -22,6 +22,7 @@ from agentTest.config.settings import (
     get_model_extra_body,
     get_llm_fast_model,
     get_llm_fast_extra_body,
+    get_skill_index_max_chars,
 )
 from agentTest.langgraph_app.prompts.planner_prompt import (
     PlannerOutput,
@@ -351,27 +352,28 @@ def build_planner_node(runtime):
             user_content = "\n\n".join(sections)
 
             # ── M2：Planner ReAct 工具循环（自主决定是否补充检索/读落盘结果）──
-            # skill 指令注入：命中 skill 时在系统提示后追加，作为背景决策策略（不暴露给前端思考过程）
+            # skill 渐进式披露（仿 Codex）：只注入所有技能 name+description 索引，
+            # 由 LLM 判断当前任务是否匹配某技能，匹配时自主调用 read_skill 读取完整正文
             skill_manager = runtime.get("skill_manager")
-            matched_skills = (
-                skill_manager.match_skills(current_user_input, scope="planner")
-                if skill_manager else []
-            )
-            if matched_skills:
-                log_skill_event(
-                    "planner",
-                    name=",".join(s.name for s in matched_skills),
-                    hit_count=len(matched_skills),
+            skill_index = (
+                skill_manager.list_skills_index(
+                    scope="planner",
+                    max_chars=get_skill_index_max_chars(),
                 )
-            skill_text = (
-                skill_manager.format_instruction(current_user_input, scope="planner")
                 if skill_manager else ""
             )
+            if skill_index:
+                log_skill_event(
+                    "planner",
+                    name=",".join(s.name for s in skill_manager.skills),
+                    hit_count=len(skill_manager.skills),
+                    mode="progressive_disclosure",
+                )
             react_messages = [
                 SystemMessage(content=PLANNER_SYSTEM_PROMPT),
             ]
-            if skill_text:
-                react_messages.append(SystemMessage(content=skill_text))
+            if skill_index:
+                react_messages.append(SystemMessage(content=f"【可用技能】\n{skill_index}"))
             react_messages.append(HumanMessage(content=user_content))
             planner_tool_map = {t.name: t for t in planner_tools}
             # query_stored_result 依赖会话上下文：循环期间注入，结束后复位
@@ -405,8 +407,10 @@ def build_planner_node(runtime):
                                     _result = _tool.invoke(_tc.get("args") or {})
                                 except Exception as _err:
                                     _result = f"工具调用失败: {_err}"
+                            # 技能正文需完整进入上下文供 LLM 遵循，放宽截断；其余工具结果保持 2000 上限
+                            _max_result = 12000 if _tc.get("name") == "read_skill" else 2000
                             react_messages.append(ToolMessage(
-                                content=str(_result)[:2000],
+                                content=str(_result)[:_max_result],
                                 tool_call_id=_tc.get("id"),
                             ))
                     if _direct_output is not None:
