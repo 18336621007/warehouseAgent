@@ -341,26 +341,29 @@ Web 端采用 SSE（Server-Sent Events）实现 ChatGPT 式逐字输出：LangGr
 |------|---------|------|
 | `status` | `text` | 节点状态文案（如"正在识别意图..."） |
 | `thinking` | `node, text` | 思考过程段落（节点标签、命中表/字段、评分等） |
-| `token` | `scope, text, live, stream_id` | LLM 增量输出；`scope=thinking` 为思考过程、`scope=answer` 为最终回答；`live=true` 为实时流、`live=false` 为整段重放流；`stream_id` 用于段落归属 |
-| `thinking_retract` | `stream_id` | Advisor 最终回复从思考面板回收，改由回答区展示 |
-| `done` | `content, sql, thinking, evaluator, topic_status` | 业务正常结束，携带最终回答与展示元数据 |
+| `token` | `scope, text, live, stream_id` | LLM 增量输出；`scope=thinking` 为思考过程、`scope=answer` 为最终回答；**全部为 `live=true` 真流式**（模型边生成边推送），`live=false` 重放流已废弃；`stream_id` 用于思考段落归属 |
+| `thinking_retract` | `stream_id` | 最终回复从思考面板回收，改由回答区展示 |
+| `done` | `content, sql, thinking, evaluator, topic_status, llm_tokens` | 业务正常结束，携带最终回答与展示元数据；`llm_tokens` 为本请求 LLM token 汇总（输入/输出/缓存命中/未命中） |
 | `error` | `text, error_id` | 业务失败，前端只展示安全文案与错误编号 |
 
-**逐字输出机制**
+**逐字输出机制（真流式，仿 Codex）**
 
-- 思考过程：所有非最终回答的 LLM 输出（Planner/Advisor 工具调用步等）通过 `token(scope=thinking)` 实时推送，前端按 `stream_id` 累积为段落，思考面板默认展开且自动滚动到底部。
-- 最终回答分两类：
-  - 查询结果回答（`build_final_answer` 节点）：真实实时流（`live=true`），逐 token 直接追加。
-  - Advisor 澄清/确认回复：LLM 结束后整段重放（`live=false`），前端进入打字机队列逐字展示，实现"先思考后回答"的视觉效果。
+- 思考过程：所有非最终回答的 LLM 输出（Planner 工具调用步等）通过 `token(scope=thinking)` 实时推送，前端按 `stream_id` 累积为段落，思考面板默认展开且自动滚动到底部。
+- 最终回答：`ThinkingStreamChatModel`（`thinking_stream_chat.py`）流式生成 PlannerOutput JSON 时，用 `_JsonFieldStreamer` **实时提取 `respond_text` 字段**推前端（`live=true`），模型边生成边输出；`done` 事件整体下发仅作兜底，**不再有整段重放/打字机**。
+- 前端思考计时：思考期间按钮显示「思考中 Xs」，回答开始流式后切换为「正在生成回答」，消息固化后显示总耗时「查看思考过程（Xs）」。
 - 工具调用只展示"调用工具: 名称"，不展开完整参数，避免思考过程过长。
+
+**token 消耗统计**
+
+- `ThinkingStreamChatModel` 流式请求带 `stream_options.include_usage`，末尾 chunk 返回 usage；`GraphLLMHandler.on_llm_end` 统一聚合（按 `request_id`）。
+- 日志：`llm.response` 的 `tokens` 含每次调用明细（`prompt_tokens/completion_tokens/cache_hit/cache_miss`）；`request.completed` 的 `summary.llm_tokens` 为请求级汇总。
+- 前端：`done.llm_tokens` 在消息气泡展示「输入总token | 输出总token | 缓存命中 | 缓存未命中」。
 
 **输入框解锁机制**
 
 - 输入框只在"当前会话存在未结束请求（尚未收到 `done`/`error`）"时锁定（`updateInputLock` 基于 `doneReceived` 判断）。
-- `done`/`error` 一收到即标记 `doneReceived=true`，输入框立即解锁，不等待打字机播完。
-- 打字机继续逐字播放，播完才把占位消息固化为正式消息；期间用户直接发新消息时，程序先完整固化上一条、再发起新请求，保证消息顺序。
-- 打字机动态调速：剩余 token 尽量在约 3 秒内播完；另有 5 秒硬上限兜底，任何异常都不会让输入框长期锁定。
-- 请求结束/出错/删除会话时统一清理打字机定时器，避免悬挂。
+- `done`/`error` 一收到即标记 `doneReceived=true`，输入框立即解锁（回答内容已实时流式展示，无需等待任何重放/打字机）。
+- 占位消息在请求结束时固化为正式消息；期间用户直接发新消息时，程序先完整固化上一条、再发起新请求，保证消息顺序。
 
 ---
 

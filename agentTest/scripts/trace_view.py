@@ -618,10 +618,19 @@ def cmd_summary(events, prefix, color):
             f"LLM 调用: {summary.get('llm_calls', '-')}  "
             f"route: {end.get('route', '-')}  topic_status: {end.get('topic_status', '-')}"
         )
+        llm_tokens = summary.get("llm_tokens") or {}
+        if llm_tokens:
+            # 请求级 token 汇总单独格式化一行（输入/输出/缓存命中/未命中）
+            print(
+                f"Token: 输入总token {llm_tokens.get('input_tokens', 0)}"
+                f" | 输出总token {llm_tokens.get('output_tokens', 0)}"
+                f" | 缓存命中 {llm_tokens.get('cache_hit', 0)}"
+                f" | 缓存未命中 {llm_tokens.get('cache_miss', 0)}"
+            )
         extra = {
             key: value
             for key, value in summary.items()
-            if key not in ("nodes", "llm_calls", "route", "topic_status")
+            if key not in ("nodes", "llm_calls", "route", "topic_status", "llm_tokens")
         }
         if extra:
             print(f"其他摘要: {json.dumps(extra, ensure_ascii=False)}")
