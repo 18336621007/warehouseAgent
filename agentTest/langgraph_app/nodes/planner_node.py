@@ -1,34 +1,31 @@
-# Planner 调度节点：元数据检索 → LLM 结构化解析 → 路由判定（A1 收敛两值）
+# Planner 调度节点（单 Agent / Codex 模式）：元数据检索 → LLM 解析 → ReAct 循环内查数写回答
 #
-# Planner 是唯一决策者：route ∈ {execute, respond}，execute=进执行链查数，respond=给用户输出文本。
+# Planner 是唯一 Agent：查数通过 execute_query 工具在循环内完成，route 收敛为 respond 单一终态（直接输出文本）。
 # 流程：
-#   ① 第0层拆检索词 + Planner ReAct 工具循环（search_semantic/search_tables/search_columns/probe_values/query_stored_result）
+#   ① 第0层拆检索词 + Planner ReAct 工具循环（search_semantic/search_tables/search_columns/probe_values/query_stored_result/execute_query）
 #   ② LLM 解析：输出 effective_query / route / respond_text / 槽位 / semantic_metrics（置信度）
-#   ③ 路由：route=execute 时语义层确定性构建方案（未命中用最小方案直通）进执行链；
-#       route=respond 时直接输出澄清/回答文本结束本轮
+#   ③ 查数通过 execute_query 工具在循环内完成（结果回填后直接写回答）；route 一律 respond，直接输出澄清/回答文本结束本轮
+import json
 import re
 from datetime import date
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
+from agentTest.langgraph_app.services.thinking_stream_chat import ThinkingStreamChatModel
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
-from agentTest.langgraph_app.services.plan_synthesizer import (
-    build_plan_from_semantic,
-)
 from agentTest.langgraph_app.services.query_plan_service import (
     _extract_time_from_filters,
     lock_query_plan,
 )
 from agentTest.langgraph_app.services.result_store import list_result_index
-from agentTest.semantic_layer.metric_matcher import (
-    grep_metrics_from_keywords,
+from agentTest.config.settings import (
+    get_openai_api_key,
+    get_openai_base_url,
+    get_model_name,
+    get_model_extra_body,
+    get_llm_fast_model,
+    get_llm_fast_extra_body,
 )
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_extra_body
 from agentTest.langgraph_app.prompts.planner_prompt import (
     PlannerOutput,
-    SemanticKeywordsOutput,
     PLANNER_SYSTEM_PROMPT,
-    PLANNER_KEYWORD_SYSTEM_PROMPT,
-    PLANNER_KEYWORD_USER_TEMPLATE,
 )
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end
@@ -44,6 +41,10 @@ from agentTest.langgraph_app.runtime.llm_log_handler import build_llm_logging_ha
 from agentTest.langgraph_app.tools.result_query_tool import (
     set_result_conversation,
     reset_result_conversation,
+)
+from agentTest.langgraph_app.tools.execute_query_tool import (
+    set_execute_query_context,
+    reset_execute_query_context,
 )
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.config.planner import (
@@ -214,39 +215,72 @@ def _format_result_index(result_index: list) -> str:
         lines.append(line)
     return "\n".join(lines)
 
+def _try_parse_planner_output(response):
+    """尝试把 ReAct 轮输出文本直接解析为 PlannerOutput；失败返回 None（成功则省一次定稿 LLM 调用）。"""
+    if response is None:
+        return None
+    text = getattr(response, "content", None)
+    text = str(text or "").strip()
+    if not text:
+        return None
+    # 兼容 ```json ... ``` 代码块包裹
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return PlannerOutput.model_validate(data)
+    except Exception:
+        return None
+
+
 def build_planner_node(runtime):
     # M2：Planner 工具化，从统一注册表取只读安全工具（元数据检索 + 落盘结果预览）
     planner_tools = runtime["tool_registry"].get(group="planner")
 
-    # ChatOpenAI：LangChain 标准的 OpenAI 兼容客户端
-    # 挂载 LLM 日志回调：记录 prompt/输出/耗时，便于 trace 回放
-    chat_openai = ChatOpenAI(
+    # 思考流式 ChatModel：底层用 OpenAI 兼容 SDK 流式调用，
+    # 捕获 qwen thinking 的 reasoning_content 推送到前端思考面板（stream_bus），输出保持 langchain AIMessage
+    chat_openai = ThinkingStreamChatModel(
         api_key=get_openai_api_key(),
         base_url=get_openai_base_url(),
         model=get_model_name(),
-        temperature=0,                   # 判定任务不需要随机性
         extra_body=get_model_extra_body(),
         callbacks=[build_llm_logging_handler("planner")],
     )
-    # with_structured_output：告诉 LLM 按 PlannerOutput 的格式返回 JSON
+    # with_structured_output：结构化方式由配置 LLM_STRUCTURED_OUTPUT_METHOD 驱动
+    # （qwen thinking 模式用 json_mode/response_format，自定义 ChatModel 统一处理）
     structured_llm = chat_openai.with_structured_output(PlannerOutput)
     # M2：ReAct 工具循环 LLM，可自主调用 planner_tools 补充信息；最终仍由 structured_llm 输出 JSON
     react_llm = chat_openai.bind_tools(planner_tools)
 
-    # 第0层关键词提取：独立小调用（只输出 semantic_keywords），避免拆词噪声进入完整解析
-    keyword_structured_llm = chat_openai.with_structured_output(SemanticKeywordsOutput)
-    keyword_prompt = ChatPromptTemplate.from_messages([
-        ("system", PLANNER_KEYWORD_SYSTEM_PROMPT),
-        ("human", PLANNER_KEYWORD_USER_TEMPLATE),
-    ])
+    # 方案2：最终回答用快速模型（关闭 thinking）格式化输出省时；模型名可用 LLM_FAST_MODEL 覆盖
+    chat_openai_fast = ThinkingStreamChatModel(
+        api_key=get_openai_api_key(),
+        base_url=get_openai_base_url(),
+        model=get_llm_fast_model(),
+        extra_body=get_llm_fast_extra_body(),
+        callbacks=[build_llm_logging_handler("planner_fast")],
+    )
+    structured_llm_fast = chat_openai_fast.with_structured_output(PlannerOutput)
 
     def planner_node(state):
         # 每次调用只要求传入本轮输入
         current_user_input = state["current_user_input"]
-        # 区分本轮触发来源：执行链回看（有结果待撰写回答）/ 0 行自愈回环 / 方案失败修复
-        from_execution_review = state.get("execution_review") or False
-        # Seeker 0 行自愈回环：上次执行成功但无数据，需判断是否过滤值不匹配
-        from_empty_result = state.get("seeker_empty_result") or False
+        # 单 Agent 模式：无执行链回环（查数由 execute_query 工具在循环内完成）
+        from_execution_review = False
+        from_empty_result = False
+        # 注入查数工具上下文（request/会话归属，工具内部日志与落盘用）
+        _exec_ctx = set_execute_query_context(
+            state.get("request_id", ""),
+            state.get("conversation_id", ""),
+            state.get("topic_id", ""),
+        )
 
         # 去 Topic 化：不再使用 original_question 固定基线，
         # 当前需求由 LLM 结合【完整对话历史】+【本轮输入】每轮判断（query 改写 effective_query）
@@ -263,29 +297,15 @@ def build_planner_node(runtime):
 
         try:
 
-            # ── 第0层：LLM 拆业务检索词（对齐 skill 关键词 grep）──
-            # 独立小调用只输出 semantic_keywords，避免拆词噪声进入完整解析
+            # ── 第0层：组装对话历史（方案1后不再独立调用关键词提取，semantic_keywords 取最终输出）──
             history_context = _build_history_context(state.get("messages") or [])
-            keyword_output = keyword_structured_llm.invoke(
-                keyword_prompt.invoke({
-                    "question": current_user_input,
-                    "history": history_context or "无",
-                })
-            )
-            semantic_keywords = [
-                str(k).strip()
-                for k in (keyword_output.semantic_keywords or [])
-                if str(k).strip()
-            ]
-            log_sub_info(f"semantic_keywords: {semantic_keywords}", node_name="planner")
 
             # ── 第1层：语义层候选由 Planner ReAct 自主调用 search_semantic 获取 ──
             # 不再程序强制 grep/注入 prompt；命中指标 id 由 LLM 在 semantic_metrics 中声明，
             # 程序在步骤②后用 id 反查 provider 组装完整候选（见 _resolve_semantic_matches）
             semantic_matches = []
-            # 候选表/字段：语义层命中后由反查结果填充；RAG 元数据由 agent 自主调 search_tables/search_columns
+            # 候选表：语义层命中后由反查结果填充；RAG 元数据由 agent 自主调 search_tables/search_columns
             table_candidates = []
-            column_candidates = []
 
             # ── 检索历史优质示例（仅对话首轮注入，避免历史相似问题干扰当前需求）──
             example_vs = runtime.get("example_vector_store")
@@ -316,54 +336,6 @@ def build_planner_node(runtime):
                 f"【当前日期】\n{date.today().isoformat()}",
                 f"【当前需求基线】\n{current_user_input}",
             ]
-            seeker_plan_error = state.get("seeker_plan_error") or ""
-            if seeker_plan_error:
-                sections.append(
-                    f"【上次执行失败原因（必须调整方案避开该问题）】\n{seeker_plan_error}"
-                )
-            if from_empty_result:
-                _prev_plan = state.get("confirmed_plan") or {}
-                _prev_sql = state.get("generated_sql") or ""
-                _empty_rounds = state.get("empty_result_rounds") or 0
-                _empty_hint = ""
-                if _empty_rounds >= MAX_EMPTY_RESULT_ROUNDS:
-                    _empty_hint = "\n已达重试上限，若确认无匹配数据请直接 route=respond 告知用户，不要继续探查重试。"
-                sections.append(
-                    "【上次执行 0 行反馈（SQL 执行成功但无数据，需先自行核实原因再决定动作）】\n"
-                    f"方案过滤条件：{(_prev_plan.get('filters') or '无')}\n"
-                    f"执行的 SQL：{str(_prev_sql)[:800] or '无'}\n"
-                    "0 行可能有多种原因（过滤值与库中实际存储不一致、字段选错、数据本身为空等），"
-                    "请先自行核实原因（可用 probe_values 探查实际取值、search_columns 核验字段）再决定："
-                    "可修正后 route=execute 重跑，或确认确实无数据时 route=respond 直接告知用户。"
-                    "这是查库可解决的事实问题，不要 route=respond 向用户询问。"
-                    "请在 reason 中说明你发现 0 行的判断依据与本次修正动作（如改用模糊匹配确认实际值），便于向用户展示修正过程。"
-                    f"{_empty_hint}"
-                )
-            if from_execution_review:
-                _last_result = state.get("last_query_result") or {}
-                _res_preview = _last_result.get("preview_rows") or []
-                _res_columns = _last_result.get("columns") or []
-                _res_id = _last_result.get("result_id") or ""
-                _res_count = _last_result.get("row_count") or 0
-                _res_csv = _last_result.get("full_csv") or ""
-                _preview_lines = []
-                if _res_preview:
-                    _header = "| " + " | ".join(_res_columns) + " |"
-                    _sep = "| " + " | ".join(["---"] * len(_res_columns)) + " |"
-                    _preview_lines.append(_header)
-                    _preview_lines.append(_sep)
-                    for _row in _res_preview:
-                        _preview_lines.append("| " + " | ".join(str(_row.get(c, "")) for c in _res_columns) + " |")
-                sections.append(
-                    "【上次执行结果（结果已落盘，请基于此撰写最终回答）】\n"
-                    f"结果 ID：{_res_id} | 共 {_res_count} 行 | 列：{', '.join(_res_columns) or '无'}\n"
-                    + ("\n".join(_preview_lines) if _preview_lines else "（无预览行）")
-                    + (f"\n全量 CSV：{_res_csv}" if _res_csv else "")
-                    + "\n\n【最终回答要求】\n"
-                    + "前端支持 Markdown 渲染（含表格），请直接在 respond_text 中把上述预览行输出为 Markdown 表格，"
-                    + "并在回答末尾明确给出全量 CSV 的完整保存路径（上面『全量 CSV』已是完整绝对路径）。"
-                    + "禁止写『文本模式/界面无法展示表格』之类的说明，表格直接展示即可。"
-                )
             if history_context:
                 sections.append(f"【对话历史（最近 N 轮）】\n{history_context}")
             if example_context:
@@ -403,12 +375,21 @@ def build_planner_node(runtime):
             try:
                 # respond 但无实际内容视为"回答未完成"，给 LLM 补工具/补内容后再定稿（通用完整性约束）
                 planner_output = None
+                # 方案2：模型主动停止工具调用（信息已充分）时用快速模型定稿，省 thinking 时间；
+                # 快速模型定稿失败（execute/空回答）后回退 thinking，保证判断质量
+                _fast_failed = False
                 for _round in range(MAX_PLANNER_RESPOND_RETRY + 1):
+                    _tool_break = False
+                    _use_fast = False
+                    _direct_output = None
                     for _step in range(MAX_PLANNER_TOOL_STEPS):
                         _response = react_llm.invoke(react_messages)
                         react_messages.append(_response)
                         _tool_calls = getattr(_response, "tool_calls", None) or []
                         if not _tool_calls:
+                            _tool_break = True
+                            # 尝试直接解析该轮输出为 PlannerOutput（成功则省一次定稿 LLM 调用）
+                            _direct_output = _try_parse_planner_output(_response)
                             break
                         log_tools_called("planner", [str(tc.get("name", "?")) for tc in _tool_calls])
                         for _tc in _tool_calls:
@@ -424,12 +405,21 @@ def build_planner_node(runtime):
                                 content=str(_result)[:2000],
                                 tool_call_id=_tc.get("id"),
                             ))
-                    planner_output = structured_llm.invoke(react_messages)
-                    _respond_empty = (
+                    if _direct_output is not None:
+                        # react 轮已直接输出结构化 JSON：直接使用，跳过定稿 LLM 调用
+                        planner_output = _direct_output
+                    else:
+                        _use_fast = _tool_break and not _fast_failed
+                        planner_output = (
+                            structured_llm_fast if _use_fast else structured_llm
+                        ).invoke(react_messages)
+                    # 单 Agent：查数在工具循环内通过 execute_query 完成，route 收敛为 respond 单一终态；
+                    # 仅 respond 且文本为空（回答未完成）时重试补齐，不再拦截 route=execute
+                    _needs_retry = (
                         planner_output.route == "respond"
                         and not (planner_output.respond_text or "").strip()
                     )
-                    if not _respond_empty:
+                    if not _needs_retry:
                         break
                     # 回答未完成：追加通用提示，让 LLM 用工具补齐数据或给出实际内容（不枚举场景）
                     react_messages.append(SystemMessage(
@@ -437,6 +427,9 @@ def build_planner_node(runtime):
                                 "若回答所需数据不在上下文中，请先调用工具获取；"
                                 "然后在 respond_text 中写出给用户的实际内容（结果/澄清/确认）。"
                     ))
+                    # fast 定稿失败（execute/空回答）：后续轮回退 thinking，避免反复快速失败
+                    if _use_fast:
+                        _fast_failed = True
             finally:
                 reset_result_conversation(_conv_token)
 
@@ -444,6 +437,13 @@ def build_planner_node(runtime):
                     planner_output.effective_query.strip()
                     or current_user_input
             )
+            # 方案1：semantic_keywords 直接取最终结构化输出（不再独立调用，省一次 LLM 调用）
+            semantic_keywords = [
+                str(k).strip()
+                for k in (planner_output.semantic_keywords or [])
+                if str(k).strip()
+            ]
+            log_sub_info(f"semantic_keywords: {semantic_keywords}", node_name="planner")
             # ── 信任 LLM 的 completeness 判定，不做覆盖 ──
             tables = planner_output.tables
             fields = planner_output.fields
@@ -548,9 +548,8 @@ def build_planner_node(runtime):
             high_similarity_table_count = 0
             high_similarity_column_count = 0
 
-            # ── Planner 是唯一决策者：route ∈ {execute, respond} ──
-            # execute=本轮要查数（进执行链）；respond=给用户输出文本（澄清/确认/最终回答由 LLM 自定）
-            updated_plan = None
+            # ── Planner 是唯一决策者：route 收敛为 respond 单一终态 ──
+            # respond=给用户输出文本（澄清/确认/最终回答由 LLM 自定）；查数已在工具循环内通过 execute_query 完成
             route_llm = planner_output.route or "respond"
             respond_text = (planner_output.respond_text or "").strip()
 
@@ -586,6 +585,7 @@ def build_planner_node(runtime):
                         "completeness": completeness,
                         "semantic_metrics": [dict(m) for m in semantic_candidates],
                         "semantic_candidates": semantic_candidates,
+                        "table_candidates": table_candidates,
                         "route": route_value,
                     },
                 }
@@ -615,189 +615,23 @@ def build_planner_node(runtime):
                 planner_reason = "Planner 判定 respond（澄清/回答）：" + planner_output.reason
                 return _respond_return("respond", respond_text, planner_reason)
 
-            # ── execute 分支：构建方案进执行链 ──
-            execution_rounds = state.get("execution_rounds") or 0
-            if execution_rounds >= MAX_EXECUTION_ROUNDS:
-                # 查询轮次上限（防 execute 死循环，安全兜底）：本轮不再执行，respond 说明
-                fallback_text = (
-                    planner_output.reason.strip()
-                    or "本轮已多次查询仍未完成，请补充信息或换个问法，我再为您查询。"
-                )
-                planner_reason = (
-                    f"已达查询轮次上限({MAX_EXECUTION_ROUNDS})，本轮不再执行，respond："
-                    + planner_output.reason
-                )
-                return _respond_return("respond", fallback_text, planner_reason, {
-                    "evaluator_pending": False,
-                })
-
-            # 只采信 LLM 判定相关（>=候选阈值）的语义层命中
-            _confirmed_ids = {
-                str(m.id)
-                for m in (planner_output.semantic_metrics or [])
-                if float(m.confidence or 0) >= SEMANTIC_CONFIDENCE_CANDIDATE
-            }
-            metric_hits = [
-                sc for sc in semantic_candidates
-                if str(sc.get("id") or "") in _confirmed_ids
-            ]
-            _conf_by_id = {
-                str(m.id): float(m.confidence or 0)
-                for m in (planner_output.semantic_metrics or [])
-            }
-            metric_hits = sorted(
-                metric_hits,
-                key=lambda h: _conf_by_id.get(str(h.get("id") or ""), 0.0),
-                reverse=True,
+            # ── route 非 respond 兜底（防御）：单 Agent 下 route 已收敛为 respond，
+            # LLM 异常输出 execute 等值时按 respond 处理，避免崩溃 ──
+            fallback_text = (
+                planner_output.reason.strip()
+                or "请补充查询条件，我再为您查询。"
             )
-            # 语义层确定性构建方案（语义层优先）；未命中时用 Planner 输出构造最小方案直通
-            plan = build_plan_from_semantic(
-                metric_hits=metric_hits,
-                semantic_provider=runtime.get("semantic_metadata_provider"),
-                dimension_mentions=planner_output.dimension_mentions,
-                # 时间不再单独传槽位：统一由 filters 中的 yyyy-MM-dd 条件派生
-                filters=planner_output.filters,
-                # 每轮基于 effective_query 重建方案，不继承旧 confirmed_plan
-                draft=None,
-                complex_flag=planner_output.complex,
+            planner_reason = (
+                "Planner 输出异常 route（非 respond），兜底改为 respond："
+                + planner_output.reason
             )
-            if plan is None:
-                plan = _build_minimal_plan(planner_output)
-
-            if plan is None:
-                # 方案构建失败（信息不足）：不再降级 Advisor，respond 向用户澄清
-                clarify_text = (
-                    planner_output.reason.strip()
-                    or "查询方案不完整，请补充指标、时间或过滤条件后我再为您查询。"
-                )
-                planner_reason = (
-                    "Planner 判定 execute 但方案不完整，改为 respond 澄清："
-                    + planner_output.reason
-                )
-                return _respond_return("respond", clarify_text, planner_reason)
-
-            updated_plan = plan
-            tables = plan.get("tables", [])
-            fields = plan.get("fields", [])
-            completeness = "full"
-            route = "execute"
-            # 0 行自愈轮在前缀体现修正语义，便于前端思考过程区分轮次
-            _reason_prefix = (
-                "Planner 判定 0 行自愈修正后可直接执行："
-                if from_empty_result
-                else "Planner 判定可直接执行，方案构建通过："
-            )
-            planner_reason = _reason_prefix + planner_output.reason
-
-            # 语义层未命中且无候选时，用第0层检索词补一次 grep 写共享状态（供日志/trace 参考）
-            if not semantic_candidates and semantic_keywords:
-                semantic_candidates = grep_metrics_from_keywords(
-                    semantic_keywords, limit=SEMANTIC_GREP_TOP_K
-                )
-
-            new_entities = {
-                "effective_query": effective_query,
-                "table": tables[0] if tables else "",
-                "tables": tables,
-                "fields": fields,
-                "filters": planner_output.filters,
-                # 时间范围从 filters 中的 yyyy-MM-dd 条件派生，不再依赖独立槽位
-                "time_range": _extract_time_from_filters(planner_output.filters)[1],
-                "complex": planner_output.complex,
-                "completeness": completeness,
-                "unresolved_dimensions": (updated_plan or {}).get("unresolved_dimensions") or [],
-                "plan_error": seeker_plan_error,
-                "table_candidates": table_candidates,
-                "column_candidates": column_candidates,
-                # 语义层 grep 候选（含 notes 命中）与 LLM 置信度，供日志/trace 参考
-                "semantic_keywords": semantic_keywords,
-                "semantic_metrics": [dict(m) for m in semantic_metrics],
-                "semantic_candidates": semantic_candidates,
-                "route": route,
-            }
-
-            log_node_end(
-                "planner",
-                route=route,
-                route_source="planner_llm",
-                completeness=completeness,
-                tables=str(tables),
-                fields=str(fields),
-                high_sim_tables=high_similarity_table_count,
-                high_sim_columns=high_similarity_column_count,
-                unresolved_dimensions=(updated_plan or {}).get("unresolved_dimensions") or [],
-                reason=planner_reason,
-                ms=elapsed_ms(timer),
-            )
-
-            # Planner 路由结果决定 Topic 下一阶段：execute 进执行链，respond 等用户
-            if route == "execute":
-                next_topic_status = "confirmed"
-            else:
-                next_topic_status = "clarifying"
-
-            # ── 去 pending 状态机：不再跨轮保存解析证据/候选快照 ──
-            # 澄清候选由 Planner respond 写入历史消息，用户选择由 Planner 改写 effective_query 体现；
-            # 本轮的 analysis_spec 只保留当轮意图，字段最终过元数据校验（validate_field_table_bindings 等）。
-            existing_spec = state.get("analysis_spec") or {}
-
-            metric_mentions = list(planner_output.metric_mentions or [])
-            if not metric_mentions:
-                metric_mentions = list(existing_spec.get("metric_mentions") or [])
-            dimension_mentions = list(planner_output.dimension_mentions or [])
-            if not dimension_mentions:
-                dimension_mentions = list(existing_spec.get("dimension_mentions") or [])
-
-            analysis_spec = dict(existing_spec)
-            analysis_spec.update({
-                "analysis_type": planner_output.analysis_type,
-                "metric_mentions": metric_mentions,
-                "dimension_mentions": dimension_mentions,
-                # 语义层命中状态统一存于 planner_entities，analysis_spec 只保留业务意图
-                "time_range": "",
-                "time_grain": "",
-                "filters": [],
-                "order_by": [],
-                "limit": 0,
-                "comparison": {},
-            })
-
-            return_value = {
-                "route": route,
-                "respond_text": "",
-                "planner_reason": planner_reason,
-                "effective_query": effective_query,
-                "planner_entities": new_entities,
-                "topic_status": next_topic_status,
-                "analysis_spec": analysis_spec,
-                # 消费回环标记，避免残留影响后续轮次路由
-                "seeker_empty_result": False,
-                "execution_review": False,
-                "seeker_plan_error": None,
-                "seeker_error_unresolvable": None,
-                # 本轮要执行，结果未落盘前不触发 Evaluator
-                "evaluator_pending": False,
-                # execute 轮次计数（capture 每轮用户输入重置，防死循环）
-                "execution_rounds": execution_rounds + 1,
-            }
-            # 去 Topic 化：不再写入 original_question（当前需求以 effective_query 为准）
-            # Planner 构建的 confirmed 方案直接交给执行链，无需用户确认环节
-            return_value["confirmed_plan"] = updated_plan
-            return_value["plans"] = [updated_plan]
-            # 成功构建新方案即重置执行失败修复计数（不区分新问数/追问）
-            return_value["plan_repair_rounds"] = 0
-            # 执行失败修复：本轮已消费失败原因，清空并累计修复次数
-            if seeker_plan_error:
-                return_value["plan_repair_rounds"] = (state.get("plan_repair_rounds") or 0) + 1
-
-            # 节点完成后记录 State 分层摘要，供 trace 查看数据流转
-            log_state_snapshot("planner", {**state, **return_value})
-
-            return return_value
+            return _respond_return("respond", fallback_text, planner_reason)
 
 
         except Exception as error:
             log_node_error("planner", error=str(error), ms=elapsed_ms(timer))
             raise
+        finally:
+            reset_execute_query_context(_exec_ctx)
 
     return planner_node

@@ -64,7 +64,7 @@ class _FakeStructuredLLM:
     def bind_tools(self, tools):
         return _FakeReactLLM(self._react_tool_calls)
 
-    def with_structured_output(self, model):
+    def with_structured_output(self, model, **kwargs):
         if model is SemanticKeywordsOutput:
             return _FakeStructuredCallable(
                 SemanticKeywordsOutput(semantic_keywords=self._keyword_list)
@@ -138,7 +138,7 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         from agentTest.langgraph_app.nodes import planner_node
 
         fake_llm = _FakeStructuredLLM(keyword_list, planner_kwargs, react_tool_calls, seen_messages)
-        with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
+        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
             return node(_state("查询昨天从山东瀛能公司调出的调出明细"))
 
@@ -202,8 +202,8 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         self.assertIn("device_transfer_detail", ids)
         self.assertIn("device_return_detail", ids)
 
-    def test_no_semantic_grep_goes_execute(self):
-        """无 grep 命中：semantic_metrics 为空，Planner 用输出构造最小方案直通执行链。"""
+    def test_no_semantic_grep_falls_back_to_respond(self):
+        """无 grep 命中：semantic_metrics 为空，Planner 判定 execute 但未调 execute_query，兜底 respond。"""
         planner_kwargs = _planner_kwargs(
             route="execute",
             semantic_keywords=["排产"],
@@ -212,12 +212,12 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         result = self._run_planner(["排产电人比"], planner_kwargs)
         entities = result["planner_entities"]
         self.assertEqual(entities["semantic_metrics"], [])
-        # execute：方案由 Planner 输出构造（最小方案），route 收敛为 execute
-        self.assertEqual(result["route"], "execute")
-        self.assertIsNotNone(result.get("confirmed_plan"))
+        # 单 Agent：查数必须由 execute_query 工具完成，Planner 不直接构建方案执行
+        self.assertEqual(result["route"], "respond")
+        self.assertIsNone(result.get("confirmed_plan"))
 
-    def test_execute_route_builds_plan_from_semantic(self):
-        """Planner 判定 execute 且语义层唯一强命中时，确定性构建 confirmed_plan。"""
+    def test_execute_route_with_semantic_hit_falls_back_to_respond(self):
+        """Planner 判定 execute 且语义层唯一强命中：候选保留供日志/trace，未调工具时兜底 respond。"""
         planner_kwargs = _planner_kwargs(
             route="execute",
             effective_query="查询昨天的新增订单数",
@@ -240,11 +240,20 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
                 "id": "call_semantic_1",
             }],
         )
-        self.assertEqual(result["route"], "execute")
-        plan = result.get("confirmed_plan") or {}
-        self.assertEqual(plan.get("status"), "confirmed")
-        self.assertIn("ads_trip.ads_region_rent_order_analysis_hour", plan.get("tables", []))
-        self.assertIn("new_rent_counts", plan.get("measures", []))
+        entities = result["planner_entities"]
+        # 语义命中候选与推荐表保留（供日志/trace 与后续 execute_query 复用）
+        self.assertTrue(
+            any(c.get("id") == "addition_order_num" for c in entities["semantic_candidates"])
+        )
+        self.assertTrue(
+            any(
+                t.get("table") == "ads_trip.ads_region_rent_order_analysis_hour"
+                for t in entities["table_candidates"]
+            )
+        )
+        # 未调用 execute_query：兜底 respond，不再由 Planner 直接构建 confirmed_plan
+        self.assertEqual(result["route"], "respond")
+        self.assertIsNone(result.get("confirmed_plan"))
 
     def test_execute_route_without_tables_falls_back_to_respond(self):
         """Planner 判定 execute 但既无表信息也无法构建方案时，respond 澄清（不再降级 Advisor）。"""

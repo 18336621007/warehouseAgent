@@ -3,9 +3,6 @@
 #       plan_synthesizer 多指标确定性构建、草稿收尾
 import unittest
 
-from agentTest.config.advisor import MAX_PLAN_REPAIR_ROUNDS
-from agentTest.langgraph_app.routers.seeker_router import route_after_seeker
-from agentTest.langgraph_app.graphs.supervisor_graph import plan_error_fallback_node
 from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 from agentTest.langgraph_app.services.plan_synthesizer import (
@@ -13,68 +10,6 @@ from agentTest.langgraph_app.services.plan_synthesizer import (
 )
 from agentTest.langgraph_app.services.query_plan_service import lock_query_plan
 from agentTest.langgraph_app.state.query_plan import validate_query_plan
-
-
-class SeekerRepairRoutingTest(unittest.TestCase):
-    """Seeker 方案不可行时回 Planner 修复的分派逻辑。"""
-
-    def test_plan_error_within_budget_goes_repair(self):
-        state = {"seeker_plan_error": "缺少 join 契约", "plan_repair_rounds": 0}
-        self.assertEqual(route_after_seeker(state), "repair")
-
-    def test_plan_error_budget_exhausted_goes_fallback(self):
-        state = {
-            "seeker_plan_error": "缺少 join 契约",
-            "plan_repair_rounds": MAX_PLAN_REPAIR_ROUNDS,
-        }
-        self.assertEqual(route_after_seeker(state), "fallback")
-
-    def test_success_goes_end(self):
-        self.assertEqual(route_after_seeker({"seeker_plan_error": ""}), "end")
-        self.assertEqual(route_after_seeker({}), "end")
-
-    def test_execution_review_goes_planner(self):
-        # A1：执行成功且有结果 → 回 Planner 基于落盘结果撰写最终回答
-        state = {"execution_review": True, "seeker_empty_result": False}
-        self.assertEqual(route_after_seeker(state), "review")
-
-    def test_empty_result_goes_empty_self_heal(self):
-        # 0 行自愈：执行成功但无数据 → 回 Planner 用 probe_values 核实
-        state = {"seeker_empty_result": True, "execution_review": False}
-        self.assertEqual(route_after_seeker(state), "empty_self_heal")
-
-    def test_unresolvable_plan_error_skips_repair(self):
-        # 缺 join 契约等不可修复错误：即使修复轮次未耗尽也直接走 fallback 告知用户
-        state = {
-            "seeker_plan_error": "缺少 join 契约",
-            "seeker_error_unresolvable": True,
-            "plan_repair_rounds": 0,
-        }
-        self.assertEqual(route_after_seeker(state), "fallback")
-
-
-class PlanErrorFallbackTest(unittest.TestCase):
-    """Seeker 方案不可行且修复机会耗尽时给用户的兜底回复。"""
-
-    def test_fallback_node_returns_friendly_message(self):
-        result = plan_error_fallback_node({
-            "seeker_plan_error": "当前查询涉及多张表，但缺少必要的关联关系配置。",
-            "request_id": "req123",
-        })
-        self.assertIn("缺少必要的关联关系配置", result["final_answer"])
-        self.assertEqual(result["topic_status"], "completed")
-        self.assertTrue(result["messages"])
-
-    def test_fallback_node_unresolvable_mentions_admin(self):
-        # 缺 join 契约：最终答复明确告知用户无法关联、请联系管理员
-        result = plan_error_fallback_node({
-            "seeker_plan_error": "当前查询涉及多张表，但缺少必要的关联关系配置。",
-            "seeker_error_unresolvable": True,
-            "request_id": "req124",
-        })
-        self.assertIn("请联系数据管理员", result["final_answer"])
-        self.assertIn("缺少关联关系配置", result["final_answer"])
-        self.assertEqual(result["topic_status"], "completed")
 
 
 class PlanSynthesizerTest(unittest.TestCase):

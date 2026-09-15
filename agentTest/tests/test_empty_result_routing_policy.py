@@ -58,7 +58,7 @@ class _FakeStructuredLLM:
     def bind_tools(self, tools):
         return _FakeReactLLM(self._react_tool_calls)
 
-    def with_structured_output(self, model):
+    def with_structured_output(self, model, **kwargs):
         if model is SemanticKeywordsOutput:
             return _FakeStructuredCallable(
                 SemanticKeywordsOutput(semantic_keywords=self._keyword_list)
@@ -132,16 +132,16 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
     def test_prompt_requires_probe_values_on_zero_rows(self):
         # 0 行规则强化：可用工具探查、禁止 route=respond 向用户询问、口径歧义才允许澄清
         self.assertIn("可用 probe_values 探查实际取值", PLANNER_SYSTEM_PROMPT)
-        self.assertIn("route=execute 重跑", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("调用 execute_query 工具重跑", PLANNER_SYSTEM_PROMPT)
         self.assertIn("禁止 route=respond 向用户询问", PLANNER_SYSTEM_PROMPT)
         self.assertIn("口径歧义", PLANNER_SYSTEM_PROMPT)
 
-    def test_zero_row_section_injected_with_probe_guidance(self):
-        # 0 行自愈回 planner 时注入探查引导，提示用 probe_values 而不是问用户
+    def test_zero_row_section_not_injected_in_single_agent(self):
+        # 单 Agent：0 行反馈由 execute_query 工具结果驱动，Planner 不再注入 0 行反馈 section
         seen = []
         from agentTest.langgraph_app.nodes import planner_node
         fake_llm = _FakeStructuredLLM(["返厂", "明细"], _planner_kwargs(), seen_messages=seen)
-        with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
+        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
             node(_state(
                 "查询徐州大区今年同意返厂的返厂明细",
@@ -149,23 +149,23 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
                 generated_sql="SELECT * FROM ads_trip.ads_gundam_device_return_detail_hour WHERE region_name='徐州'",
             ))
         user_content = "".join(str(m) for m in seen)
-        self.assertIn("SQL 执行成功但无数据", user_content)
-        self.assertIn("probe_values 探查实际取值", user_content)
-        self.assertIn("不要 route=respond 向用户询问", user_content)
+        self.assertNotIn("SQL 执行成功但无数据", user_content)
+        self.assertNotIn("不要 route=respond 向用户询问", user_content)
 
     def test_zero_row_section_not_injected_without_flag(self):
         # 无 0 行标记时不注入 0 行反馈 section
         seen = []
         from agentTest.langgraph_app.nodes import planner_node
         fake_llm = _FakeStructuredLLM(["返厂", "明细"], _planner_kwargs(), seen_messages=seen)
-        with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
+        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
             node(_state("查询徐州大区今年同意返厂的返厂明细"))
         user_content = "".join(str(m) for m in seen)
         self.assertNotIn("SQL 执行成功但无数据", user_content)
 
-    def test_zero_row_self_heal_probe_then_seeker(self):
-        # 0 行自愈链路：react 先调 probe_values 探查，structured 修正 filters 后 route=execute
+    def test_zero_row_self_heal_probe_then_execute_query(self):
+        # 0 行自愈链路：react 先调 probe_values 探查，structured 仍 route=execute
+        # 循环提示调 execute_query 工具，重试耗尽后兜底 respond（不直接 route=execute）
         react_tool_calls = [
             {
                 "name": "search_semantic",
@@ -185,6 +185,7 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
                 "type": "tool_call",
             }
         ]
+        seen = []
         from agentTest.langgraph_app.nodes import planner_node
         fake_llm = _FakeStructuredLLM(
             ["返厂", "明细"],
@@ -196,17 +197,27 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
                 )
             ]),
             react_tool_calls=react_tool_calls,
+            seen_messages=seen,
         )
-        with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
+        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
             result = node(_state(
                 "查询徐州大区今年同意返厂的返厂明细",
                 seeker_empty_result=True,
                 generated_sql="SELECT * FROM ads_trip.ads_gundam_device_return_detail_hour WHERE region_name='徐州'",
             ))
-        # 探查修正后仍由 Planner 重跑 execute，不向用户澄清
-        self.assertEqual(result.get("route"), "execute")
-        self.assertNotEqual(result.get("topic_status"), "clarifying")
+        # 探查后仍需通过 execute_query 工具查数，Planner 不直接 route=execute
+        self.assertEqual(result.get("route"), "respond")
+        self.assertEqual(result.get("topic_status"), "clarifying")
+        self.assertTrue(
+            any(
+                "execute_query 工具" in str(m.content)
+                for msgs in seen
+                for m in msgs
+                if getattr(m, "type", "") == "system"
+            ),
+            "应提示调用 execute_query 工具",
+        )
 
 
 if __name__ == "__main__":

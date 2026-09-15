@@ -55,7 +55,7 @@ class _FakeStructuredLLM:
     def bind_tools(self, tools):
         return _FakeReactLLM(self._react_tool_calls)
 
-    def with_structured_output(self, model):
+    def with_structured_output(self, model, **kwargs):
         if model is SemanticKeywordsOutput:
             return _FakeStructuredCallable(
                 SemanticKeywordsOutput(semantic_keywords=self._keyword_list)
@@ -125,10 +125,10 @@ def _planner_kwargs(**overrides):
 class PlannerRouteRespondTest(unittest.TestCase):
     """Planner route=respond：直接输出文本给用户（澄清/确认/最终回答）。"""
 
-    def _run_planner(self, planner_kwargs, messages=None, state_overrides=None):
+    def _run_planner(self, planner_kwargs, messages=None, state_overrides=None, seen_messages=None):
         from agentTest.langgraph_app.nodes import planner_node
-        fake_llm = _FakeStructuredLLM(["返厂", "明细"], planner_kwargs)
-        with mock.patch.object(planner_node, "ChatOpenAI", return_value=fake_llm):
+        fake_llm = _FakeStructuredLLM(["返厂", "明细"], planner_kwargs, seen_messages=seen_messages)
+        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
             return node(_state("查询徐州大区今年同意返厂的返厂明细", messages, **(state_overrides or {})))
 
@@ -168,26 +168,39 @@ class PlannerRouteRespondTest(unittest.TestCase):
         ctx = _build_history_context(messages)
         self.assertIn("已确认无数据", ctx)
 
-    def test_execute_route_builds_plan(self):
-        """route=execute 且方案构建成功：进执行链（route=execute），写入 confirmed_plan/plans。"""
-        result = self._run_planner(_planner_kwargs(
-            route="execute",
-            effective_query="查询昨天的新增订单数",
-            dimension_mentions=[],
-            filters="pt_dt 昨天",
-            semantic_metrics=[
-                {
-                    "id": "addition_order_num",
-                    "confidence": 0.95,
-                    "mention": "新增订单",
-                }
-            ],
-        ))
-        self.assertEqual(result["route"], "execute")
-        self.assertEqual(result["topic_status"], "confirmed")
-        self.assertTrue(result.get("confirmed_plan"))
-        self.assertEqual(len(result.get("plans") or []), 1)
-        self.assertEqual(result.get("execution_rounds"), 1)
+    def test_execute_route_without_tool_falls_back_to_respond(self):
+        """route=execute 但未调用 execute_query：循环提示查数，重试耗尽后兜底 respond（不再直接构建方案）。"""
+        seen = []
+        result = self._run_planner(
+            _planner_kwargs(
+                route="execute",
+                effective_query="查询昨天的新增订单数",
+                dimension_mentions=[],
+                filters="pt_dt 昨天",
+                semantic_metrics=[
+                    {
+                        "id": "addition_order_num",
+                        "confidence": 0.95,
+                        "mention": "新增订单",
+                    }
+                ],
+            ),
+            seen_messages=seen,
+        )
+        # 单 Agent：查数必须由 execute_query 工具完成，Planner 不再直接 route=execute
+        self.assertEqual(result["route"], "respond")
+        self.assertEqual(result["topic_status"], "clarifying")
+        self.assertIsNone(result.get("confirmed_plan"))
+        # 循环内提示过"查数必须调用 execute_query 工具"
+        self.assertTrue(
+            any(
+                "execute_query 工具" in str(m.content)
+                for msgs in seen
+                for m in msgs
+                if getattr(m, "type", "") == "system"
+            ),
+            "应提示调用 execute_query 工具",
+        )
 
 
 if __name__ == "__main__":

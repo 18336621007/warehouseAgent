@@ -41,7 +41,8 @@ class PlannerOutput(BaseModel):
 
     route: Literal["execute", "respond"] = Field(
         default="respond",
-        description="本轮路由判定：execute=本轮要查数，进执行链；respond=本轮给用户输出文本（澄清/确认/最终回答由你自定），结束等用户回复"
+        description="本轮路由判定：respond=给用户输出文本（澄清/确认/最终回答由你自定），结束等用户回复；"
+                    "查数必须在工具循环内调用 execute_query 完成，最终一律输出 respond（execute 已废弃，仅供兼容）"
     )
 
     filters: str = Field(
@@ -56,7 +57,7 @@ class PlannerOutput(BaseModel):
 
     fields: list[str] = Field(
         default_factory=list,
-        description="SELECT 业务字段（度量/维度/展示字段）；时间字段与过滤字段一律不写 fields（它们属于 filters）"
+        description="SELECT 业务字段（度量/维度/展示字段）；时间字段与过滤字段一律不写 fields（它们属于 filters）；明细查询必须列出具体业务字段，禁止 *，不确定时先用 search_columns 查询该表真实字段"
     )
 
     completeness: Literal[
@@ -115,23 +116,26 @@ PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责理解�
 【可用工具与调用时机】
 - search_semantic：检索语义层业务指标候选（权威口径：来源表/表达式/维度/枚举值/备注）。新查询或需确认指标口径时优先调用；语义层优先于 RAG 检索。
 - search_tables：检索数据表；信息不足时补充。
-- search_columns：检索字段（含枚举提示）；过滤值不确定时确认，如大区/公司名称。
+- search_columns：检索字段（含枚举提示）；明细查询选展示字段或过滤值不确定时调用。
 - search_databases：检索数据库，低频。
 - query_stored_result：读取本会话已落盘的查询结果，判断用户追问能否直接复用历史结果。
-- probe_values：实时探查某表某字段的实际存储值（LIKE 模糊匹配），用于确认过滤值是否与库中一致（如大区/公司名称被截断、格式不同）。
+- probe_values：实时探查某表某字段的实际存储值（LIKE 模糊匹配），仅用于"执行返回 0 行"时核实过滤值是否与库中一致（如大区/公司名称被截断、格式不同），勿在执行前预查。
+- execute_query：执行数据查询并返回结果摘要（列 + 预览行 + 行数 + 全量 CSV 路径）。需要查数时必须调用；结果回填后基于结果直接写最终回答。
 规则：
 - 新查询/口径确认：优先调用 search_semantic 获取语义层候选（来源表/表达式/维度/枚举值），命中指标在 semantic_metrics 中声明 id 与置信度；未命中时再用 search_tables/search_columns（RAG 兜底）。
 - 基于上次落盘结果的追问（"统计各个原因多少条""刚才的结果"等）：优先用 query_stored_result 读落盘 CSV 直接回答，不需要 search_semantic。
-- 语义层候选不再自动提供，需主动调用 search_semantic 获取；若某过滤维度候选未提供枚举值，可调用 search_columns（元数据采样）或 probe_values（实时查库）确认该字段实际取值，避免精确匹配落空。
+- 明细查询（analysis_type=detail）：fields 必须用 search_columns 查到的真实字段列出具体展示字段，禁止用 * 表示全字段。
+- 语义层候选不再自动提供，需主动调用 search_semantic 获取；语义层已提供枚举值时直接用其执行查询（execute_query），不要预先 probe_values；仅当执行返回 0 行时，才用 probe_values 探查实际取值并修正后重跑。
+- 需要查数时：调用 execute_query 工具执行查询，拿到结果摘要后，基于结果输出 route=respond 的最终回答（Markdown 表格 + 全量 CSV 路径）。禁止直接 route=execute。
 - 语义层未命中或信息不足（如过滤值不确定）时，先调用工具补充，再输出最终 JSON。
-- 收到【上次执行 0 行反馈】时，先自行核实 0 行原因（可能为过滤值与实际存储值不匹配、字段选错、数据本身为空等），可用 probe_values 探查实际取值、search_columns 核验字段；确认原因后修正 filters 并 route=execute 重跑，这类事实问题查库可解，禁止 route=respond 向用户询问。
+- 收到【上次执行 0 行反馈】时，先自行核实 0 行原因（可能为过滤值与实际存储值不匹配、字段选错、数据本身为空等），可用 probe_values 探查实际取值；确认原因后修正 filters 并调用 execute_query 工具重跑，这类事实问题查库可解，禁止 route=respond 向用户询问。
 - 探查后确认过滤值无误、确属无数据，route=respond 并给出 respond_text 直接告知用户，不要反复重试；只有在存在真正的口径歧义（需要用户在多个候选之间选择）时才允许 route=respond 向用户澄清。
 - 不要用工具执行 SQL，执行由执行链负责；工具调用应克制，避免反复调用。
 - 任何具体数值/统计结论必须来自工具或执行链的真实结果（如 query_stored_result 的 group_by_count、SQL 查询返回）；未取得真实数据时 route=respond 明确告知无法确认，禁止凭对话历史或记忆推断、编造数字。
 
 你需要输出：
 1. effective_query：当前完整有效需求
-2. route：本轮路由判定（execute=本轮要查数，进执行链；respond=本轮给用户输出文本，澄清/确认/最终回答由你自定，结束等用户）
+2. route：本轮路由判定（execute=你还需查数但尚未调用 execute_query，程序会提示你先查数；respond=本轮给用户输出文本，澄清/确认/最终回答由你自定，结束等用户）
 3. filters：用户明确的口径过滤条件（含时间，时间按【当前日期】换算成 yyyy-MM-dd 日期区间）
 4. tables：候选目标表
 5. fields：SELECT 业务字段（度量/维度/展示字段；时间与过滤字段一律不写，属于 filters）
@@ -140,7 +144,7 @@ PLANNER_SYSTEM_PROMPT = """你是 Text2SQL 系统中的 Planner，负责理解�
 8. metric_mentions：用户提到的指标业务概念
 9. dimension_mentions：用户提到的维度业务概念
 10. analysis_type：分析类型
-11. respond_text：仅当 route=respond 时填写，给用户的完整文本（澄清/确认/最终回答）；route=execute 时留空
+11. respond_text：给用户的完整文本（澄清/确认/最终回答）；查数必须在工具循环内调用 execute_query 完成，最终一律 route=respond
 
 禁止：
 - 生成SQL
@@ -175,23 +179,23 @@ Advisor：
 无法确定选项含义时，保留原需求，并将 completeness 判定为 partial。
 
 【route判定规则】
-route 决定本轮是"进执行链查数"还是"给用户说话"，你是唯一决策者：
-- execute：当前有效需求的指标、时间、过滤、维度已明确，可直接构建方案进执行链查询。
-- respond：需要向用户澄清口径/补充信息，或本轮无需查数直接回答（如 FAQ 纯知识问答、已确认无数据、用户问非查数类问题），
+route 本轮一律输出 respond（给用户输出文本，澄清/确认/最终回答由你自定），你是唯一决策者；查数必须在工具循环内调用 execute_query 完成：
+- respond：向用户澄清口径/补充信息，或本轮无需查数直接回答（如 FAQ 纯知识问答、已确认无数据、用户问非查数类问题），
   由你输出给用户的完整文本（澄清或回答内容自定）。respond 后本轮结束，等用户回复后在同一对话继续。
+- 需要查数时：先调用 execute_query 获取结果摘要，再基于结果写 respond 最终回答；禁止输出 route=execute（execute 已废弃）。
 - respond_text 必须是给用户的实际内容（结果/澄清/确认），禁止写"需要调用 XX 工具""结果已落盘"这类过程/内部说明；
   若回答所需数据不在上下文中，先用工具获取，再写 respond_text。
 - respond_text 用 Markdown 撰写：小节用 ## 标题分隔、关键数字/口径用 **加粗** 强调、并列要点用 - 列表、对比用表格，
   整体像一份结构清晰的数据分析报告。
   用户引用/追问历史查询结果（"给我完整的明细""刚才的结果""统计各个原因多少条"）时，先用 query_stored_result
-  读取已落盘 CSV，能直接回答就 respond，需要新查数再 execute（见【最近查询结果索引】）。
+  读取已落盘 CSV，能直接回答就 respond，需要新查数再调用 execute_query（见【最近查询结果索引】）。
 
 要点：
-- 用户一次问多个指标时，只要每个指标都能唯一映射、槽位齐全，即使命中多个语义层指标也应判定 execute。
+- 用户一次问多个指标时，只要每个指标都能唯一映射、槽位齐全，即使命中多个语义层指标也应直接调用 execute_query 完成查数。
 - 多指标不等于 respond；含糊不清、口径冲突、需用户选择才 respond。
 - 收到【上次执行结果】→ 基于结果 respond 撰写最终回答（见【上次执行结果规则】）。
-- 收到【上次执行 0 行反馈】→ 事实问题先用 probe_values 探查，可修正则 execute 重跑，确认无数据则 respond 告知。
-- 收到【上次执行失败原因】→ 调整方案避开该问题后 execute；无法修复时 respond 说明原因。
+- 收到【上次执行 0 行反馈】→ 事实问题先用 probe_values 探查，可修正则调用 execute_query 重跑，确认无数据则 respond 告知。
+- 收到【上次执行失败原因】→ 调整方案避开该问题后调用 execute_query；无法修复时 respond 说明原因。
 - 不确定时选 respond 更安全（澄清/说明后继续），但不要把可以确定的查询推给 respond。
 - 结合 search_semantic 检索到的指标候选与【对话历史】判断，不允许仅根据关键词判断。
 
@@ -199,7 +203,7 @@ route 决定本轮是"进执行链查数"还是"给用户说话"，你是唯一�
 - 收到【上次执行结果】时，这是执行链已查完并落盘的结果，你的任务是基于结果撰写最终回答：
   - route=respond，respond_text 为完整业务回答（参考 skill 展示习惯：平台分别展示再给合计、标注口径与单位）。
   - 严格基于结果内容，禁止编造数值；引用落盘结果时带 result_id/轮次。
-  - 结果确实不足以回答时，可 route=execute 补充查询（有查询轮次上限），否则不要重复查询。
+  - 结果确实不足以回答时，可再调用 execute_query 补充查询（有查询轮次上限），否则不要重复查询。
 - 0 行结果：如实告知用户没有匹配数据，不要编造"有数据"。
 
 【时间写入 filters 规则】
@@ -309,7 +313,7 @@ PLANNER_KEYWORD_SYSTEM_PROMPT = """只输出纯JSON，不要markdown代码块，
   实体/维度词（经销商、平台、区域等，无业务限定时剔除）。
 - 每个关键词尽量短且独立可检索（如「调出明细」拆成「调出」「明细」两个词）。
 - 保留渠道/口径限定词（如「A类」「月租」），它们可能对应维度枚举值或独立指标。
-- 若没有可提取的业务关键词，返回空数组。
+- 必须输出包含 semantic_keywords 字段的 JSON 对象（无关键词时该字段为空数组），不要输出裸数组。
 """
 
 PLANNER_KEYWORD_USER_TEMPLATE = """当前需求：

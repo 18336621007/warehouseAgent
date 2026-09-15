@@ -363,74 +363,19 @@ def _check_filter_enum_values(sql: str, enum_lookup_simple: dict) -> list:
 
 
 def _check_plan_consistency(sql: str, confirmed_plan: dict, advisor_last_answer: str, llm, enum_lookup_simple: dict = None) -> str:
-    tables = confirmed_plan.get("tables", [])
-    fields = confirmed_plan.get("fields", [])
-    measures = confirmed_plan.get("measures", []) or confirmed_plan.get("fields", [])
-    dimensions = confirmed_plan.get("dimensions", [])
-    time_field = confirmed_plan.get("time_field", "pt_dt")
-    filters = confirmed_plan.get("filters", "")
-    joins = confirmed_plan.get("joins") or []  # 多表Join边
-    table_plans = confirmed_plan.get("table_plans") or []
-
-    # ── 先做程序化校验 ──
+    # 仅做程序化校验（表/度量聚合/维度/时间分区/逐表过滤/枚举值）。
+    # 移除 LLM 语义校验：慢且会把"字段超集"误判为不一致导致砍字段，数据正确性由执行后返工机制兜底；
+    # advisor_last_answer / llm 参数保留以兼容调用方，已不再使用。
     programmatic_issues = _validate_sql_against_plan(sql, confirmed_plan)
     if programmatic_issues:
         return "; ".join(programmatic_issues)
 
-    # ── 过滤条件枚举值校验：字面量必须命中字段枚举，避免模型猜测 ──
+    # 过滤条件枚举值校验：字面量必须命中字段枚举，避免模型猜测
     enum_issues = _check_filter_enum_values(sql, enum_lookup_simple)
     if enum_issues:
         return "; ".join(enum_issues)
 
-    # ── 构造逐表过滤描述 ──
-    table_plans_desc = "\n".join(
-        f"  {table_plan.get('table', '')}: "
-        f"time_field={table_plan.get('time_field', '')}, "
-        f"time_range={table_plan.get('time_range', '')}, "
-        f"filters={table_plan.get('filters', '') or '无'}"
-        for table_plan in table_plans
-    )
-
-    # ── 构造Join描述 ──
-    joins_desc = ""
-    if joins and len(tables) > 1:
-        join_lines = []
-        for edge in joins:
-            join_lines.append(
-                f"  {edge['left_table']}.{edge['left_key']} = "
-                f"{edge['right_table']}.{edge['right_key']} ({edge.get('join_type', 'LEFT')} JOIN)"
-            )
-        joins_desc = "\n".join(join_lines)
-    elif len(tables) > 1:
-        # 多表无关联关系：标记为 independent_aggregation 策略，避免校验器误判为"无 JOIN"
-        joins_desc = (
-            "independent_aggregation（多表无主外键约束，按各自粒度独立聚合，"
-            "用 CROSS JOIN 子查询 或 UNION ALL 合并，禁止 JOIN ON <字段>=<字段>）"
-        )
-
-    # ── 程序化校验通过，再用 LLM 做语义校验 ──
-    check_prompt = ChatPromptTemplate.from_messages([
-        ("system", SQL_AUDIT_SYSTEM_PROMPT),
-        ("human", SQL_AUDIT_HUMAN_TEMPLATE),
-    ])
-
-    prompt_value = check_prompt.invoke({
-        "table": ", ".join(tables),
-        "measures": ", ".join(measures) if measures else "无（仅查询维度信息）",
-        "dimensions": ", ".join(dimensions) if dimensions else "无",
-        "time_field": time_field,
-        "table_plans": table_plans_desc or "无",
-        "filters": filters or "无",
-        "joins": joins_desc or "单表查询（无需表关联）",
-        "advisor_answer": advisor_last_answer[:1200],
-        "sql": sql,
-    })
-    result = llm.invoke(prompt_value)
-    content_result = result.content.strip() if hasattr(result, 'content') else str(result).strip()
-
-    if content_result.upper().startswith("PASS"):
-        return ""
-    return content_result
+    return ""
 
 
 def build_generate_sql_node(runtime):

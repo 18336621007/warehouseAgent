@@ -4,7 +4,7 @@ import contextvars
 import os
 import dotenv
 
-from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_enable_thinking, get_stream_output_enabled
+from agentTest.config.settings import get_openai_api_key, get_openai_base_url, get_model_name, get_model_enable_thinking, get_stream_output_enabled, get_llm_stream_reasoning
 from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_llm_call
@@ -75,14 +75,25 @@ class LLM:
         stream_kwargs["stream"] = True
         response = self.client.chat.completions.create(**stream_kwargs)
         parts = []
+        # 思考内容独立 stream_id：reasoning_content 按段落流式展示到前端思考面板，不拼入正式输出
+        reasoning_sid = f"reasoning-{os.urandom(3).hex()}"
+        stream_reasoning = get_llm_stream_reasoning()
         for chunk in response:
-            delta = ""
-            if chunk.choices:
-                delta = chunk.choices[0].delta.content or ""
-            if delta:
-                parts.append(delta)
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            # 兼容 OpenAI 兼容接口的思考字段（reasoning_content），缺失则跳过
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning is None and hasattr(delta, "model_dump"):
+                reasoning = delta.model_dump().get("reasoning_content")
+            reasoning = reasoning or ""
+            content = getattr(delta, "content", None) or ""
+            if reasoning and stream_reasoning and bus is not None:
+                bus.emit_token("thinking", reasoning, stream_id=reasoning_sid)
+            if content:
+                parts.append(content)
                 if bus is not None:
-                    bus.emit_token(scope, delta)
+                    bus.emit_token(scope, content)
         return "".join(parts)
 
 

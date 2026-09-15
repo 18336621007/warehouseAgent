@@ -283,6 +283,34 @@ def build_plan_from_semantic(
         "complex": bool(complex_flag or draft.get("complex") or False),
         "table_plans": [],
     }
+    # 明细查询补全业务展示字段：避免方案字段不全导致只查少量列（如仅有维度字段），
+    # 从语义层模型口径字段收集，缺失时回退物理表字段（排除分区/时间字段）
+    if detail_flag:
+        detail_fields = []
+        detail_model = sl.get_semantic_model(main_table)
+        if detail_model:
+            for _m_info in (detail_model.get("measures") or {}).values():
+                if isinstance(_m_info, dict) and _m_info.get("field"):
+                    _f = str(_m_info["field"])
+                    if _f not in detail_fields:
+                        detail_fields.append(_f)
+            for _d_info in (detail_model.get("dimensions") or {}).values():
+                if isinstance(_d_info, dict) and _d_info.get("field"):
+                    _f = str(_d_info["field"])
+                    if _f not in detail_fields:
+                        detail_fields.append(_f)
+        if not detail_fields:
+            detail_phys = sl.get_physical_table(main_table)
+            if detail_phys:
+                for _f in (detail_phys.get("fields") or {}):
+                    if _f in (time_field, "pt_dt"):
+                        continue
+                    detail_fields.append(_f)
+        for _f in detail_fields:
+            if _f not in plan["select_fields"]:
+                plan["select_fields"].append(_f)
+            field_sources.setdefault(_f, main_table)
+
     if unresolved_dimensions:
         # 未解析维度词写入方案供日志审计（不参与执行字段）
         plan["unresolved_dimensions"] = list(dict.fromkeys(unresolved_dimensions))
