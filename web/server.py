@@ -53,7 +53,6 @@ QUERY_SAFE_ERROR_MESSAGE = "系统暂时无法完成本次查询，请稍后重�
 def _sse(data_dict):
     return "data: " + json.dumps(data_dict, ensure_ascii=False) + "\n\n"
 
-
 def _extract_node_detail(node_name, node_update):
     """从节点写入 State 的增量中提取可展示的 LLM 输出，作为前端思考过程内容。
 
@@ -190,6 +189,7 @@ def chat():
                     summary={"nodes": 0, "intent": "chat"},
                     ms=elapsed_ms(request_timer),
                 )
+                # chat 快速回复为短文本，直接 done 一次性下发（不走 planner 定稿，无真流式）
                 yield _sse_req({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0})
                 return
 
@@ -339,6 +339,8 @@ def chat():
                 ms=elapsed_ms(request_timer),
             )
 
+            # 最终回答的真流式已由 LLM 层（ThinkingStreamChatModel.answer_field）在生成时
+            # 实时 emit（live=true），done 事件整体下发作为兜底，无需再重放
             bus.emit({
                 "type": "done",
                 "content": final_answer,

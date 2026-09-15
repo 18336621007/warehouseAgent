@@ -17,6 +17,7 @@ from agentTest.config.settings import (
     get_llm_structured_output_method,
     get_llm_thinking_force_tool,
     get_llm_stream_reasoning,
+    get_stream_output_enabled,
 )
 from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
 
@@ -53,14 +54,140 @@ def _lc_msg_to_oai(message: BaseMessage) -> dict:
     return oai_msg
 
 
+class _JsonFieldStreamer:
+    """从 JSON 文本流中增量提取指定字符串字段的值（用于最终回答实时流式输出）。
+
+    模型以流式生成 PlannerOutput JSON 时，respond_text 字段的文本会在生成过程中
+    实时提取并推送前端，实现"边生成边输出"而非生成完再重放。
+    """
+
+    _ESC_MAP = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f"}
+
+    def __init__(self, field: str):
+        self._field = field
+        self._stack = []        # 容器栈：'obj' / 'arr'
+        self._state = "start"   # start/obj/key/colon/value/str/esc/uni/arr/arr_str/end
+        self._key = ""
+        self._in_target = False
+        self._esc = ""
+
+    def feed(self, text: str) -> str:
+        """输入 JSON 增量片段，返回本段内可安全输出的目标字段文本。"""
+        out = []
+        for ch in text:
+            self._step(ch, out)
+        return "".join(out)
+
+    def _container(self):
+        # 栈顶容器对应的等待状态：对象等 key，数组等元素
+        return "obj" if self._stack[-1] == "obj" else "arr"
+
+    def _close_container(self):
+        # 弹出当前容器并返回外层等待状态（栈空则结束）
+        self._stack.pop()
+        return "end" if not self._stack else self._container()
+
+    def _step(self, ch, out):
+        st = self._state
+        if st == "start":
+            if ch == "{":
+                self._stack.append("obj")
+                self._state = "obj"
+        elif st == "obj":
+            if ch == '"':
+                self._key = ""
+                self._state = "key"
+            elif ch == "}":
+                self._state = self._close_container()
+        elif st == "key":
+            if ch == "\\":
+                self._state = "key_esc"
+            elif ch == '"':
+                self._state = "colon"
+            else:
+                self._key += ch
+        elif st == "key_esc":
+            self._key += ch
+            self._state = "key"
+        elif st == "colon":
+            if ch == ":":
+                self._state = "value"
+        elif st == "value":
+            if ch == '"':
+                self._in_target = (len(self._stack) == 1 and self._stack[-1] == "obj" and self._key == self._field)
+                self._state = "str"
+            elif ch == "{":
+                self._stack.append("obj")
+                self._state = "obj"
+            elif ch == "[":
+                self._stack.append("arr")
+                self._state = "arr"
+            elif ch == ",":
+                self._state = self._container()
+            elif ch in "}]":
+                self._state = self._close_container()
+        elif st == "str":
+            if ch == "\\":
+                self._state = "esc"
+                self._esc = ""
+            elif ch == '"':
+                self._in_target = False
+                self._state = "end"
+            elif self._in_target:
+                out.append(ch)
+        elif st == "esc":
+            if ch == "u":
+                self._state = "uni"
+                self._esc = ""
+            else:
+                if self._in_target:
+                    out.append(self._ESC_MAP.get(ch, "\\" + ch))
+                self._state = "str"
+        elif st == "uni":
+            self._esc += ch
+            if len(self._esc) == 4:
+                if self._in_target:
+                    try:
+                        out.append(chr(int(self._esc, 16)))
+                    except Exception:
+                        out.append("?")
+                self._state = "str"
+        elif st == "arr":
+            if ch == '"':
+                self._state = "arr_str"
+            elif ch == "{":
+                self._stack.append("obj")
+                self._state = "obj"
+            elif ch == "[":
+                self._stack.append("arr")
+                self._state = "arr"
+            elif ch == "]":
+                self._state = self._close_container()
+            # 数组元素间逗号/字面量忽略
+        elif st == "arr_str":
+            if ch == "\\":
+                self._state = "arr_str_esc"
+            elif ch == '"':
+                self._state = "arr"
+        elif st == "arr_str_esc":
+            self._state = "arr_str"
+        elif st == "end":
+            if ch == ",":
+                self._state = self._container()
+            elif ch in "}]":
+                self._state = self._close_container()
+
+
 class ThinkingStreamChatModel(BaseChatModel):
     """思考流式 ChatModel：流式捕获 reasoning_content 推送前端，返回标准 AIMessage。"""
     model: str = Field(default="")
     extra_body: dict | None = Field(default=None)
+    answer_field: str = Field(default="", description="最终回答流式：结构化 JSON 中该字段的文本在生成中实时推前端")
     _client: OpenAI = PrivateAttr()
 
-    def __init__(self, api_key: str, base_url: str, model: str, extra_body=None, callbacks=None):
-        super().__init__(model=model, extra_body=extra_body or None, callbacks=callbacks)
+    def __init__(self, api_key: str, base_url: str, model: str, extra_body=None, callbacks=None, answer_field=""):
+        super().__init__(model=model, extra_body=extra_body or None, callbacks=callbacks,
+                         answer_field=answer_field)
         # OpenAI 客户端实例不作为 pydantic 字段，仅保存为私有属性
         self._client = OpenAI(api_key=api_key, base_url=base_url)
 
@@ -149,6 +276,9 @@ class ThinkingStreamChatModel(BaseChatModel):
         stream_reasoning = get_llm_stream_reasoning()
         reasoning_sid = f"reasoning-{os.urandom(3).hex()}"
         content_parts = []
+        # 最终回答流式：从生成中的 JSON 增量提取指定字段（如 respond_text），实时推前端
+        stream_answer = bool(self.answer_field) and get_stream_output_enabled() and bus is not None
+        json_streamer = _JsonFieldStreamer(self.answer_field) if stream_answer else None
         # 流式工具调用增量按 index 累积（function calling / structured output）
         tool_calls_acc = {}
         response = self._client.chat.completions.create(**request)
@@ -166,6 +296,11 @@ class ThinkingStreamChatModel(BaseChatModel):
             content = getattr(delta, "content", None) or ""
             if content:
                 content_parts.append(content)
+                if json_streamer is not None:
+                    # 已确认可输出的目标字段文本增量：实时推前端回答区
+                    piece = json_streamer.feed(content)
+                    if piece:
+                        bus.emit_token("answer", piece, live=True)
             delta_tool_calls = getattr(delta, "tool_calls", None) or []
             for tc in delta_tool_calls:
                 acc = tool_calls_acc.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})

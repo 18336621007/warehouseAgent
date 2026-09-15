@@ -162,6 +162,9 @@ async function sendMsg() {
         pendingFinalContent: null,  // done 提前到达时暂存的最终内容
         finalizeAfterTypewriter: false,  // 请求结束后等待打字机播完再保存消息
         doneReceived: false,  // 本轮业务已结束（收到 done/error），输入框可解锁
+        thinkStartAt: 0,  // 思考计时起点（ms）
+        thinkTimer: null,  // 思考计时器句柄
+        thinkingSeconds: 0,  // 思考总耗时（秒），固化时保存
     };
     lockInput(true);
     hideEmpty();
@@ -208,6 +211,11 @@ async function sendMsg() {
                     } else if (event.type === "token") {
                         // 思考/回答逐字流式增量：思考按流式段落追加，回答追加到预览区
                         if (event.scope === "answer") {
+                            // 最终回答开始流式：停止思考计时并切换状态
+                            if (pend.thinkTimer) stopThinkTimer(pend);
+                            if (pend.status === "AI 正在思考..." || pend.status.indexOf("思考") >= 0) {
+                                pend.status = "正在生成回答";
+                            }
                             if (event.live === true) {
                                 // 实时 token：直接追加
                                 pend.content += event.text;
@@ -241,6 +249,7 @@ async function sendMsg() {
                         updatePendingMessage(reqConv);
                     } else if (event.type === "done") {
                         pend.doneReceived = true;
+                        if (pend.thinkTimer) stopThinkTimer(pend);
                         if (pend.answerTimer) {
                             // 打字机未播完：暂存最终内容，并设 5 秒硬上限兜底固化消息
                             pend.pendingFinalContent = event.content;
@@ -257,6 +266,7 @@ async function sendMsg() {
                         pend.dialogue_id = event.dialogue_id || 0;
                     } else if (event.type === "error") {
                         pend.doneReceived = true;
+                        if (pend.thinkTimer) stopThinkTimer(pend);
                         flushAnswerTypewriter(pend);
                         var errorIdText = event.error_id
                             ? "\n错误编号：" + event.error_id
@@ -299,6 +309,7 @@ function finalizePendingRequest(convId, pend) {
         role: "assistant", content: pend.content || "(无响应)", sql: pend.sql,
         thinking: pend.thinking, evaluator: pend.evaluator, dialogue_id: pend.dialogue_id,
         request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
+        thinkingSeconds: pend.thinkingSeconds || 0,
     };
     if (conv) conv.messages.push(savedMsg);
     delete pendingRequests[convId];
@@ -373,6 +384,28 @@ function flushAnswerTypewriter(pend) {
     }
 }
 
+function startThinkTimer(pend) {
+    // 思考计时：每秒刷新思考按钮上的已耗时，仿照 codex 展示思考时长
+    if (pend.thinkTimer || pend.thinkingSeconds) return;
+    pend.thinkStartAt = Date.now();
+    pend.thinkTimer = setInterval(function () {
+        if (conversationId && pendingRequests[conversationId] === pend) {
+            updatePendingMessage(conversationId);
+        }
+    }, 1000);
+}
+
+function stopThinkTimer(pend) {
+    // 停止思考计时并定格总耗时（供固化消息展示）
+    if (pend.thinkTimer) {
+        clearInterval(pend.thinkTimer);
+        pend.thinkTimer = null;
+    }
+    if (pend.thinkStartAt) {
+        pend.thinkingSeconds = Math.max(1, Math.round((Date.now() - pend.thinkStartAt) / 1000));
+    }
+}
+
 function appendPendingMessage(convId) {
     // 在当前会话消息流内追加“AI 正在思考”占位消息（ChatGPT 形式）
     var area = $("chatArea"); if (!area) return;
@@ -428,6 +461,8 @@ function appendPendingMessage(convId) {
     }
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
     area.appendChild(wrapper); area.scrollTop = area.scrollHeight;
+    // 请求未结束且未定格耗时前，启动思考计时
+    if (!pend.doneReceived && !pend.thinkingSeconds) startThinkTimer(pend);
 }
 
 function updatePendingMessage(convId) {
@@ -449,6 +484,16 @@ function updatePendingMessage(convId) {
     if (answerEl) {
         answerEl.innerHTML = formatContent(pend.content);
         answerEl.style.display = pend.content ? "block" : "none";
+    }
+    // 思考按钮：计时中显示"思考中 Xs"，结束后定格"查看思考过程（Xs）"
+    var thinkBtn = wrapper.querySelector(".collapse-btn");
+    if (thinkBtn) {
+        if (pend.thinkTimer) {
+            var secs = Math.floor((Date.now() - pend.thinkStartAt) / 1000);
+            thinkBtn.innerHTML = '<span class="arrow">▼</span> 思考中 ' + secs + 's';
+        } else if (pend.thinkingSeconds) {
+            thinkBtn.innerHTML = '<span class="arrow">▼</span> 查看思考过程（' + pend.thinkingSeconds + 's）';
+        }
     }
     // 消息区：随内容增长自动滚动，用户上翻历史时保持不动
     if (area && !area._userScrolledUp) area.scrollTop = area.scrollHeight;
@@ -478,7 +523,9 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         var open1 = thinkingOpen !== false;
         cc1.classList.toggle("show", open1);
         btn1.classList.toggle("open", open1);
-        btn1.innerHTML = '<span class="arrow">' + (open1 ? "▼" : "▶") + '</span> 查看思考过程';
+        var thinkLabel = "查看思考过程"
+            + (msgObj && msgObj.thinkingSeconds ? "（" + msgObj.thinkingSeconds + "s）" : "");
+        btn1.innerHTML = '<span class="arrow">' + (open1 ? "▼" : "▶") + '</span> ' + thinkLabel;
         btn1.onclick = function () {
             var wasOpen = cc1.classList.contains("show"); cc1.classList.toggle("show");
             btn1.classList.toggle("open"); btn1.querySelector(".arrow").textContent = wasOpen ? "▶" : "▼";

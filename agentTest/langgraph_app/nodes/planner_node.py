@@ -252,6 +252,8 @@ def build_planner_node(runtime):
         model=get_model_name(),
         extra_body=get_model_extra_body(),
         callbacks=[build_llm_logging_handler("planner")],
+        # 最终回答流式：structured 定稿生成 JSON 时实时提取 respond_text 推前端
+        answer_field="respond_text",
     )
     # with_structured_output：结构化方式由配置 LLM_STRUCTURED_OUTPUT_METHOD 驱动
     # （qwen thinking 模式用 json_mode/response_format，自定义 ChatModel 统一处理）
@@ -266,6 +268,8 @@ def build_planner_node(runtime):
         model=get_llm_fast_model(),
         extra_body=get_llm_fast_extra_body(),
         callbacks=[build_llm_logging_handler("planner_fast")],
+        # 最终回答流式：结构化定稿生成 JSON 时实时提取 respond_text 推前端
+        answer_field="respond_text",
     )
     structured_llm_fast = chat_openai_fast.with_structured_output(PlannerOutput)
 
