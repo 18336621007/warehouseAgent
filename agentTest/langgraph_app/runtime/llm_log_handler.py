@@ -8,6 +8,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 from agentTest.config import log_config
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
+from agentTest.langgraph_app.runtime.graph_logger import add_llm_usage
 from agentTest.langgraph_app.runtime.graph_logger import log_llm_call
 from agentTest.langgraph_app.runtime.graph_logger import log_llm_error
 from agentTest.langgraph_app.runtime.graph_logger import log_llm_response
@@ -109,6 +110,16 @@ class GraphLLMHandler(BaseCallbackHandler):
                 output += generation.text or ""
         llm_output = response.llm_output or {}
         token_usage = llm_output.get("token_usage") or {}
+        # 缓存命中/未命中：prompt_tokens_details.cached_tokens 为命中部分，未命中 = 输入 - 命中
+        ptd = token_usage.get("prompt_tokens_details") or {}
+        if hasattr(ptd, "model_dump"):
+            ptd = ptd.model_dump()
+        if not isinstance(ptd, dict):
+            ptd = {}
+        cache_hit = int(ptd.get("cached_tokens") or 0)
+        prompt_tokens = int(token_usage.get("prompt_tokens") or 0)
+        completion_tokens = int(token_usage.get("completion_tokens") or 0)
+        cache_miss = max(0, prompt_tokens - cache_hit)
         log_llm_response(
             start["caller"],
             start["model"],
@@ -118,9 +129,19 @@ class GraphLLMHandler(BaseCallbackHandler):
                 "prompt_tokens": token_usage.get("prompt_tokens"),
                 "completion_tokens": token_usage.get("completion_tokens"),
                 "total_tokens": token_usage.get("total_tokens"),
+                "cache_hit": cache_hit,
+                "cache_miss": cache_miss,
             },
             call_id=run_id,
         )
+        if prompt_tokens or completion_tokens:
+            # 请求级 token 汇总：统一在日志回调聚合，避免各模型重复计数
+            add_llm_usage(
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                cache_hit=cache_hit,
+                cache_miss=cache_miss,
+            )
 
     def on_llm_error(self, error, *, run_id, **kwargs):
         if not log_config.LOG_LLM_ENABLED:

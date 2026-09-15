@@ -53,6 +53,10 @@ _EVENT_CATEGORY = {
 _LLM_CALL_COUNTS: dict = {}
 _LLM_CALL_LOCK = threading.Lock()
 
+# 请求级 LLM token 用量聚合（input/output/cache_hit/cache_miss），供日志与前端展示
+_LLM_TOKEN_USAGE: dict = {}
+_LLM_TOKEN_LOCK = threading.Lock()
+
 # 保存当前请求的日志身份，不同并发请求之间相互隔离
 _LOG_CONTEXT = ContextVar(
     "graph_log_context",
@@ -390,7 +394,9 @@ def log_request_end(**kwargs):
     # 请求级摘要：调用方补充节点数等统计，LLM 调用次数由日志层自动统计
     summary = dict(kwargs.pop("summary", {}) or {})
     summary.setdefault("llm_calls", get_llm_call_count())
+    summary.setdefault("llm_tokens", get_llm_token_usage())
     clear_llm_call_count()
+    clear_llm_token_usage()
     _write_log(
         logging.INFO,
         "request.completed",
@@ -588,6 +594,44 @@ def clear_llm_call_count():
         return
     with _LLM_CALL_LOCK:
         _LLM_CALL_COUNTS.pop(request_id, None)
+
+
+def add_llm_usage(input_tokens=0, output_tokens=0, cache_hit=0, cache_miss=0, reasoning_tokens=0):
+    # 累加当前请求的 LLM token 用量（按 request_id 聚合，跨线程安全）
+    request_id = _current_request_id()
+    if not request_id:
+        return
+    with _LLM_TOKEN_LOCK:
+        acc = _LLM_TOKEN_USAGE.setdefault(request_id, {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_hit": 0,
+            "cache_miss": 0,
+            "reasoning_tokens": 0,
+        })
+        acc["input_tokens"] += int(input_tokens or 0)
+        acc["output_tokens"] += int(output_tokens or 0)
+        acc["cache_hit"] += int(cache_hit or 0)
+        acc["cache_miss"] += int(cache_miss or 0)
+        acc["reasoning_tokens"] += int(reasoning_tokens or 0)
+
+
+def get_llm_token_usage():
+    # 返回当前请求的 LLM token 汇总（无则空字典）
+    request_id = _current_request_id()
+    if not request_id:
+        return {}
+    with _LLM_TOKEN_LOCK:
+        return dict(_LLM_TOKEN_USAGE.get(request_id) or {})
+
+
+def clear_llm_token_usage():
+    # 请求结束后清理 token 聚合，避免内存增长
+    request_id = _current_request_id()
+    if not request_id:
+        return
+    with _LLM_TOKEN_LOCK:
+        _LLM_TOKEN_USAGE.pop(request_id, None)
 
 
 def _plan_summary(plan):

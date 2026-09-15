@@ -263,6 +263,8 @@ class ThinkingStreamChatModel(BaseChatModel):
             "messages": oai_messages,
             "temperature": float(kwargs.get("temperature", 0)),
             "stream": True,
+            # 流式请求在最后一个 chunk 返回 usage，用于 token 消耗统计（含缓存命中）
+            "stream_options": {"include_usage": True},
         }
         if self.extra_body:
             request["extra_body"] = self.extra_body
@@ -281,8 +283,12 @@ class ThinkingStreamChatModel(BaseChatModel):
         json_streamer = _JsonFieldStreamer(self.answer_field) if stream_answer else None
         # 流式工具调用增量按 index 累积（function calling / structured output）
         tool_calls_acc = {}
+        usage = None
         response = self._client.chat.completions.create(**request)
         for chunk in response:
+            if getattr(chunk, "usage", None) is not None:
+                # 流式 usage 仅在末尾 chunk 返回（需 stream_options.include_usage），保存最后一个
+                usage = chunk.usage
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -312,6 +318,14 @@ class ThinkingStreamChatModel(BaseChatModel):
                     acc["arguments"] += tc.function.arguments
 
         content = "".join(content_parts)
+        llm_output = None
+        if usage is not None:
+            # 提取 token 用量（含缓存命中明细），供 llm.response 日志与请求级汇总
+            try:
+                usage_dump = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
+            except Exception:
+                usage_dump = {}
+            llm_output = {"token_usage": usage_dump}
         ai_kwargs = {}
         if tool_calls_acc:
             tool_calls = []
@@ -329,4 +343,4 @@ class ThinkingStreamChatModel(BaseChatModel):
                 })
             ai_kwargs["tool_calls"] = tool_calls
         message = AIMessage(content=content or "", **ai_kwargs)
-        return ChatResult(generations=[ChatGeneration(message=message)])
+        return ChatResult(generations=[ChatGeneration(message=message)], llm_output=llm_output)

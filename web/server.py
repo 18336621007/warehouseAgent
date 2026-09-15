@@ -14,6 +14,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_request_end
 from agentTest.langgraph_app.runtime.graph_logger import log_request_error
 from agentTest.langgraph_app.runtime.graph_logger import log_request_start
 from agentTest.langgraph_app.runtime.graph_logger import log_state_change
+from agentTest.langgraph_app.runtime.graph_logger import get_llm_token_usage
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
@@ -190,7 +191,7 @@ def chat():
                     ms=elapsed_ms(request_timer),
                 )
                 # chat 快速回复为短文本，直接 done 一次性下发（不走 planner 定稿，无真流式）
-                yield _sse_req({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0})
+                yield _sse_req({"type": "done", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "dialogue_id": 0, "llm_tokens": {}})
                 return
 
         state_input = {
@@ -320,12 +321,15 @@ def chat():
                 else None
             )
 
+            # 请求级 LLM token 汇总（在 log_request_end 清理聚合器之前读取）
+            llm_tokens = get_llm_token_usage()
             session["messages"].append({"role": "user", "content": message})
             session["messages"].append({
                 "role": "assistant", "content": final_answer, "sql": display_sql,
                 "thinking": "\n".join(thinking_parts),
                 "dialogue_id": dialogue_id if has_evaluator else 0,
                 "evaluator": evaluator_payload,
+                "llm_tokens": llm_tokens,
             })
 
             # ── 去 Topic 化：不再按 new_query / 异常终态切换 Topic，
@@ -349,6 +353,7 @@ def chat():
                 "thinking": "\n".join(thinking_parts),
                 "evaluator": evaluator_payload,
                 "dialogue_id": dialogue_id if has_evaluator else 0,
+                "llm_tokens": llm_tokens,
             })
         except Exception as error:
             error_id = uuid.uuid4().hex

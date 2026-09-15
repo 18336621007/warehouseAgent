@@ -165,6 +165,7 @@ async function sendMsg() {
         thinkStartAt: 0,  // 思考计时起点（ms）
         thinkTimer: null,  // 思考计时器句柄
         thinkingSeconds: 0,  // 思考总耗时（秒），固化时保存
+        llmTokens: null,  // 本轮 LLM token 消耗汇总（输入/输出/缓存命中/未命中）
     };
     lockInput(true);
     hideEmpty();
@@ -264,6 +265,7 @@ async function sendMsg() {
                         pend.sql = event.sql;
                         pend.evaluator = event.evaluator;
                         pend.dialogue_id = event.dialogue_id || 0;
+                        pend.llmTokens = event.llm_tokens || null;
                     } else if (event.type === "error") {
                         pend.doneReceived = true;
                         if (pend.thinkTimer) stopThinkTimer(pend);
@@ -310,6 +312,7 @@ function finalizePendingRequest(convId, pend) {
         thinking: pend.thinking, evaluator: pend.evaluator, dialogue_id: pend.dialogue_id,
         request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
         thinkingSeconds: pend.thinkingSeconds || 0,
+        llm_tokens: pend.llmTokens || null,
     };
     if (conv) conv.messages.push(savedMsg);
     delete pendingRequests[convId];
@@ -505,6 +508,13 @@ function removePendingMessage(convId) {
     if (wrapper) wrapper.remove();
 }
 
+function fmtNum(n) {
+    // token 数字千分位格式化（非数字返回原值）
+    var v = Number(n);
+    if (isNaN(v)) return String(n == null ? "0" : n);
+    return v.toLocaleString("en-US");
+}
+
 function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requestId, thinkingOpen, msgObj) {
     var area = $("chatArea"); if (!area) return;
     var wrapper = document.createElement("div"); wrapper.className = "msg " + role;
@@ -552,6 +562,16 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         rid.textContent = "request_id: " + requestId;
         rid.title = "复制该编号到 trace_view.py 查看本次查询日志";
         bubble.appendChild(rid);
+    }
+
+    // token 消耗展示：输入/输出/缓存命中/未命中（历史消息从 msgObj 读取）
+    if (role === "assistant" && msgObj && msgObj.llm_tokens) {
+        var tu = msgObj.llm_tokens;
+        var tEl = document.createElement("div");
+        tEl.className = "token-usage";
+        tEl.textContent = "⚡️ 输入总Token：" + fmtNum(tu.input_tokens) + " | 输出总Token: " + fmtNum(tu.output_tokens)
+            + " | 缓存命中：" + fmtNum(tu.cache_hit) + " | 缓存未命中：" + fmtNum(tu.cache_miss);
+        bubble.appendChild(tEl);
     }
 
     if (role === "assistant" && evaluator) {
