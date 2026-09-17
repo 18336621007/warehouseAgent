@@ -26,3 +26,8 @@ PROBE_VALUES_LIMIT_MAX = 50
 
 # M3/A1：单次用户输入内 Planner 发起 execute 的最大轮次（执行完回看后再查），防死循环
 MAX_EXECUTION_ROUNDS = 3
+
+# 上下文压缩阈值（字符数）：Planner 工具轮消息累计超过后，把早期轮次压缩为结构化摘要，防 prompt 膨胀
+PLANNER_CONTEXT_COMPACT_CHARS = 12000
+# 压缩时保留的最近完整工具轮数（更早的轮次替换为摘要）
+PLANNER_CONTEXT_KEEP_ROUNDS = 3

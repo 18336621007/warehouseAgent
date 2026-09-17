@@ -1,5 +1,6 @@
 # execute_query 工具单元测试：把 Seeker 执行链封装为一次工具调用
 # 覆盖：metric_id 解析 / grep 兜底 / 结果摘要（成功预览、0 行提示、方案不可行、未命中指标）
+import json
 import unittest
 from unittest import mock
 
@@ -161,6 +162,119 @@ class ExecuteQueryToolTest(unittest.TestCase):
         self.assertEqual(kwargs.get("metric_source"), "metric_id")
         self.assertEqual(kwargs.get("tier"), "unique")
         self.assertIn("addition_order_num", kwargs.get("metric_ids", []))
+
+    def test_multi_steps_serial_execution(self):
+        """steps 多段串行：每段独立 request_id，Seeker 调用次数=段数，返回各段摘要。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        steps = json.dumps([
+            {"id": "s1", "question": "昨天新增订单数", "metric_id": "addition_order_num", "filters": "", "dimensions": ""},
+            {"id": "s2", "question": "新增订单 昨天", "metric_id": "", "filters": "", "dimensions": ""},
+        ])
+        out = tool.invoke({"question": "", "steps": steps})
+        self.assertEqual(len(seeker.calls), 2)
+        # 每段独立 request_id：落盘 result_id / CSV 文件名唯一，可被 query_stored_result 分别引用
+        rids = [c.get("request_id") for c in seeker.calls]
+        self.assertEqual(rids[0], "req-1_s1")
+        self.assertEqual(rids[1], "req-1_s2")
+        self.assertIn("已串行执行多段查询", out)
+        self.assertIn("[s1]", out)
+        self.assertIn("[s2]", out)
+        self.assertIn("查询成功", out)
+
+    def test_multi_steps_saves_script_meta(self):
+        """多段串行：保存查询脚本元数据（每段定义 + SQL + 结果引用），供审计与按段引用。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        steps = json.dumps([
+            {"id": "s1", "question": "昨天新增订单数", "metric_id": "addition_order_num", "filters": "pt_dt='2026-09-15'", "dimensions": "company_name"},
+        ])
+        with mock.patch("agentTest.langgraph_app.services.result_store.save_query_script") as mocked:
+            tool.invoke({"question": "", "steps": steps})
+        self.assertTrue(mocked.called)
+        args = mocked.call_args[0]
+        self.assertEqual(args[0], "conv1")       # conversation_id
+        self.assertEqual(args[1], "req-1")       # base request_id
+        self.assertEqual(len(args[2]), 1)        # 一段 step_info
+        step = args[2][0]
+        self.assertEqual(step["step_id"], "s1")
+        self.assertEqual(step["result_id"], "rid-1")
+
+    def test_steps_parse_error_returns_guidance(self):
+        """steps 非空但解析失败：返回引导文案，不调用 Seeker。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        out = tool.invoke({"question": "", "steps": "not-a-json"})
+        self.assertIn("steps 解析失败", out)
+        self.assertEqual(len(seeker.calls), 0)
+
+    def test_steps_fallback_to_single_when_empty(self):
+        """steps 为空时保持单段逻辑：向后兼容，不新增 Seeker 调用。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        out = tool.invoke({"question": "新增订单 昨天"})
+        self.assertEqual(len(seeker.calls), 1)
+        self.assertEqual(seeker.calls[0].get("request_id"), "req-1")
+        self.assertIn("查询成功", out)
+
+    def test_steps_same_source_metrics_merge_one_sql(self):
+        """同表多指标：metric_ids 合并到一个 step，Seeker 只调用 1 次（一条多列聚合 SQL）。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        steps = json.dumps([{
+            "id": "s1", "question": "昨天租赁中、月租、逾期>30天、滞纳订单数",
+            "metric_ids": "renting_order_num,month_renting_order_num,overdue_gt30_order_num,stag_order_num",
+            "filters": "pt_dt='2026-09-15'", "dimensions": "",
+        }])
+        out = tool.invoke({"question": "", "steps": steps})
+        self.assertEqual(len(seeker.calls), 1)
+        self.assertEqual(seeker.calls[0].get("request_id"), "req-1_s1")
+        plan = seeker.calls[0].get("confirmed_plan") or {}
+        measures = plan.get("measures") or []
+        self.assertEqual(len(measures), 4)
+        self.assertIn("rent_order_counts", measures)
+        self.assertIn("month_renting_order_counts", measures)
+        self.assertIn("overdue30_days_rents", measures)
+        self.assertIn("stag_order_counts", measures)
+
+    def test_steps_diff_source_metrics_split_groups(self):
+        """异表多指标：按来源表自动拆组串行执行，每组独立 request_id。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        steps = json.dumps([{
+            "id": "s2", "question": "租赁中订单数和库存电池数",
+            "metric_ids": "renting_order_num,battery_stock_num",
+            "filters": "pt_dt='2026-09-15'", "dimensions": "",
+        }])
+        out = tool.invoke({"question": "", "steps": steps})
+        self.assertEqual(len(seeker.calls), 2)
+        rids = [c.get("request_id") for c in seeker.calls]
+        self.assertEqual(rids, ["req-1_s2_g1", "req-1_s2_g2"])
+
+    def test_dimensional_measure_resolves_via_dimension(self):
+        """dimensional_measures 子口径：dimension 传入（如“激活电柜”）时解析 {field} 为真实字段。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        steps = json.dumps([{
+            "id": "s3", "question": "激活电柜数", "metric_id": "cabinet_active_num",
+            "filters": "pt_dt='2026-09-15'", "dimensions": "", "dimension": "激活电柜",
+        }])
+        out = tool.invoke({"question": "", "steps": steps})
+        self.assertEqual(len(seeker.calls), 1)
+        plan = seeker.calls[0].get("confirmed_plan") or {}
+        self.assertEqual(plan.get("measures") or [], ["active_cabinet_num"])
+
+    def test_dimensional_measure_without_dimension_fails(self):
+        """dimensional_measures 子口径：未传 dimension 时 {field} 无法解析，方案构建失败且不调用 Seeker。"""
+        seeker = _FakeSeekerGraph(_success_result())
+        tool = build_execute_query_tool(_runtime(), seeker)
+        steps = json.dumps([{
+            "id": "s4", "question": "激活电柜数", "metric_id": "cabinet_active_num",
+            "filters": "pt_dt='2026-09-15'", "dimensions": "", "dimension": "",
+        }])
+        out = tool.invoke({"question": "", "steps": steps})
+        self.assertEqual(len(seeker.calls), 0)
+        self.assertIn("方案构建失败", out)
 
 
 if __name__ == "__main__":

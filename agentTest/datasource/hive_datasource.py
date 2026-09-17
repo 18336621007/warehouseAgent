@@ -5,6 +5,7 @@ from pyhive import hive
 # Hive 数据源，负责真正执行 SQL 和底层超时控制
 class HiveDataSource(BaseDataSource):
     # Hive 数据源实现，后续负责执行真实只读查询
+    engine = "hive"
 
     def __init__(self):
         self.config = get_hive_config()

@@ -1,7 +1,6 @@
 ﻿from agentTest.db.hive_guardrails import MAX_RESULT_ROWS, QUERY_TIMEOUT_SECONDS
 from agentTest.langchain_app.utils.sql_cleaner import clear_sql
 from agentTest.validate.sql_validate import is_read_only_sql, validate_hive_sql
-from agentTest.datasource.hive_datasource import HiveDataSource
 from agentTest.db.hive_guardrails import MAX_RESULT_ROWS, QUERY_TIMEOUT_SECONDS, validate_sql_with_guardrails
 
 # SQL 查询工具，负责统一执行只读 SQL
@@ -34,19 +33,18 @@ class SQLQueryTool:
         if not is_valid:
             raise ValueError(f"illegal sql: {message}")
 
-        if isinstance(self.datasource, HiveDataSource):
-            # 先做 Hive 基础校验
-            is_valid, message = validate_hive_sql(sql)
-            if not is_valid:
-                raise ValueError(f"illegal hive sql: {message}")
+        # 统一安全校验（Hive/Trino/Doris 共用同一套底线：只读 + LIMIT/JOIN 开关 + 白名单 + select * 门禁 + 分区过滤）
+        is_valid, message = validate_hive_sql(sql)
+        if not is_valid:
+            raise ValueError(f"illegal sql: {message}")
 
-             # 再做 AST Guardrails 资源保护校验
-            # partition_fields 允许调用方透传方案时间/分区字段（如明细表无 pt_dt 时用 create_time），
-            # 未传时回退默认 pt_dt（与 hive_guardrails.PARTITION_FIELDS 一致）。
-            partition_fields = args.get("partition_fields")
-            is_valid, message = validate_sql_with_guardrails(sql, partition_fields=partition_fields)
-            if not is_valid:
-                raise ValueError(f"illegal hive sql: {message}")
+        # 再做 AST Guardrails 资源保护校验
+        # partition_fields 允许调用方透传方案时间/分区字段（如明细表无 pt_dt 时用 create_time），
+        # 未传时回退默认 pt_dt（与 hive_guardrails.PARTITION_FIELDS 一致）。
+        partition_fields = args.get("partition_fields")
+        is_valid, message = validate_sql_with_guardrails(sql, partition_fields=partition_fields)
+        if not is_valid:
+            raise ValueError(f"illegal sql: {message}")
 
         # 底层 datasource 负责真正执行查询并返回结构化结果
         return self.datasource.query(

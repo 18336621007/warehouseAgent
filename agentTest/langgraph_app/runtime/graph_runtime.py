@@ -16,6 +16,10 @@ from agentTest.langchain_app.app_builder import build_table_rag
 from agentTest.langchain_app.app_builder import build_bm25_rag
 from agentTest.langgraph_app.services.query_plan_schema_resolver import QueryPlanSchemaResolver
 from agentTest.metadata.hive_meta_provider import HiveMetadataProvider
+from agentTest.metadata.multi_source_meta_provider import MultiSourceMetadataProvider
+from agentTest.datasource.registry import DataSourceRegistry
+from agentTest.datasource.doris_datasource import DorisDataSource
+from agentTest.datasource.trino_datasource import TrinoDataSource
 from agentTest.langgraph_app.services.whitelist_filtered_store import WhitelistFilteredVectorStore
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 from agentTest.langgraph_app.skills.skill_loader import build_skill_manager
@@ -40,7 +44,9 @@ def build_graph_runtime():
     init_evaluator_table()
 
     # Provider 由 Runtime 统一创建，Tools 和 Resolver 共享缓存
-    metadata_provider = HiveMetadataProvider()
+    # 多源元数据：主通道 Hive（表清单/字段结构），Hive 查不到时兜底语义层 physical（如 data_project 天数池表）
+    semantic_metadata_provider = SemanticMetadataProvider()
+    metadata_provider = MultiSourceMetadataProvider(HiveMetadataProvider(), semantic_metadata_provider)
     tools = build_langchain_tools(
         meta_provider=metadata_provider,
     )
@@ -89,7 +95,12 @@ def build_graph_runtime():
     # 参考 Codex：查不到数据返回用 LIKE 确认具体值，而不是依赖元数据采样猜测
     from agentTest.datasource.hive_datasource import HiveDataSource
     from agentTest.langgraph_app.tools.probe_values_tool import build_probe_values_tool
-    probe_values_tool = build_probe_values_tool(HiveDataSource(), metadata_provider)
+    # 引擎执行器注册表：查询/值探查按表路由（data_project -> doris，其余 -> trino 优先/hive 兜底）
+    datasource_registry = DataSourceRegistry()
+    datasource_registry.register("hive", HiveDataSource())
+    datasource_registry.register("doris", DorisDataSource())
+    datasource_registry.register("trino", TrinoDataSource())
+    probe_values_tool = build_probe_values_tool(HiveDataSource(), metadata_provider, engine_registry=datasource_registry)
     tool_registry.register(ToolSpec(
         name="probe_values",
         description=probe_values_tool.description,
@@ -177,7 +188,8 @@ def build_graph_runtime():
         "field_type_map_simple": field_type_map_simple,  # 兜底 {col: measure|dimension}
         "sample_values_map": sample_values_map,  # 字段枚举值 {db.table.col: [values]}
         "sample_values_map_simple": sample_values_map_simple,  # 兜底 {col: [values]}
-        "semantic_metadata_provider": SemanticMetadataProvider(),  # join关系
+        "semantic_metadata_provider": semantic_metadata_provider,  # join关系
+        "datasource_registry": datasource_registry,  # 引擎注册表：按表路由查询/值探查引擎
         # 通用 skill 管理器：Planner 渐进式披露（注入 name+description 索引，正文由 read_skill 按需读取）
         "skill_manager": skill_manager,
     }

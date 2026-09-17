@@ -5,10 +5,11 @@
 # 多数据源/并行预留：内部按 confirmed_plan 的 engine 取数据源（当前默认 hive），
 # 工具执行器预留多 tool_calls 并行（当前串行）。
 import re
+import json
 from contextvars import ContextVar
 
 from langchain.tools import tool
-from agentTest.semantic_layer.metric_matcher import grep_metrics_from_keywords
+from agentTest.semantic_layer.metric_matcher import grep_metric_files_from_keywords
 from agentTest.langgraph_app.services.plan_synthesizer import build_plan_from_semantic
 from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 from agentTest.config.semantic import (
@@ -96,6 +97,38 @@ def _log_metric_hit(metric_hits, question, metric_source):
     return ordered
 
 
+def _parse_steps(steps) -> list:
+    """把 steps 参数解析为子查询列表：接受 JSON 数组字符串或 list，非法返回空列表。"""
+    if isinstance(steps, (list, tuple)):
+        return [s for s in steps if isinstance(s, dict)]
+    try:
+        data = json.loads(str(steps or "").strip())
+    except Exception:
+        return []
+    return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
+
+
+def _parse_step_metric_ids(step: dict) -> list[str]:
+    """从 step 解析指标 id 列表：兼容 metric_ids（逗号分隔/JSON 数组）与 metric_id。"""
+    ids = []
+    _raw = step.get("metric_ids")
+    if _raw:
+        if isinstance(_raw, (list, tuple)):
+            ids = [str(x) for x in _raw if str(x).strip()]
+        else:
+            _text = str(_raw).strip()
+            if _text.startswith("["):
+                try:
+                    ids = [str(x) for x in json.loads(_text) if str(x).strip()]
+                except Exception:
+                    ids = [x.strip() for x in _text.strip("[]").split(",")]
+            else:
+                ids = [x.strip() for x in _text.split(",")]
+    if not ids and step.get("metric_id"):
+        ids = [str(step.get("metric_id"))]
+    return [x for x in ids if x]
+
+
 def _build_result_summary(result_state: dict) -> str:
     """把执行链返回状态组装成给 Agent 的结果摘要（成功预览 / 0 行 / 失败原因）。"""
     plan_error = str(result_state.get("seeker_plan_error") or "")
@@ -130,42 +163,43 @@ def build_execute_query_tool(runtime, seeker_graph):
     """构建查数工具：持有编译好的 Seeker 子图，内部同步执行并返回结果摘要。"""
     semantic_provider = runtime["semantic_metadata_provider"]
 
-    @tool
-    def execute_query(question: str, metric_id: str = "", filters: str = "", dimensions: str = "") -> str:
-        """执行一次数据查询并返回结果摘要（列 + 预览行 + 行数 + 全量 CSV 路径）。
+    def _run_single(question, metric_ids, filters, dimensions, dimension, request_id):
+        """执行单个子查询：语义层定位 → 方案构建 → Seeker 子图 → 结果摘要。
 
-        需要查数时调用；多指标可分多次调用（并行预留）。参数：
-        - question：查询意图（如"查询徐州大区今年同意返厂的返厂明细"）
-        - metric_id：语义层指标 id（可选，先用 search_semantic 确认后传入更准）
-        - filters：过滤条件（如"region_name='徐州大区' AND status='同意返厂'"），时间用 yyyy-MM-dd 日期区间
-        - dimensions：需要展示/分组的维度（逗号分隔，可选）
-        返回 0 行时请自行判断是过滤值问题（可 probe_values 探查）还是确实无数据。
+        返回 (result_state, text)：result_state 供脚本元数据记录 SQL/引用，text 回填给 Agent。
+        metric_ids 为显式指标 id 列表（同表多指标合并一条 SQL）；为空时按问题词 grep 兜底取 top1。
+        dimension 为 dimensional_measures 子口径（如"激活电柜"），用于解析 {field} 占位符。
         """
-        # 1. 指标定位：优先用 Agent 声明的 metric_id，否则按问题词 grep 兜底
+        # 1. 指标定位：优先用 Agent 声明的 metric_ids，否则按问题词 grep 兜底（只取 top1）
         metric_source = "metric_id"
         metric_hits = []
-        if metric_id:
-            _m = semantic_provider.get_metric_by_id(metric_id)
-            if _m:
-                metric_hits = [_m]
+        for _mid in (metric_ids or []):
+            _m = semantic_provider.get_metric_by_id(_mid)
+            if _m and _m not in metric_hits:
+                metric_hits.append(_m)
         if not metric_hits:
             metric_source = "grep_fallback"
-            metric_hits = grep_metrics_from_keywords(
+            metric_hits = grep_metric_files_from_keywords(
                 _split_keywords(question),
                 provider=semantic_provider.semantic_layer,
                 limit=3,
-            )
+            )[:1]
         if not metric_hits:
-            return "未匹配到语义层指标，无法构建查询方案。可先用 search_semantic 检索指标，或补充指标/口径信息后再试。"
+            return None, "未匹配到语义层指标，无法构建查询方案。可先用 search_semantic 检索指标，或补充指标/口径信息后再试。"
         # 记录工具内部真实语义层命中（供日志审计"实际走的语义层路径"）
         metric_hits = _log_metric_hit(metric_hits, question, metric_source)
-        _top_metric = metric_hits[0]
-        _hit_line = (
-            f"已按语义层指标「{_top_metric.get('name', '')}」"
-            f"（id={_top_metric.get('id', '')}）执行查询。"
-        )
+        # 命中行同时带 name 与 id，便于 LLM/日志审计实际走的指标（id 为稳定标识）
+        _hit_parts = []
+        for _m in metric_hits:
+            _n = str(_m.get("name") or _m.get("id") or "")
+            _i = str(_m.get("id") or "")
+            _hit_parts.append(f"{_n}（id={_i}）" if _i and _i != _n else _n)
+        _hit_line = "已按语义层指标「" + "、".join(_hit_parts) + "」执行查询。"
         # 2. 语义层确定性方案构建（字段由语义层权威决定，避免 LLM 猜字段）
+        # dimension（dimensional_measures 子口径）并入维度提及，供 {field} 占位符解析
         _dims = [d.strip() for d in str(dimensions or "").split(",") if d.strip()]
+        if str(dimension or "").strip():
+            _dims.append(str(dimension).strip())
         plan = build_plan_from_semantic(
             metric_hits=metric_hits,
             semantic_provider=semantic_provider,
@@ -173,11 +207,11 @@ def build_execute_query_tool(runtime, seeker_graph):
             filters=filters,
         )
         if plan is None:
-            return "语义层方案构建失败（指标口径不完整或字段无法映射），无法执行查询。"
+            return None, "语义层方案构建失败（指标口径不完整或字段无法映射），无法执行查询。"
         # 3. 构造 Seeker 子图初始状态并同步执行（request 上下文由 planner 循环注入）
         state = {
             "confirmed_plan": plan,
-            "request_id": _current_request_id.get(),
+            "request_id": request_id,
             "conversation_id": _current_conversation_id.get(),
             "topic_id": _current_topic_id.get(),
             "effective_query": question,
@@ -186,8 +220,110 @@ def build_execute_query_tool(runtime, seeker_graph):
         try:
             result_state = seeker_graph.invoke(state)
         except Exception as error:
-            return f"{_hit_line}\n查询执行异常：{error}"
+            return None, f"{_hit_line}\n查询执行异常：{error}"
         # 4. 组装结果摘要回填给 Agent（前置语义层命中行，供审计）
-        return _hit_line + "\n" + _build_result_summary(result_state)
+        return result_state, _hit_line + "\n" + _build_result_summary(result_state)
+
+    def _group_metric_ids_by_source(metric_ids):
+        """把指标 id 列表按来源表分组（保持原顺序，同表合并），返回 [(ids, source_model), ...]。"""
+        groups = []
+        seen = {}
+        for _mid in metric_ids:
+            _m = semantic_provider.get_metric_by_id(_mid)
+            if not _m:
+                continue
+            _src = str(_m.get("source_model") or "")
+            if _src not in seen:
+                seen[_src] = len(groups)
+                groups.append(([], _src))
+            groups[seen[_src]][0].append(_mid)
+        return groups
+
+    def _run_steps(steps_list, fallback_question, base_request_id):
+        """串行执行多段查询：每段按来源表自动拆分（同表多指标合并一条 SQL），
+        每组独立落盘（唯一 result_id），保存脚本元数据并返回汇总。
+
+        仿 Codex 查询脚本：一次提交多段查询，逐段执行、逐段保存原始结果，减少 LLM 工具往返。
+        """
+        from agentTest.langgraph_app.services.result_store import save_query_script
+        summaries = []
+        step_infos = []
+        for _idx, _step in enumerate(steps_list):
+            # step_id 只保留字母数字下划线：它拼入 request_id 并用于落盘文件名（Windows 不允许冒号等字符）
+            _step_id = re.sub(r"[^0-9A-Za-z_]", "_", str(_step.get("id") or f"s{_idx + 1}")) or f"s{_idx + 1}"
+            _s_question = str(_step.get("question") or fallback_question or "")
+            _s_metric_ids = _parse_step_metric_ids(_step)
+            _s_filters = str(_step.get("filters") or "")
+            _s_dims = str(_step.get("dimensions") or "")
+            _s_dimension = str(_step.get("dimension") or "")
+            # 按来源表分组：同表多指标合并一条 SQL，异表自动拆组串行执行
+            _groups = _group_metric_ids_by_source(_s_metric_ids)
+            if not _groups:
+                _groups = [([], "")]
+            for _gi, (_ids, _src) in enumerate(_groups):
+                # 每组独立 request_id，保证落盘 result_id / CSV 文件名唯一
+                _sub_request_id = (
+                    f"{base_request_id}_{_step_id}_g{_gi + 1}"
+                    if len(_groups) > 1
+                    else f"{base_request_id}_{_step_id}"
+                )
+                _result_state, _text = _run_single(
+                    _s_question, _ids, _s_filters, _s_dims, _s_dimension, _sub_request_id
+                )
+                _sql_result = (_result_state or {}).get("sql_result") or {}
+                _last_result = (_result_state or {}).get("last_query_result") or {}
+                step_infos.append({
+                    "step_id": _step_id if len(_groups) == 1 else f"{_step_id}_g{_gi + 1}",
+                    "question": _s_question,
+                    "metric_ids": list(_ids),
+                    "source_model": _src,
+                    "filters": _s_filters,
+                    "dimensions": _s_dims,
+                    "dimension": _s_dimension,
+                    "generated_sql": str((_result_state or {}).get("generated_sql") or ""),
+                    "result_id": str((_result_state or {}).get("result_id") or ""),
+                    "round_no": _last_result.get("round_no"),
+                    "row_count": int(_sql_result.get("row_count") or 0),
+                    "columns": list(_sql_result.get("columns") or []),
+                    "full_csv": str((_result_state or {}).get("result_csv") or ""),
+                })
+                summaries.append(f"[{_step_id}] {_text}")
+        # 保存查询脚本元数据（仿 Codex），供审计与后续按段引用中间结果
+        save_query_script(_current_conversation_id.get(), base_request_id, step_infos)
+        return (
+            "已串行执行多段查询（每段结果已落盘，可 query_stored_result 按 result_id/round_no 引用）：\n\n"
+            + "\n\n".join(summaries)
+        )
+
+    @tool
+    def execute_query(question: str, metric_id: str = "", filters: str = "", dimensions: str = "", dimension: str = "", steps: str = "") -> str:
+        """执行一次数据查询并返回结果摘要（列 + 预览行 + 行数 + 全量 CSV 路径）。
+
+        需要查数时调用；多指标可用 steps 一次提交多段查询（串行执行、每段结果独立落盘，仿 Codex 查询脚本）。参数：
+        - question：查询意图（如"查询徐州大区今年同意返厂的返厂明细"）
+        - metric_id：语义层指标 id（可选，先用 search_semantic 确认后传入更准）
+        - filters：过滤条件（如"region_name='徐州大区' AND status='同意返厂'"），时间用 yyyy-MM-dd 日期区间
+        - dimensions：需要展示/分组的维度（逗号分隔，可选）
+        - dimension：dimensional_measures 型指标的子口径（如"激活电柜"），用于解析 {field} 占位符
+        - steps：可选，多段查询脚本的 JSON 数组字符串，每段 {id, question, metric_ids, metric_id, filters, dimensions, dimension}；
+          同一来源表、同一时间/过滤条件的多个指标用 metric_ids 合并到一个 step，程序按表自动合并为一条 SQL（多列聚合）；
+          不同来源表自动拆组串行执行（每组独立 result_id）。非空时串行执行每段并各自落盘，返回各段摘要与结果引用
+        返回 0 行时请自行判断是过滤值问题（可 probe_values 探查）还是确实无数据。
+        """
+        base_request_id = _current_request_id.get()
+        if str(steps or "").strip():
+            steps_list = _parse_steps(steps)
+            if not steps_list:
+                return (
+                    "steps 解析失败：需要 JSON 数组字符串，如 "
+                    "[{\"id\":\"s1\",\"question\":\"昨天新增订单数\",\"metric_id\":\"addition_order_num\","
+                    "\"filters\":\"\",\"dimensions\":\"\"}]"
+                )
+            return _run_steps(steps_list, question, base_request_id)
+        result_state, text = _run_single(
+            question, [metric_id] if metric_id else [], filters, dimensions, dimension, base_request_id
+        )
+        return text
 
     return execute_query
+

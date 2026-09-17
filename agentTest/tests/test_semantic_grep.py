@@ -5,6 +5,7 @@ import unittest
 from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider
 from agentTest.semantic_layer.metric_matcher import (
     grep_metrics_from_keywords,
+    grep_metric_files_from_keywords,
     resolve_metric_chain,
     format_metric_context,
 )
@@ -69,6 +70,47 @@ class SemanticGrepTest(unittest.TestCase):
         provider = get_semantic_layer_provider()
         self.assertEqual(provider.grep_metrics([], limit=5), [])
         self.assertEqual(provider.grep_metrics(None, limit=5), [])
+
+
+class SemanticGrepFilesTest(unittest.TestCase):
+    """文件系统 grep 定位指标测试（对齐 skill 文件 grep 思路：窄匹配 + 完整口径返回）。"""
+
+    def test_file_grep_exact_hit_ranks_first(self):
+        """「库存电池数」应精确命中 battery_stock_num 且排第一，哈尔滨弱相关指标排后。"""
+        hits = grep_metric_files_from_keywords(["库存电池数"], limit=3)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["id"], "battery_stock_num")
+        self.assertEqual(hits[0]["name"], "库存电池数")
+        self.assertEqual(hits[0]["confidence"], 1.0)
+        # 只匹配 id/name/aliases：哈尔滨月报电池状态数（别名含"库存电池数"）排精确命中后面
+        self.assertIn("haerbin_report_battery_status_month_num", [m["id"] for m in hits[1:]])
+
+    def test_file_grep_sentence_reverse_hit(self):
+        """整句（"查询昨天库存电池数"）应通过名称反向子串命中 battery_stock_num。"""
+        hits = grep_metric_files_from_keywords(["查询昨天库存电池数"], limit=3)
+        self.assertEqual([m["id"] for m in hits], ["battery_stock_num"])
+
+    def test_file_grep_dimensional_variant(self):
+        """「激活电柜数」应精确命中 dimensional_measures 型指标 cabinet_active_num。"""
+        hits = grep_metric_files_from_keywords(["激活电柜数"], limit=3)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["id"], "cabinet_active_num")
+
+    def test_file_grep_returns_file_path_and_full_notes(self):
+        """命中返回来源文件路径与完整 notes（供上层注入完整口径）。"""
+        hits = grep_metric_files_from_keywords(["库存电池数"], limit=1)
+        self.assertEqual(len(hits), 1)
+        m = hits[0]
+        self.assertTrue(m.get("file_path", "").endswith("battery_stock_num.yaml"))
+        self.assertTrue(m.get("notes"))
+        text = format_metric_context(hits, compact=False)
+        self.assertIn("来源文件", text)
+        self.assertIn("备注", text)
+
+    def test_file_grep_empty_keywords(self):
+        """空关键词返回空列表，不报错。"""
+        self.assertEqual(grep_metric_files_from_keywords([], limit=3), [])
+        self.assertEqual(grep_metric_files_from_keywords(None, limit=3), [])
 
 
 if __name__ == "__main__":

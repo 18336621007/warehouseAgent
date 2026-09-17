@@ -26,7 +26,7 @@ def _clamp_limit(limit, default, max_value):
     return max(1, min(limit_int, max_value))
 
 
-def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_VALUES_LIMIT_DEFAULT, limit_max=PROBE_VALUES_LIMIT_MAX):
+def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_VALUES_LIMIT_DEFAULT, limit_max=PROBE_VALUES_LIMIT_MAX, engine_registry=None):
     """构建受控只读"值探查"工具，安全边界全部在程序层，不依赖 LLM。
 
     - 只生成 SELECT DISTINCT ... LIKE ...，天然只读；
@@ -73,6 +73,12 @@ def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_V
 
         database_name = schema.get("database_name") or ""
         table_name = schema.get("table_name") or ""
+        # 多数据源：按表解析引擎选择执行器（data_project -> doris，其余 -> trino 优先）
+        probe_datasource = datasource
+        if engine_registry is not None:
+            candidates = engine_registry.get_candidates(table)
+            if candidates:
+                probe_datasource = engine_registry.get_datasource(candidates[0]) or datasource
         # 表名/库名来自元数据（简单标识符）裸写，让 validate_hive_sql 的表白名单检查生效；
         # 字段名加反引号防保留字干扰。
         quoted_col = f"`{real_column}`"
@@ -96,7 +102,7 @@ def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_V
             return f"探查 SQL 未通过 Hive 校验：{message}"
 
         try:
-            result = datasource.query(sql, timeout_seconds=QUERY_TIMEOUT_SECONDS, max_rows=limit_int)
+            result = probe_datasource.query(sql, timeout_seconds=QUERY_TIMEOUT_SECONDS, max_rows=limit_int)
         except Exception as error:
             return f"值探查执行失败：{error}"
 

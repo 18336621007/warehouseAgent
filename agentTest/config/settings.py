@@ -57,9 +57,24 @@ def get_llm_fast_model() -> str:
     return os.getenv("LLM_FAST_MODEL", "").strip() or get_model_name()
 
 
-# 简要注释：最终回答用快速模型 extra_body（默认关闭 thinking，只做结果格式化，不做深度推理）。
+# 简要注释：快速模型 extra_body（工具循环/快速定稿用）。
+# 思考开关默认跟随主模型 MODEL_ENABLE_THINKING，可用 LLM_FAST_ENABLE_THINKING 单独覆盖（true/false）。
 def get_llm_fast_extra_body() -> dict:
-    return {"enable_thinking": False}
+    value = os.getenv("LLM_FAST_ENABLE_THINKING", "").strip().lower()
+    if value in ("true", "1", "yes", "on"):
+        return {"enable_thinking": True}
+    if value in ("false", "0", "no", "off"):
+        return {"enable_thinking": False}
+    return get_model_extra_body()
+
+
+# 简要注释：模型上下文窗口 token 上限（供前端展示上下文使用进度，可在 .env 按模型覆盖）。
+def get_model_context_window() -> int:
+    value = os.getenv("MODEL_CONTEXT_WINDOW", "128000").strip()
+    try:
+        return int(value)
+    except ValueError:
+        return 128000
 
 
 # 简要注释：是否启用 LLM 输出逐字流式（思考过程/最终回答），默认开启，可通过 .env 关闭回退非流式。

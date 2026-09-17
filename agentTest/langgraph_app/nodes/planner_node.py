@@ -22,6 +22,7 @@ from agentTest.config.settings import (
     get_model_extra_body,
     get_llm_fast_model,
     get_llm_fast_extra_body,
+    get_model_context_window,
     get_skill_index_max_chars,
 )
 from agentTest.langgraph_app.prompts.planner_prompt import (
@@ -47,12 +48,20 @@ from agentTest.langgraph_app.tools.execute_query_tool import (
     set_execute_query_context,
     reset_execute_query_context,
 )
+from agentTest.langgraph_app.tools.semantic_tool import (
+    begin_semantic_dedup,
+    end_semantic_dedup,
+    get_semantic_dedup_summary,
+)
+from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.config.planner import (
     MAX_PLANNER_TOOL_STEPS,
     MAX_PLANNER_RESPOND_RETRY,
     MAX_EMPTY_RESULT_ROUNDS,
     MAX_EXECUTION_ROUNDS,
+    PLANNER_CONTEXT_COMPACT_CHARS,
+    PLANNER_CONTEXT_KEEP_ROUNDS,
 )
 from agentTest.config.semantic import (
     SEMANTIC_UNIQUE_GAP_THRESHOLD,
@@ -241,6 +250,87 @@ def _try_parse_planner_output(response):
         return None
 
 
+def _emit_context_progress(response):
+    """每轮工具调用后推送上下文使用进度（prompt tokens / 窗口），供前端展示进度条。"""
+    bus = get_stream_bus()
+    if bus is None:
+        return
+    usage = getattr(response, "usage_metadata", None) or {}
+    used = int(usage.get("input_tokens") or 0)
+    if not used:
+        # 回退：自定义 ChatModel 走 _generate（非 _stream）时，token 位于 response_metadata.token_usage
+        meta = getattr(response, "response_metadata", None) or {}
+        token_usage = meta.get("token_usage") or {}
+        used = int(token_usage.get("prompt_tokens") or 0)
+    if not used:
+        return
+    window = get_model_context_window()
+    bus.emit({
+        "type": "context_progress",
+        "used_tokens": used,
+        "window_tokens": window,
+        "percent": round(min(100.0, used * 100.0 / window), 1),
+    })
+
+
+def _emit_context_compacted(before_chars, after_chars):
+    """上下文压缩发生时推送提示，供前端展示"上下文已压缩"。"""
+    bus = get_stream_bus()
+    if bus is None:
+        return
+    bus.emit({
+        "type": "context_compacted",
+        "before_chars": before_chars,
+        "after_chars": after_chars,
+        "saved_chars": max(0, before_chars - after_chars),
+    })
+
+
+def _maybe_compact_react_messages(messages, keep_rounds=PLANNER_CONTEXT_KEEP_ROUNDS):
+    """触发式上下文压缩（通用，不区分场景）：消息总字符超阈值时，
+    把早期工具轮替换为【已获取信息摘要】，保留 System/Human 与最近 keep_rounds 轮完整内容，
+    避免多轮工具检索导致 prompt 无限膨胀；未超阈值返回原列表（零开销）。
+    """
+    total_chars = sum(len(str(m.content or "")) for m in messages)
+    if total_chars <= PLANNER_CONTEXT_COMPACT_CHARS:
+        return messages
+    summary = get_semantic_dedup_summary()
+    # 消息头：System(+skill System) + Human 需求基线，始终保留
+    head_end = 1
+    if len(messages) > 1 and isinstance(messages[1], SystemMessage):
+        head_end = 2
+    if len(messages) > head_end and isinstance(messages[head_end], HumanMessage):
+        head_end += 1
+    # 尾部：保留最近 keep_rounds 对（AI+Tool）及最后一条无工具调用的 AI（停止信号）
+    tail = []
+    idx = len(messages) - 1
+    pairs = 0
+    stop_seen = False
+    while idx > head_end and pairs < keep_rounds:
+        if isinstance(messages[idx], ToolMessage):
+            ai_idx = idx
+            while ai_idx > head_end and not isinstance(messages[ai_idx], AIMessage):
+                ai_idx -= 1
+            if ai_idx <= head_end:
+                break
+            tail = messages[ai_idx:idx + 1] + tail
+            idx = ai_idx - 1
+            pairs += 1
+        elif isinstance(messages[idx], AIMessage) and not getattr(messages[idx], "tool_calls", None) and not stop_seen:
+            # 停止信号 AI 保留，并继续向前收集最近的工具结果轮
+            tail = [messages[idx]] + tail
+            idx -= 1
+            stop_seen = True
+        else:
+            idx -= 1
+    compacted = list(messages[:head_end])
+    if summary:
+        compacted.append(SystemMessage(content=summary))
+    compacted.extend(tail)
+    _emit_context_compacted(total_chars, sum(len(str(m.content or "")) for m in compacted))
+    return compacted
+
+
 def build_planner_node(runtime):
     # M2：Planner 工具化，从统一注册表取只读安全工具（元数据检索 + 落盘结果预览）
     planner_tools = runtime["tool_registry"].get(group="planner")
@@ -259,20 +349,21 @@ def build_planner_node(runtime):
     # with_structured_output：结构化方式由配置 LLM_STRUCTURED_OUTPUT_METHOD 驱动
     # （qwen thinking 模式用 json_mode/response_format，自定义 ChatModel 统一处理）
     structured_llm = chat_openai.with_structured_output(PlannerOutput)
-    # M2：ReAct 工具循环 LLM，可自主调用 planner_tools 补充信息；最终仍由 structured_llm 输出 JSON
-    react_llm = chat_openai.bind_tools(planner_tools)
-
-    # 方案2：最终回答用快速模型（关闭 thinking）格式化输出省时；模型名可用 LLM_FAST_MODEL 覆盖
+    # 方案2：工具循环/快速定稿模型（与主模型同开思考，避免非思考误判路由）；模型名可用 LLM_FAST_MODEL 覆盖
     chat_openai_fast = ThinkingStreamChatModel(
         api_key=get_openai_api_key(),
         base_url=get_openai_base_url(),
         model=get_llm_fast_model(),
-        extra_body=get_llm_fast_extra_body(),
+        extra_body=get_model_extra_body(),
         callbacks=[build_llm_logging_handler("planner_fast")],
         # 最终回答流式：结构化定稿生成 JSON 时实时提取 respond_text 推前端
         answer_field="respond_text",
     )
     structured_llm_fast = chat_openai_fast.with_structured_output(PlannerOutput)
+
+    # M2：ReAct 工具循环 LLM，可自主调用 planner_tools 补充信息；最终仍由 structured_llm 输出 JSON
+    # 动作分层：工具调用轮用 fast 模型提速；fast 与主模型同开思考，保证路由判断质量
+    react_llm = chat_openai_fast.bind_tools(planner_tools)
 
     def planner_node(state):
         # 每次调用只要求传入本轮输入
@@ -286,6 +377,8 @@ def build_planner_node(runtime):
             state.get("conversation_id", ""),
             state.get("topic_id", ""),
         )
+        # 开启 search_semantic 请求内去重：多轮 ReAct 检索不重复注入同一指标候选
+        _sem_token = begin_semantic_dedup()
 
         # 去 Topic 化：不再使用 original_question 固定基线，
         # 当前需求由 LLM 结合【完整对话历史】+【本轮输入】每轮判断（query 改写 effective_query）
@@ -378,6 +471,8 @@ def build_planner_node(runtime):
             planner_tool_map = {t.name: t for t in planner_tools}
             # query_stored_result 依赖会话上下文：循环期间注入，结束后复位
             _conv_token = set_result_conversation(str(state.get("conversation_id") or ""))
+            # 只读检索类工具的同参数去重集合：重复调用不再重复注入全量结果，防 prompt 膨胀
+            _seen_tool_results = {}
             try:
                 # respond 但无实际内容视为"回答未完成"，给 LLM 补工具/补内容后再定稿（通用完整性约束）
                 planner_output = None
@@ -390,6 +485,8 @@ def build_planner_node(runtime):
                     _direct_output = None
                     for _step in range(MAX_PLANNER_TOOL_STEPS):
                         _response = react_llm.invoke(react_messages)
+                        # 每轮工具调用后推送上下文使用进度（prompt tokens / 窗口）
+                        _emit_context_progress(_response)
                         react_messages.append(_response)
                         _tool_calls = getattr(_response, "tool_calls", None) or []
                         if not _tool_calls:
@@ -403,20 +500,33 @@ def build_planner_node(runtime):
                             if _tool is None:
                                 _result = f"未知工具: {_tc.get('name')}"
                             else:
-                                try:
-                                    _result = _tool.invoke(_tc.get("args") or {})
-                                except Exception as _err:
-                                    _result = f"工具调用失败: {_err}"
+                                # 只读检索类工具同参数去重：重复调用注入一行提示，让 LLM 直接引用上文结果
+                                _dedup_key = ""
+                                if _tc.get("name") in ("search_semantic", "search_tables", "search_columns", "search_databases"):
+                                    _arg_key = json.dumps(_tc.get("args") or {}, ensure_ascii=False, sort_keys=True)
+                                    _dedup_key = f"{_tc.get('name')}|{_arg_key}"
+                                if _dedup_key and _dedup_key in _seen_tool_results:
+                                    _result = f"工具 {_tc.get('name')} 同参数已在上文返回，请直接引用上文结果，无需重复检索。"
+                                else:
+                                    if _dedup_key:
+                                        _seen_tool_results[_dedup_key] = True
+                                    try:
+                                        _result = _tool.invoke(_tc.get("args") or {})
+                                    except Exception as _err:
+                                        _result = f"工具调用失败: {_err}"
                             # 技能正文需完整进入上下文供 LLM 遵循，放宽截断；其余工具结果保持 2000 上限
                             _max_result = 12000 if _tc.get("name") == "read_skill" else 2000
                             react_messages.append(ToolMessage(
                                 content=str(_result)[:_max_result],
                                 tool_call_id=_tc.get("id"),
                             ))
+                        # 触发式上下文压缩：工具结果累积超阈值时压缩早期轮次，防 prompt 膨胀
+                        react_messages = _maybe_compact_react_messages(react_messages)
                     if _direct_output is not None:
                         # react 轮已直接输出结构化 JSON：直接使用，跳过定稿 LLM 调用
                         planner_output = _direct_output
                     else:
+                        # 动作分层：工具轮用 fast 提速；定稿优先 fast（信息充分），失败回退 thinking 保证质量
                         _use_fast = _tool_break and not _fast_failed
                         planner_output = (
                             structured_llm_fast if _use_fast else structured_llm
@@ -440,6 +550,7 @@ def build_planner_node(runtime):
                         _fast_failed = True
             finally:
                 reset_result_conversation(_conv_token)
+                end_semantic_dedup(_sem_token)
 
             effective_query = (
                     planner_output.effective_query.strip()

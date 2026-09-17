@@ -166,6 +166,8 @@ async function sendMsg() {
         thinkTimer: null,  // 思考计时器句柄
         thinkingSeconds: 0,  // 思考总耗时（秒），固化时保存
         llmTokens: null,  // 本轮 LLM token 消耗汇总（输入/输出/缓存命中/未命中）
+        contextProgress: null,  // 上下文使用进度（used/window/percent），供进度条展示
+        contextCompacted: null,  // 上下文压缩提示（saved_chars 等），压缩发生时展示
     };
     lockInput(true);
     hideEmpty();
@@ -248,6 +250,22 @@ async function sendMsg() {
                         pend.thinkingParts = pend.thinkingParts.filter(function (p) { return p.sid !== rsid; });
                         rebuildThinking(pend);
                         updatePendingMessage(reqConv);
+                    } else if (event.type === "context_progress") {
+                        // 上下文使用进度：更新进度条（used / window / percent）
+                        pend.contextProgress = {
+                            used_tokens: event.used_tokens,
+                            window_tokens: event.window_tokens,
+                            percent: event.percent,
+                        };
+                        updatePendingMessage(reqConv);
+                    } else if (event.type === "context_compacted") {
+                        // 上下文压缩提示：展示"已压缩"与节省量
+                        pend.contextCompacted = {
+                            before_chars: event.before_chars,
+                            after_chars: event.after_chars,
+                            saved_chars: event.saved_chars,
+                        };
+                        updatePendingMessage(reqConv);
                     } else if (event.type === "done") {
                         pend.doneReceived = true;
                         if (pend.thinkTimer) stopThinkTimer(pend);
@@ -313,6 +331,8 @@ function finalizePendingRequest(convId, pend) {
         request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
         thinkingSeconds: pend.thinkingSeconds || 0,
         llm_tokens: pend.llmTokens || null,
+        context_progress: pend.contextProgress || null,
+        context_compacted: pend.contextCompacted || null,
     };
     if (conv) conv.messages.push(savedMsg);
     delete pendingRequests[convId];
@@ -455,6 +475,12 @@ function appendPendingMessage(convId) {
     answerPreview.style.display = "none";
     bubble.appendChild(answerPreview);
 
+    // 上下文使用进度与压缩提示（仿 Codex）：请求过程中实时更新
+    var ctxInfo = document.createElement("div");
+    ctxInfo.className = "context-info";
+    ctxInfo.style.display = "none";
+    bubble.appendChild(ctxInfo);
+
     // 消息区滚动监听只绑定一次：用户上翻历史时暂停自动滚动
     if (!area._scrollBound) {
         area._scrollBound = true;
@@ -496,6 +522,28 @@ function updatePendingMessage(convId) {
             thinkBtn.innerHTML = '<span class="arrow">▼</span> 思考中 ' + secs + 's';
         } else if (pend.thinkingSeconds) {
             thinkBtn.innerHTML = '<span class="arrow">▼</span> 查看思考过程（' + pend.thinkingSeconds + 's）';
+        }
+    }
+    // 上下文使用进度：进度条 + 百分比；压缩发生时叠加提示
+    var ctxEl = wrapper.querySelector(".context-info");
+    if (ctxEl) {
+        if (pend.contextProgress && pend.contextProgress.window_tokens) {
+            var pct = pend.contextProgress.percent || 0;
+            var warnCls = pct >= 90 ? " danger" : (pct >= 70 ? " warn" : "");
+            var savedTxt = "";
+            if (pend.contextCompacted) {
+                savedTxt = "<div class=\"context-compacted\">🧹 上下文已压缩，释放 " + fmtNum(pend.contextCompacted.saved_chars) + " 字符</div>";
+            }
+            ctxEl.innerHTML = "上下文使用 " + pct + "%（" + fmtNum(pend.contextProgress.used_tokens)
+                + " / " + fmtNum(pend.contextProgress.window_tokens) + " tokens）"
+                + "<div class=\"context-bar\"><div class=\"context-bar-fill' + warnCls + '\" style=\"width:' + pct + '%\"></div></div>"
+                + savedTxt;
+            ctxEl.style.display = "block";
+        } else if (pend.contextCompacted) {
+            ctxEl.innerHTML = "<div class=\"context-compacted\">🧹 上下文已压缩，释放 " + fmtNum(pend.contextCompacted.saved_chars) + " 字符</div>";
+            ctxEl.style.display = "block";
+        } else {
+            ctxEl.style.display = "none";
         }
     }
     // 消息区：随内容增长自动滚动，用户上翻历史时保持不动
@@ -572,6 +620,26 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         tEl.textContent = "⚡️ 输入总Token：" + fmtNum(tu.input_tokens) + " | 输出总Token: " + fmtNum(tu.output_tokens)
             + " | 缓存命中：" + fmtNum(tu.cache_hit) + " | 缓存未命中：" + fmtNum(tu.cache_miss);
         bubble.appendChild(tEl);
+    }
+
+    // 上下文使用进度与压缩提示（历史消息从 msgObj 读取）
+    if (role === "assistant" && msgObj && (msgObj.context_progress || msgObj.context_compacted)) {
+        var ctxEl = document.createElement("div"); ctxEl.className = "context-info";
+        var pct = msgObj.context_progress ? (msgObj.context_progress.percent || 0) : 0;
+        var savedTxt = "";
+        if (msgObj.context_compacted) {
+            savedTxt = "<div class=\"context-compacted\">🧹 上下文已压缩，释放 " + fmtNum(msgObj.context_compacted.saved_chars) + " 字符</div>";
+        }
+        if (msgObj.context_progress && msgObj.context_progress.window_tokens) {
+            var warnCls = pct >= 90 ? " danger" : (pct >= 70 ? " warn" : "");
+            ctxEl.innerHTML = "上下文使用 " + pct + "%（" + fmtNum(msgObj.context_progress.used_tokens)
+                + " / " + fmtNum(msgObj.context_progress.window_tokens) + " tokens）"
+                + "<div class=\"context-bar\"><div class=\"context-bar-fill' + warnCls + '\" style=\"width:' + pct + '%\"></div></div>"
+                + savedTxt;
+        } else {
+            ctxEl.innerHTML = savedTxt;
+        }
+        bubble.appendChild(ctxEl);
     }
 
     if (role === "assistant" && evaluator) {

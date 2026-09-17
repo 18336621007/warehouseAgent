@@ -1,0 +1,12 @@
+# 引擎路由配置：决定每张逻辑表(schema.table)的查询引擎候选链（有序，第一位首选）
+# 执行失败时按顺序降级到下一个候选（仅连接/执行异常才降级，校验失败不降级）
+# 说明：元数据/语义层仍以 Hive 为准；本文件只决定"查询走哪个引擎"
+engine_scope:
+  # 默认候选：Trino 主通道（联邦查询 Hive 数仓表），失败降级 Hive 直连兜底
+  default: [trino, hive]
+  # 库级映射：data_project 为 Doris 专属库（天数池等 ADS 表），失败直接报错不降级
+  databases:
+    data_project: [doris]
+  # 表级覆盖（预留）：库级不满足时按 schema.table 精确指定
+  # tables:
+  #   "dws_trip.some_table": [trino, hive]

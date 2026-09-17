@@ -307,3 +307,25 @@ def read_result_full(conversation_id: str, ref: str):
     except Exception:
         rows = []
     return {"entry": entry, "rows": rows}
+
+def save_query_script(conversation_id: str, request_id: str, steps: list) -> bool:
+    """保存多段查询脚本元数据（仿 Codex 查询脚本）：每段定义 + 生成的 SQL + 结果引用。
+
+    写入对话目录下 {request_id}_script.json，供审计与后续按段引用中间结果；
+    落盘是旁路能力，任何写盘失败静默返回 False，不阻断主流程。
+    """
+    if not RESULT_STORE_ENABLED or not conversation_id or not request_id:
+        return False
+    try:
+        conv_dir = _conversation_dir(conversation_id)
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        script = {
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "steps": steps,
+        }
+        return _dump_json(conv_dir / f"{request_id}_script.json", script)
+    except Exception:
+        return False
+

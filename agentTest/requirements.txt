@@ -6,11 +6,12 @@ langchain-openai
 langgraph
 openai
 
-# 数据访问（Hive + Doris/MySQL）
+# 数据访问（Trino + Hive + Doris/MySQL）
 pyhive
 thrift
 thrift-sasl
 pymysql
+trino
 
 # 向量检索与 BM25
 faiss-cpu

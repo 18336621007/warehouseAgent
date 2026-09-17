@@ -409,6 +409,18 @@ def _build_table_columns_index() -> dict:
     except Exception:
         # 元数据不可用时返回空索引，归属校验退化为不拦截（锁定链路由其他校验兜底）
         pass
+    # 叠加语义层 physical 表字段（权威定义）：覆盖 data_project 等 Hive 无增强元数据的 Doris 专属表
+    try:
+        from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider
+        for phys in get_semantic_layer_provider().get_all_physical_tables():
+            schema = str(phys.get("schema") or "")
+            name = str(phys.get("name") or "")
+            cols = {str(f) for f in (phys.get("fields") or {}).keys()}
+            if schema and name and cols:
+                index.setdefault(f"{schema}.{name}", set()).update(cols)
+    except Exception:
+        # 语义层不可用时跳过叠加，不影响既有 Hive 表校验
+        pass
     _TABLE_COLUMNS_INDEX = index
     return index
 

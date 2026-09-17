@@ -3,6 +3,8 @@ from abc import ABC, abstractmethod
 
 class BaseDataSource(ABC):
     # 数据源抽象基类，统一定义查询与 schema 元数据能力
+    # engine：引擎标识（hive/doris/trino），供引擎路由与日志审计使用
+    engine = ""
 
     @abstractmethod
     def query(self, sql: str):

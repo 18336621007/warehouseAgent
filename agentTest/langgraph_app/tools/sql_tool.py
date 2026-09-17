@@ -9,7 +9,7 @@ from agentTest.langgraph_app.tools.sql_query_tool import SQLQueryTool
 DEFAULT_SQL_QUERY_TIMEOUT_SECONDS = 180
 
 
-def build_sql_query_tool(datasource, query_timeout_seconds=DEFAULT_SQL_QUERY_TIMEOUT_SECONDS):
+def build_sql_query_tool(datasource, engine_name="hive", query_timeout_seconds=DEFAULT_SQL_QUERY_TIMEOUT_SECONDS):
     sql_query_tool = SQLQueryTool(datasource, query_timeout_seconds=query_timeout_seconds)
 
     def run_sql_query(sql: str, partition_fields: list[str] | None = None):
@@ -21,6 +21,6 @@ def build_sql_query_tool(datasource, query_timeout_seconds=DEFAULT_SQL_QUERY_TIM
 
     return StructuredTool.from_function(
         func=run_sql_query,
-        name="sql_query",
-        description="执行只读 Hive SQL 查询，自动进行 SQL 安全校验并返回查询结果",
+        name=f"sql_query_{engine_name}",
+        description=f"执行只读 {engine_name} SQL 查询，自动进行 SQL 安全校验并返回查询结果",
     )

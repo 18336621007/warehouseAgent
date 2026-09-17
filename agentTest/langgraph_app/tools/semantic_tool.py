@@ -1,11 +1,45 @@
 # 语义层检索工具：Planner ReAct 里自主调用的权威口径来源
 # 语义层优先于 RAG：新查询/口径确认先调 search_semantic，未命中再用 search_tables/search_columns
 import re
+from contextvars import ContextVar
+
 from langchain.tools import tool
 from agentTest.semantic_layer.metric_matcher import (
-    grep_metrics_from_keywords,
+    grep_metric_files_from_keywords,
     format_metric_context,
 )
+
+# 请求级去重集合：记录本轮已展示过的指标 id，避免 Planner 多轮检索重复注入同一候选导致 prompt 膨胀
+_seen_metric_ids: ContextVar = ContextVar("search_semantic_seen_ids", default=None)
+# 请求级已展示指标清单（id/name/来源表）：供上下文压缩时生成轻量摘要替代早期工具轮
+_seen_metric_meta: ContextVar = ContextVar("search_semantic_seen_meta", default=None)
+
+
+def begin_semantic_dedup():
+    """请求入口：开启新的去重集合与指标清单，返回 tokens 供 finally 复位。"""
+    return (
+        _seen_metric_ids.set(set()),
+        _seen_metric_meta.set([]),
+    )
+
+
+def end_semantic_dedup(tokens) -> None:
+    """请求结束：复位去重集合与指标清单，防止跨请求串状态。"""
+    _seen_metric_ids.reset(tokens[0])
+    _seen_metric_meta.reset(tokens[1])
+
+
+def get_semantic_dedup_summary() -> str:
+    """把已展示指标清单格式化为轻量摘要，供上下文压缩时替代早期工具轮。"""
+    meta = _seen_metric_meta.get()
+    if not meta:
+        return ""
+    lines = ["【已获取信息摘要】", "- search_semantic 已展示指标："]
+    for m in meta:
+        lines.append(
+            f"  - {m.get('id', '')}({m.get('name', '')}, {m.get('source_model', '')})"
+        )
+    return "\n".join(lines)
 
 # 关键词拆分分隔符：中英文常见分隔符（对齐 metric_matcher 分词习惯）
 _TOKEN_SPLIT = re.compile(r"[\s,，、。;；:：]+")
@@ -16,11 +50,11 @@ def _split_keywords(question: str) -> list[str]:
     return [t.strip() for t in _TOKEN_SPLIT.split(str(question or "")) if t and t.strip()]
 
 
-def build_search_semantic_tool(provider=None, limit: int = 5):
+def build_search_semantic_tool(provider=None, limit: int = 3):
     """构建语义层指标检索工具（受控只读，返回权威口径候选文本）。
 
-    - 复用 grep_metrics_from_keywords：对 id/name/aliases/definition/notes/dimensions 全文匹配；
-    - 返回 format_metric_context 候选文本，供 LLM 判定命中指标与置信度；
+    - 复用 grep_metric_files_from_keywords：文件系统 grep 只匹配 id/name/aliases（双向子串）；
+    - 命中返回完整口径（含备注/枚举/来源文件），供 LLM 判定命中指标与置信度；
     - 命中指标 id 由 LLM 在 semantic_metrics 中声明，程序用 id 反查 provider 构建方案。
     """
     @tool
@@ -34,9 +68,30 @@ def build_search_semantic_tool(provider=None, limit: int = 5):
         keywords = _split_keywords(question)
         if not keywords:
             return "未找到匹配结果。"
-        matches = grep_metrics_from_keywords(keywords, provider=provider, limit=limit)
+        matches = grep_metric_files_from_keywords(keywords, provider=provider, limit=limit)
         if not matches:
             return "未找到匹配结果。"
-        return format_metric_context(matches)
+        # 请求内去重：只返回未展示过的新指标，重复候选提示直接引用，避免上下文累积膨胀
+        # 注意：工具在 langchain 隔离 context 中执行，ContextVar.set 新对象不回写外层，
+        # 因此只修改请求入口 begin_semantic_dedup 已建好的 set 对象（引用共享）
+        seen = _seen_metric_ids.get()
+        if seen is None:
+            # 未开启去重（独立调用场景）：退化为不去重，直接返回全部候选
+            return format_metric_context(matches, compact=False)
+        new_matches = [m for m in matches if str(m.get("id") or "") not in seen]
+        if not new_matches:
+            names = "、".join(str(m.get("name") or m.get("id") or "") for m in matches[:3])
+            return f"检索到的指标（{names} 等）已在上文展示，直接引用其 id 即可，无需重复检索。"
+        for m in new_matches:
+            seen.add(str(m.get("id") or ""))
+            meta = _seen_metric_meta.get()
+            if meta is not None:
+                meta.append({
+                    "id": m.get("id", ""),
+                    "name": m.get("name", ""),
+                    "source_model": m.get("source_model", ""),
+                })
+        # 完整渲染：命中后返回含备注/枚举/来源文件的完整口径（对齐 codex 打开指标文件读全文）
+        return format_metric_context(new_matches, compact=False)
 
     return search_semantic

@@ -122,3 +122,29 @@ class SemanticMetadataProvider:
     def find_safe_join_path(self, models: list[str]) -> list[dict]:
         """在给定模型集合中寻找合规 Join 边列表（BFS 生成最小生成树）"""
         return self._semantic_layer.find_safe_join_path(models)
+
+    def describe_table(self, table_identifier: str) -> dict:
+        """按 schema.table 从语义层 physical YAML 构造描述结构（Hive 查不到时的兜底）。"""
+        phys = self._semantic_layer.get_physical_table(table_identifier)
+        if not phys:
+            raise ValueError(f"语义层无此表: {table_identifier}")
+        fields = phys.get("fields") or {}
+        columns = []
+        for name, info in fields.items():
+            if isinstance(info, dict):
+                columns.append({
+                    "name": str(name),
+                    "type": str(info.get("type") or ""),
+                    "comment": str(info.get("semantic") or ""),
+                    "nullable": None,
+                    "partition_key": str(info.get("role") or "") == "partition",
+                })
+            else:
+                columns.append({"name": str(name), "type": str(info), "comment": "", "nullable": None, "partition_key": False})
+        return {
+            "database_name": str(phys.get("schema") or table_identifier.split(".", 1)[0]),
+            "table_name": str(phys.get("name") or table_identifier),
+            "table_comment": str(phys.get("comment") or ""),
+            "table_type": "",
+            "columns": columns,
+        }

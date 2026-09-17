@@ -127,8 +127,22 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     select_parts = []
     for dim in dimensions:
         select_parts.append(_qualify(dim))
+    measure_exprs = confirmed_plan.get("measure_expressions") or {}
     for m in measures:
-        select_parts.append(f"SUM({_qualify(m)}) AS {m}")
+        _expr = str(measure_exprs.get(m) or "")
+        # 复用语义层标准聚合表达式（SUM/COUNT/AVG/MIN/MAX，可含 DISTINCT），字段加表别名
+        _em = re.match(
+            r"^\s*(SUM|COUNT|AVG|MIN|MAX)\s*\(\s*(DISTINCT\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*$",
+            _expr,
+            re.IGNORECASE,
+        )
+        if _em:
+            _distinct = (_em.group(2) or "").strip()
+            select_parts.append(
+                f"{_em.group(1).upper()}({_distinct + ' ' if _distinct else ''}{_qualify(m)}) AS {m}"
+            )
+        else:
+            select_parts.append(f"SUM({_qualify(m)}) AS {m}")
     # 明细查询：无度量/维度时直接输出已选明细字段，未指定则用 *
     if is_detail and not select_parts:
         detail_select_fields = confirmed_plan.get("select_fields") or []
@@ -512,6 +526,24 @@ def build_generate_sql_node(runtime):
         timer = start_timer()
 
         log_node_start("generate_sql", retry=retry_count, question=question)
+
+        # 确定性 SQL 翻译优先：方案完整且为简单查询时，用语义层表达式程序化构造标准 SQL，
+        # 通过程序化校验即直接使用（0 LLM 调用），多段查询不再每段重新思考；
+        # 复杂查询（窗口/子查询/CTE）、修复重试、或构造失败时走 LLM 生成。
+        if (
+            not confirmed_plan.get("complex")
+            and not retry_count
+            and not sql_fix_reason
+        ):
+            fallback_sql = _build_fallback_sql(confirmed_plan)
+            if fallback_sql and not _validate_sql_against_plan(fallback_sql, confirmed_plan):
+                log_node_event("generate_sql", "确定性 SQL 翻译: 方案完整，跳过 LLM 生成")
+                log_node_end("generate_sql", sql=fallback_sql, ctx_len=0, ms=elapsed_ms(timer))
+                return {
+                    "generated_sql": fallback_sql,
+                    "sql_pass_history": [fallback_sql],
+                    "topic_status": "validating_sql",
+                }
 
         try:
             prompt = default_prompt

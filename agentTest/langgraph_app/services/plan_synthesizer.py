@@ -4,6 +4,7 @@
 import re
 
 from agentTest.semantic_layer.metric_matcher import resolve_entity_dimension_fields
+from agentTest.datasource.registry import resolve_engine_candidates
 from agentTest.langgraph_app.services.query_plan_service import (
     lock_query_plan,
     validate_field_table_bindings,
@@ -32,6 +33,53 @@ def _extract_measure_fields(expression: str, candidate_fields: set) -> list[str]
         if token not in result:
             result.append(token)
     return result
+
+
+def _extract_measure_expression(expression: str, field: str) -> str:
+    """从指标表达式提取标准"聚合包裹单字段"形式的 SQL 片段（SUM/COUNT/AVG/MIN/MAX，可含 DISTINCT），
+    供确定性 SQL 翻译复用；复合表达式（比率/多字段/带表别名）返回空串交由 LLM 生成。
+
+    示例：sum({field}) → SUM(active_cabinet_num)；count(distinct delivery_no) → COUNT(DISTINCT delivery_no)。
+    """
+    if not expression or not field:
+        return ""
+    expr = str(expression).strip()
+    # 替换 dimensional_measures 占位符为实际物理字段
+    expr = expr.replace("{field}", field)
+    m = re.match(
+        r"^\s*(SUM|COUNT|AVG|MIN|MAX)\s*\(\s*(DISTINCT\s+)?%s\s*\)\s*$" % re.escape(field),
+        expr,
+        re.IGNORECASE,
+    )
+    if not m:
+        return ""
+    distinct = (m.group(2) or "").strip()
+    agg = m.group(1).upper()
+    return f"{agg}({distinct + ' ' if distinct else ''}{field})"
+
+
+def _resolve_dimensional_measure_field(dim_measures: list, dimension_mentions) -> str:
+    """从 dimensional_measures 子项按用户指定的子口径（dimension/aliases）解析物理字段。
+
+    匹配规则：提及词与子口径的 dimension/别名精确或互相包含（如"激活电柜"→active_cabinet_num）；
+    未命中返回空串，由调用方决定失败。
+    """
+    mentions = [str(m) for m in (dimension_mentions or []) if str(m).strip()]
+    if not mentions:
+        return ""
+    for item in dim_measures:
+        if not isinstance(item, dict):
+            continue
+        _dim = str(item.get("dimension") or "")
+        _aliases = [str(a) for a in (item.get("aliases") or []) if str(a).strip()]
+        for _m in mentions:
+            if _m == _dim or any(_m == a for a in _aliases):
+                return str(item.get("field") or "")
+            if _dim and (_dim in _m or _m in _dim):
+                return str(item.get("field") or "")
+            if any(a and (a in _m or _m in a) for a in _aliases):
+                return str(item.get("field") or "")
+    return ""
 
 
 def _entity_aliases(word: str) -> list[str]:
@@ -100,6 +148,7 @@ def build_plan_from_semantic(
     sl = semantic_provider.semantic_layer
 
     measures = []
+    measure_expressions = {}
     tables = []
     field_sources = {}
     concept_resolutions = {}
@@ -139,11 +188,22 @@ def build_plan_from_semantic(
                 "concept_type": "metric",
             }
             continue
-        fields_found = _extract_measure_fields(expression, candidate_fields)
+        # dimensional_measures 型指标：表达式含 {field} 占位符，按 dimension 子口径解析物理字段
+        dim_measures = hit.get("dimensional_measures") or []
+        if dim_measures:
+            _field = _resolve_dimensional_measure_field(dim_measures, dimension_mentions)
+            fields_found = [_field] if _field else []
+        else:
+            fields_found = _extract_measure_fields(expression, candidate_fields)
         # 复合表达式（0 或多个物理字段）无法确定为单个度量 → 交给 Advisor
         if len(fields_found) != 1:
             return None
         field = fields_found[0]
+        # 保留语义层原始聚合表达式（标准聚合包裹单字段），供确定性 SQL 翻译复用，避免每段重新让 LLM 思考
+        if field not in measure_expressions:
+            _expr = _extract_measure_expression(expression, field)
+            if _expr:
+                measure_expressions[field] = _expr
         if field not in measures:
             measures.append(field)
         if src not in tables:
@@ -251,7 +311,11 @@ def build_plan_from_semantic(
         for filter_field in _extract_filter_fields(final_filters):
             if filter_field in field_sources:
                 continue
-            owner_table = _find_field_table(filter_field, scope_ids, sl)
+            # 优先在已确认来源表内定位过滤字段，避免 pt_dt 等公共分区字段被误归到扩展维表，
+            # 导致 tables 含无关联维表、确定性 SQL 翻译无法构造 JOIN
+            owner_table = _find_field_table(filter_field, set(tables), sl)
+            if not owner_table:
+                owner_table = _find_field_table(filter_field, scope_ids, sl)
             if not owner_table:
                 return None
             field_sources.setdefault(filter_field, owner_table)
@@ -264,9 +328,24 @@ def build_plan_from_semantic(
     if not tables:
         return None
 
+    # 引擎路由：按方案主表解析引擎候选链（data_project -> doris，其余 -> trino 优先/hive 兜底）
+    engine_candidates = resolve_engine_candidates(main_table) if main_table else []
+    # 多表场景校验跨引擎：其余表首选引擎与主表不一致时标记，执行层拒绝跨数据源关联
+    cross_engine = False
+    if len(tables) > 1:
+        main_primary = engine_candidates[0] if engine_candidates else ""
+        for _t in tables[1:]:
+            _cands = resolve_engine_candidates(_t)
+            if _cands and _cands[0] != main_primary:
+                cross_engine = True
+                break
+
     plan = {
         "tables": tables,
+        "engine_candidates": engine_candidates,
+        "cross_engine": cross_engine,
         "measures": list(dict.fromkeys(measures)),
+        "measure_expressions": measure_expressions,
         "dimensions": list(dict.fromkeys(dimensions)),
         # 查看字段 = 草稿已确认字段 + 语义层构建的度量/维度（业务方案字段）
         "select_fields": list(dict.fromkeys(
