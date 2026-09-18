@@ -18,6 +18,10 @@ EXAMPLE_SIMILARITY_THRESHOLD = 0.7  # 优秀示例检索最低余弦相似度
 MAX_PLANNER_TOOL_STEPS = 10
 # M2：respond 但 respond_text 为空（回答未完成）时，允许 Planner 重试补齐的最大次数
 MAX_PLANNER_RESPOND_RETRY = 2
+# 2026-09-17：模型端 response_format JSON 偶发异常（APIError 400/5xx）时，LLM 调用的瞬时重试次数（退避 0.5s 递增）
+MAX_LLM_RETRY = 2
+# 2026-09-17：execute_query 多段查询的并行度（不同来源表/独立指标并行执行，出错逐级降级到串行）
+MAX_QUERY_PARALLEL = 4
 # M2：Seeker 执行成功但 0 行时，回 Planner 自愈的最大轮次（防死循环）
 MAX_EMPTY_RESULT_ROUNDS = 2
 # M3：值探查工具参数（0 行自愈时用 LIKE 实时确认字段实际取值）
@@ -27,7 +31,18 @@ PROBE_VALUES_LIMIT_MAX = 50
 # M3/A1：单次用户输入内 Planner 发起 execute 的最大轮次（执行完回看后再查），防死循环
 MAX_EXECUTION_ROUNDS = 3
 
-# 上下文压缩阈值（字符数）：Planner 工具轮消息累计超过后，把早期轮次压缩为结构化摘要，防 prompt 膨胀
-PLANNER_CONTEXT_COMPACT_CHARS = 12000
-# 压缩时保留的最近完整工具轮数（更早的轮次替换为摘要）
-PLANNER_CONTEXT_KEEP_ROUNDS = 3
+# 上下文动态收敛（对齐 Codex：不写死字符阈值，全部由"剩余预算 = 窗口 − 已用 token − 输出预留"派生）
+# 输出预留比例：为模型输出/定稿 JSON 预留的窗口比例
+CONTEXT_BUDGET_OUTPUT_RESERVE_RATIO = 0.15
+# 单个工具结果最多占剩余预算的比例（预算充足时不截断，仅超过该配额才收敛）
+TOOL_RESULT_MAX_BUDGET_RATIO = 0.25
+# 工具结果收敛的安全垫：最小/最大字符数（仅极端兜底，正常路径由预算比例派生）
+TOOL_RESULT_MIN_CHARS = 2000
+TOOL_RESULT_MAX_CHARS = 20000
+# 压缩红线比例：估算下一轮输入 token 超过窗口该比例时触发上下文压缩
+CONTEXT_COMPACT_REDLINE_RATIO = 0.8
+# 压缩时保留的最近完整工具轮数（预算越紧保留越少，MAX→MIN 连续映射）
+PLANNER_CONTEXT_KEEP_ROUNDS_MAX = 3
+PLANNER_CONTEXT_KEEP_ROUNDS_MIN = 1
+# 中文字符/每 token 换算系数（估算新增内容 token 占用，取偏保守值：1 token ≈ 1.5 中文字符）
+CHARS_PER_TOKEN_ESTIMATE = 1.5

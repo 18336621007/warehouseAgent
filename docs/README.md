@@ -2,7 +2,7 @@
 
 > [查看完整文档索引](./文档索引.md)
 
-基于 LangGraph 的多智能体协同框架，将自然语言分析需求自动转换为 Hive SQL 并执行查询。
+基于 LangGraph 的单 Agent（Codex 模式）框架：Planner 唯一 Agent 在 ReAct 工具循环内完成语义层检索、元数据补全与查数，最终直接撰写 Markdown 回答；查询引擎支持 Trino 主通道 / Doris 专属 / Hive 兜底。
 
 ## 快速开始
 
@@ -297,17 +297,17 @@ MySQL 重算综合分 → is_high_quality 变化时 → FAISS 自动增删
 ```text
 Web / CLI 请求
   → capture_user_message
-  → Planner：还原有效需求、识别确认意图、选择 Advisor 或 Seeker
-  → Advisor：元数据检索、消除业务歧义、同轮生成 locked QueryPlan
-  → 用户仅确认一次 locked QueryPlan
-  → Seeker：字段覆盖分析 → JoinPlanner → 精确 Schema → SQL 生成
-  → 逐表过滤自动修复 → SQL 安全校验 → Hive 执行 → 最终答案 → Evaluator
+  → Planner（唯一 Agent，ReAct 工具循环）：
+      · search_semantic（语义层优先）→ search_tables / search_columns（RAG 兜底）
+      · query_stored_result（复用落盘结果）/ read_skill（技能渐进式披露）
+      · execute_query（调用执行链子图：精确 Schema → SQL 生成 → 校验 → Trino/Doris/Hive 执行 → 落盘 CSV）
+  → 基于工具结果直接撰写 Markdown 最终回答（respond），结束本轮
 ```
 
 ### 本轮架构强化
 
-- **单次确认协议**：未生成 `locked_plan` 时禁止展示最终确认话术；Advisor 在用户解决歧义的同一轮直接调用 `submit_query_plan`。
-- **去 pending 状态机**：候选不跨轮固化，用户改选/追问通过 `effective_query` 改写 + 完整对话历史还原，Advisor 按当轮意图工作。
+- **单次确认协议**：不再有 Advisor 锁定方案/门禁流程；查数由 Planner 在工具循环内通过 `execute_query` 完成，结果回填后直接撰写回答。
+- **去 pending 状态机**：候选不跨轮固化，用户改选/追问通过 `effective_query` 改写 + 完整对话历史还原，Planner 按当轮意图工作。
 - **多表字段来源锁定**：执行阶段优先校验 QueryPlan 中已经锁定的 `field_sources`，禁止静默换表。
 - **复合 Join 键**：关系元数据支持字符串和字段列表，当前运营日报与经销商维表按 `pt_platform + company_id` 关联。
 - **Join 推测开关**：`ALLOW_AI_INFERRED_JOIN=True` 时允许缺少人工关系的场景进入 LLM 推测；关闭时安全拒绝。

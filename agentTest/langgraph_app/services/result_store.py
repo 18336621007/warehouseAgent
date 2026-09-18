@@ -5,6 +5,7 @@
 import csv
 import json
 import shutil
+import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from agentTest.config.advisor import (
 
 # 项目根目录（result_store.py -> services -> langgraph_app -> agentTest -> 项目根）
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+# 会话索引读写锁：execute_query 多段并行落盘时保护 round_no 分配与 _index.json 的读写原子性
+_STORE_LOCK = threading.Lock()
 
 
 def _store_root() -> Path:
@@ -151,98 +154,99 @@ def save_query_result(state, sql_result) -> dict:
 
     返回 {result_id, round_no, result_file, full_csv}；未启用或失败返回 {}。
     """
-    if not RESULT_STORE_ENABLED:
-        return {}
-    try:
-        request_id = str(state.get("request_id") or "")
-        if not request_id:
+    with _STORE_LOCK:
+        if not RESULT_STORE_ENABLED:
             return {}
-        conversation_id = str(state.get("conversation_id") or "")
-        sql_result = sql_result or {}
-        columns = list(sql_result.get("columns") or [])
-        rows = list(sql_result.get("rows") or [])
-        row_count = int(sql_result.get("row_count") or len(rows))
-        conv_dir = _conversation_dir(conversation_id)
-        conv_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            request_id = str(state.get("request_id") or "")
+            if not request_id:
+                return {}
+            conversation_id = str(state.get("conversation_id") or "")
+            sql_result = sql_result or {}
+            columns = list(sql_result.get("columns") or [])
+            rows = list(sql_result.get("rows") or [])
+            row_count = int(sql_result.get("row_count") or len(rows))
+            conv_dir = _conversation_dir(conversation_id)
+            conv_dir.mkdir(parents=True, exist_ok=True)
 
-        # 全量行始终写 CSV（紧凑、可交付），JSON 只放预览，避免大结果膨胀
-        full_csv = f"{request_id}_full.csv"
-        _dump_csv(conv_dir / full_csv, columns, rows)
+            # 全量行始终写 CSV（紧凑、可交付），JSON 只放预览，避免大结果膨胀
+            full_csv = f"{request_id}_full.csv"
+            _dump_csv(conv_dir / full_csv, columns, rows)
 
-        preview_rows = []
-        for row in rows[:RESULT_STORE_MAX_PREVIEW_ROWS]:
-            if isinstance(row, dict):
-                preview_rows.append(row)
-            else:
-                preview_rows.append(dict(zip(columns, row)))
+            preview_rows = []
+            for row in rows[:RESULT_STORE_MAX_PREVIEW_ROWS]:
+                if isinstance(row, dict):
+                    preview_rows.append(row)
+                else:
+                    preview_rows.append(dict(zip(columns, row)))
 
-        index = _read_index(conv_dir)
-        round_no = len(index["results"]) + 1
-        result_id = f"{request_id}:result"
-        confirmed_plan = state.get("confirmed_plan") or {}
-        entry = {
-            "result_id": result_id,
-            "source_request_id": request_id,
-            "round_no": round_no,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "effective_query": str(
-                state.get("effective_query") or state.get("current_user_input") or ""
-            ),
-            "table": confirmed_plan.get("table", ""),
-            "columns": columns,
-            "row_count": row_count,
-            "preview_rows": preview_rows,
-            "entity_keys": _extract_entity_keys(state, preview_rows),
-            "result_summary": f"共 {row_count} 行，列：{', '.join(columns[:10]) or '无'}",
-            "file": f"{request_id}.json",
-            "full_csv": full_csv,
-        }
-        _dump_json(conv_dir / f"{request_id}.json", entry)
+            index = _read_index(conv_dir)
+            round_no = len(index["results"]) + 1
+            result_id = f"{request_id}:result"
+            confirmed_plan = state.get("confirmed_plan") or {}
+            entry = {
+                "result_id": result_id,
+                "source_request_id": request_id,
+                "round_no": round_no,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "effective_query": str(
+                    state.get("effective_query") or state.get("current_user_input") or ""
+                ),
+                "table": confirmed_plan.get("table", ""),
+                "columns": columns,
+                "row_count": row_count,
+                "preview_rows": preview_rows,
+                "entity_keys": _extract_entity_keys(state, preview_rows),
+                "result_summary": f"共 {row_count} 行，列：{', '.join(columns[:10]) or '无'}",
+                "file": f"{request_id}.json",
+                "full_csv": full_csv,
+            }
+            _dump_json(conv_dir / f"{request_id}.json", entry)
 
-        # 每轮任务元数据（仿 Codex rollout 事件流）：原问题/路由/命中的指标/SQL/结果摘要，
-        # 供审计与后续 LLM 读取落盘结果时先看 meta 再决定读哪个 CSV
-        planner_entities = state.get("planner_entities") or {}
-        semantic_metrics = planner_entities.get("semantic_metrics") or []
-        meta = {
-            "request_id": request_id,
-            "round_no": round_no,
-            "created_at": entry.get("created_at"),
-            "effective_query": entry.get("effective_query"),
-            "current_user_input": str(state.get("current_user_input") or ""),
-            "route": str(planner_entities.get("route") or state.get("route") or ""),
-            "semantic_metric_ids": [
-                str(m.get("id") or "") for m in semantic_metrics if isinstance(m, dict)
-            ],
-            "generated_sql": str(state.get("generated_sql") or ""),
-            "row_count": row_count,
-            "columns": columns,
-            "result_file": entry.get("file"),
-            "full_csv": full_csv,
-        }
-        _dump_json(conv_dir / f"{request_id}_meta.json", meta)
+            # 每轮任务元数据（仿 Codex rollout 事件流）：原问题/路由/命中的指标/SQL/结果摘要，
+            # 供审计与后续 LLM 读取落盘结果时先看 meta 再决定读哪个 CSV
+            planner_entities = state.get("planner_entities") or {}
+            semantic_metrics = planner_entities.get("semantic_metrics") or []
+            meta = {
+                "request_id": request_id,
+                "round_no": round_no,
+                "created_at": entry.get("created_at"),
+                "effective_query": entry.get("effective_query"),
+                "current_user_input": str(state.get("current_user_input") or ""),
+                "route": str(planner_entities.get("route") or state.get("route") or ""),
+                "semantic_metric_ids": [
+                    str(m.get("id") or "") for m in semantic_metrics if isinstance(m, dict)
+                ],
+                "generated_sql": str(state.get("generated_sql") or ""),
+                "row_count": row_count,
+                "columns": columns,
+                "result_file": entry.get("file"),
+                "full_csv": full_csv,
+            }
+            _dump_json(conv_dir / f"{request_id}_meta.json", meta)
 
-        # 更新索引：追加 + 只保留最近 MAX_ROUNDS 轮，被挤出的结果文件一并删除
-        index["results"].append(entry)
-        overflow = index["results"][:-RESULT_STORE_MAX_ROUNDS] if RESULT_STORE_MAX_ROUNDS > 0 else []
-        index["results"] = index["results"][-RESULT_STORE_MAX_ROUNDS:] if RESULT_STORE_MAX_ROUNDS > 0 else []
-        _dump_json(_index_path(conv_dir), index)
-        for old in overflow:
-            _remove_files(
-                conv_dir,
-                old.get("file"),
-                old.get("full_csv"),
-                f"{old.get('source_request_id') or ''}_meta.json",
-            )
-        _cleanup_old_days()
+            # 更新索引：追加 + 只保留最近 MAX_ROUNDS 轮，被挤出的结果文件一并删除
+            index["results"].append(entry)
+            overflow = index["results"][:-RESULT_STORE_MAX_ROUNDS] if RESULT_STORE_MAX_ROUNDS > 0 else []
+            index["results"] = index["results"][-RESULT_STORE_MAX_ROUNDS:] if RESULT_STORE_MAX_ROUNDS > 0 else []
+            _dump_json(_index_path(conv_dir), index)
+            for old in overflow:
+                _remove_files(
+                    conv_dir,
+                    old.get("file"),
+                    old.get("full_csv"),
+                    f"{old.get('source_request_id') or ''}_meta.json",
+                )
+            _cleanup_old_days()
 
-        return {
-            "result_id": result_id,
-            "round_no": round_no,
-            "result_file": str(conv_dir / f"{request_id}.json"),
-            "full_csv": str(conv_dir / full_csv),
-        }
-    except Exception:
-        return {}
+            return {
+                "result_id": result_id,
+                "round_no": round_no,
+                "result_file": str(conv_dir / f"{request_id}.json"),
+                "full_csv": str(conv_dir / full_csv),
+            }
+        except Exception:
+            return {}
 
 
 def list_result_index(conversation_id: str, limit: int = 8) -> list:

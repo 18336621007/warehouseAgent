@@ -118,30 +118,18 @@ class PlannerFastModelTest(unittest.TestCase):
             node = planner_node.build_planner_node(_build_runtime())
             return node(_state("查询徐州大区今年同意返厂的返厂明细"))
 
-    def test_fast_model_used_when_no_tool_call(self):
-        """模型无工具调用直接定稿：走 fast 模型，thinking 不被调用。"""
+    def test_react_direct_text_skips_finalize(self):
+        """react 轮无工具调用且输出回答文本：直接采纳为最终回答，不再调 fast/thinking 定稿（对齐 Codex 自由输出）。"""
         fake_llm = _FakeLLM(
             PlannerOutput(**_planner_kwargs()),
             PlannerOutput(**_planner_kwargs()),
+            react_content="查询结果：共 26 条返厂明细。",
         )
         result = self._run(fake_llm)
         self.assertEqual(result["route"], "respond")
-        self.assertTrue(fake_llm.fast_calls, "应使用快速模型定稿")
-        self.assertEqual(len(fake_llm.thinking_calls), 0, "无需 thinking 模型")
-
-    def test_fast_execute_defensive_respond_fallback(self):
-        """fast 输出 route=execute（已废弃终态）：不再拦截重试/回退 thinking，直接防御兜底 respond。"""
-        fake_llm = _FakeLLM(
-            # thinking 输出：最终回答（不会用到）
-            PlannerOutput(**_planner_kwargs()),
-            # fast 输出：误判 execute（reason 作为兜底回复）
-            PlannerOutput(**_planner_kwargs(route="execute", respond_text="", reason="需要查询徐州大区返厂明细")),
-        )
-        result = self._run(fake_llm)
-        self.assertEqual(result["route"], "respond")
-        self.assertTrue(fake_llm.fast_calls, "fast 应先被调用")
-        self.assertEqual(len(fake_llm.thinking_calls), 0, "execute 已废弃，不再回退 thinking")
-        self.assertIn("需要查询徐州大区返厂明细", result["respond_text"], "防御兜底应使用 reason 作为回复")
+        self.assertIn("查询结果：共 26 条返厂明细", result["final_answer"])
+        self.assertEqual(len(fake_llm.fast_calls), 0, "react 文本直接采纳，无需 fast 定稿")
+        self.assertEqual(len(fake_llm.thinking_calls), 0, "react 文本直接采纳，无需 thinking 定稿")
 
     def test_react_direct_json_skips_finalize(self):
         """react 轮直接输出合法 PlannerOutput JSON：直接解析使用，不再调 fast/thinking 定稿。"""
@@ -161,6 +149,7 @@ class PlannerFastModelTest(unittest.TestCase):
         fake_llm = _FakeLLM(
             PlannerOutput(**_planner_kwargs()),
             PlannerOutput(**_planner_kwargs(route="respond", respond_text="")),
+            react_content="",
         )
         result = self._run(fake_llm)
         self.assertEqual(result["route"], "respond")

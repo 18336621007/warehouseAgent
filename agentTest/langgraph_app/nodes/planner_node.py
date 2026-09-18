@@ -7,7 +7,10 @@
 #   ③ 查数通过 execute_query 工具在循环内完成（结果回填后直接写回答）；route 一律 respond，直接输出澄清/回答文本结束本轮
 import json
 import re
+import time
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from agentTest.langgraph_app.services.thinking_stream_chat import ThinkingStreamChatModel
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from agentTest.langgraph_app.services.query_plan_service import (
@@ -52,17 +55,28 @@ from agentTest.langgraph_app.tools.semantic_tool import (
     begin_semantic_dedup,
     end_semantic_dedup,
     get_semantic_dedup_summary,
+    set_semantic_render_budget,
+    reset_semantic_render_budget,
 )
 from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.config.planner import (
     MAX_PLANNER_TOOL_STEPS,
-    MAX_PLANNER_RESPOND_RETRY,
+    MAX_LLM_RETRY,
     MAX_EMPTY_RESULT_ROUNDS,
     MAX_EXECUTION_ROUNDS,
-    PLANNER_CONTEXT_COMPACT_CHARS,
-    PLANNER_CONTEXT_KEEP_ROUNDS,
+    CONTEXT_BUDGET_OUTPUT_RESERVE_RATIO,
+    TOOL_RESULT_MAX_BUDGET_RATIO,
+    TOOL_RESULT_MIN_CHARS,
+    TOOL_RESULT_MAX_CHARS,
+    CONTEXT_COMPACT_REDLINE_RATIO,
+    PLANNER_CONTEXT_KEEP_ROUNDS_MAX,
+    PLANNER_CONTEXT_KEEP_ROUNDS_MIN,
+    CHARS_PER_TOKEN_ESTIMATE,
+    MAX_QUERY_PARALLEL,
 )
+from openai import APIError
+
 from agentTest.config.semantic import (
     SEMANTIC_UNIQUE_GAP_THRESHOLD,
     SEMANTIC_GREP_TOP_K,
@@ -286,14 +300,40 @@ def _emit_context_compacted(before_chars, after_chars):
     })
 
 
-def _maybe_compact_react_messages(messages, keep_rounds=PLANNER_CONTEXT_KEEP_ROUNDS):
-    """触发式上下文压缩（通用，不区分场景）：消息总字符超阈值时，
-    把早期工具轮替换为【已获取信息摘要】，保留 System/Human 与最近 keep_rounds 轮完整内容，
-    避免多轮工具检索导致 prompt 无限膨胀；未超阈值返回原列表（零开销）。
+def _estimate_tokens(text) -> int:
+    """按中文字符/token 系数估算文本 token 占用（偏保守高估，预留安全余量）。"""
+    return int(len(str(text)) / CHARS_PER_TOKEN_ESTIMATE)
+
+
+def _get_context_budget(used_tokens) -> int:
+    """按剩余上下文预算计算可用 token 额度（对齐 Codex 动态收敛）。
+    剩余预算 = 窗口 − 已用 token − 输出预留；预算不足返回 0（触发压缩兜底）。
     """
-    total_chars = sum(len(str(m.content or "")) for m in messages)
-    if total_chars <= PLANNER_CONTEXT_COMPACT_CHARS:
+    window = get_model_context_window()
+    reserve = int(window * CONTEXT_BUDGET_OUTPUT_RESERVE_RATIO)
+    return max(0, window - int(used_tokens or 0) - reserve)
+
+
+def _maybe_compact_react_messages(messages, used_tokens=0, added_chars=0, keep_rounds=None):
+    """触发式上下文压缩（通用，不区分场景）：预计下一轮输入将超过窗口预算红线时，
+    把早期工具轮替换为【已获取信息摘要】，保留 System/Human 与最近 keep_rounds 轮完整内容；
+    触发条件与压缩强度均由剩余上下文预算动态派生（对齐 Codex），未超红线返回原列表（零开销）。
+    """
+    window = get_model_context_window()
+    # 估算下一轮输入 token = 当前真实已用 + 本轮新增结果的估算增量
+    estimated_next = int(used_tokens or 0) + _estimate_tokens(added_chars)
+    redline = int(window * CONTEXT_COMPACT_REDLINE_RATIO)
+    if estimated_next <= redline:
         return messages
+    # 压缩强度随剩余预算动态：预算越紧，保留的最近完整工具轮数越少（MAX→MIN 连续映射）
+    budget = _get_context_budget(used_tokens)
+    budget_ratio = budget / max(1, window)
+    if keep_rounds is None:
+        keep_rounds = max(
+            PLANNER_CONTEXT_KEEP_ROUNDS_MIN,
+            int(round(PLANNER_CONTEXT_KEEP_ROUNDS_MAX * budget_ratio)),
+        )
+    total_chars = sum(len(str(m.content or "")) for m in messages)
     summary = get_semantic_dedup_summary()
     # 消息头：System(+skill System) + Human 需求基线，始终保留
     head_end = 1
@@ -329,6 +369,60 @@ def _maybe_compact_react_messages(messages, keep_rounds=PLANNER_CONTEXT_KEEP_ROU
     compacted.extend(tail)
     _emit_context_compacted(total_chars, sum(len(str(m.content or "")) for m in compacted))
     return compacted
+
+
+def _condense_skill_heading(text, max_lines=8):
+    """提取技能正文的 markdown 标题骨架作为轻量摘要（保留章节结构，细节按需重新 read_skill）。"""
+    out = []
+    for ln in str(text or "").splitlines():
+        if ln.strip().startswith("#"):
+            out.append(ln.strip())
+            if len(out) >= max_lines:
+                break
+    return "\n".join(out) if out else str(text or "")[:200]
+
+
+def _condense_read_skill_results(messages, keep_tool_call_ids):
+    """把非本轮 read_skill 结果替换为轻量摘要：技能全文只在读取那一轮保留，
+    后续轮只需章节骨架（对齐 Codex auto-compact 早期轮收敛），细节可重新 read_skill。"""
+    out = []
+    for m in messages:
+        if (isinstance(m, ToolMessage)
+                and getattr(m, "name", "") == "read_skill"
+                and m.tool_call_id not in keep_tool_call_ids):
+            headings = _condense_skill_heading(m.content)
+            out.append(ToolMessage(
+                content=f"【技能已读】章节骨架：\n{headings}\n（全文已在上文提供，如需重看请再次调用 read_skill）",
+                tool_call_id=m.tool_call_id,
+                name="read_skill",
+            ))
+        else:
+            out.append(m)
+    return out
+
+
+def _invoke_llm_with_retry(llm, messages, node_name="planner"):
+    """LLM 调用瞬时错误重试：模型端 response_format JSON 偶发异常（APIError 400/5xx）时退避重试。
+
+    invoke 抛异常时 messages 未被修改、无副作用（工具不会重复执行），重试幂等安全；
+    仅对 openai.APIError 重试，其余异常直接上抛避免掩盖真实错误。
+    """
+    last_err = None
+    for _attempt in range(MAX_LLM_RETRY + 1):
+        try:
+            if _attempt:
+                log_sub_info(
+                    f"LLM 调用第 {_attempt} 次重试（上次异常: {type(last_err).__name__}）",
+                    node_name=node_name,
+                )
+            return llm.invoke(messages)
+        except APIError as _err:
+            last_err = _err
+            if _attempt >= MAX_LLM_RETRY:
+                break
+            # 退避 0.5s 递增，避免瞬时故障时高频重试
+            time.sleep(0.5 * (_attempt + 1))
+    raise last_err
 
 
 def build_planner_node(runtime):
@@ -479,75 +573,152 @@ def build_planner_node(runtime):
                 # 方案2：模型主动停止工具调用（信息已充分）时用快速模型定稿，省 thinking 时间；
                 # 快速模型定稿失败（execute/空回答）后回退 thinking，保证判断质量
                 _fast_failed = False
-                for _round in range(MAX_PLANNER_RESPOND_RETRY + 1):
-                    _tool_break = False
-                    _use_fast = False
-                    _direct_output = None
-                    for _step in range(MAX_PLANNER_TOOL_STEPS):
-                        _response = react_llm.invoke(react_messages)
-                        # 每轮工具调用后推送上下文使用进度（prompt tokens / 窗口）
-                        _emit_context_progress(_response)
-                        react_messages.append(_response)
-                        _tool_calls = getattr(_response, "tool_calls", None) or []
-                        if not _tool_calls:
-                            _tool_break = True
-                            # 尝试直接解析该轮输出为 PlannerOutput（成功则省一次定稿 LLM 调用）
-                            _direct_output = _try_parse_planner_output(_response)
-                            break
-                        log_tools_called("planner", [str(tc.get("name", "?")) for tc in _tool_calls])
-                        for _tc in _tool_calls:
-                            _tool = planner_tool_map.get(_tc.get("name"))
-                            if _tool is None:
-                                _result = f"未知工具: {_tc.get('name')}"
-                            else:
-                                # 只读检索类工具同参数去重：重复调用注入一行提示，让 LLM 直接引用上文结果
-                                _dedup_key = ""
-                                if _tc.get("name") in ("search_semantic", "search_tables", "search_columns", "search_databases"):
-                                    _arg_key = json.dumps(_tc.get("args") or {}, ensure_ascii=False, sort_keys=True)
-                                    _dedup_key = f"{_tc.get('name')}|{_arg_key}"
-                                if _dedup_key and _dedup_key in _seen_tool_results:
-                                    _result = f"工具 {_tc.get('name')} 同参数已在上文返回，请直接引用上文结果，无需重复检索。"
-                                else:
-                                    if _dedup_key:
-                                        _seen_tool_results[_dedup_key] = True
-                                    try:
-                                        _result = _tool.invoke(_tc.get("args") or {})
-                                    except Exception as _err:
-                                        _result = f"工具调用失败: {_err}"
-                            # 技能正文需完整进入上下文供 LLM 遵循，放宽截断；其余工具结果保持 2000 上限
-                            _max_result = 12000 if _tc.get("name") == "read_skill" else 2000
-                            react_messages.append(ToolMessage(
-                                content=str(_result)[:_max_result],
-                                tool_call_id=_tc.get("id"),
-                            ))
-                        # 触发式上下文压缩：工具结果累积超阈值时压缩早期轮次，防 prompt 膨胀
-                        react_messages = _maybe_compact_react_messages(react_messages)
-                    if _direct_output is not None:
-                        # react 轮已直接输出结构化 JSON：直接使用，跳过定稿 LLM 调用
-                        planner_output = _direct_output
-                    else:
-                        # 动作分层：工具轮用 fast 提速；定稿优先 fast（信息充分），失败回退 thinking 保证质量
-                        _use_fast = _tool_break and not _fast_failed
-                        planner_output = (
-                            structured_llm_fast if _use_fast else structured_llm
-                        ).invoke(react_messages)
-                    # 单 Agent：查数在工具循环内通过 execute_query 完成，route 收敛为 respond 单一终态；
-                    # 仅 respond 且文本为空（回答未完成）时重试补齐，不再拦截 route=execute
-                    _needs_retry = (
-                        planner_output.route == "respond"
-                        and not (planner_output.respond_text or "").strip()
-                    )
-                    if not _needs_retry:
+                # 单程工具循环（对齐 Codex）：模型自主决定停止与回答，程序仅做步数保护，不做空文本强制重试
+                _tool_break = False
+                _use_fast = False
+                _direct_output = None
+                # 本轮真实 input_tokens：供工具结果收敛与压缩按剩余预算动态决策
+                _current_input_tokens = 0
+                for _step in range(MAX_PLANNER_TOOL_STEPS):
+                    _response = _invoke_llm_with_retry(react_llm, react_messages)
+                    # 每轮工具调用后推送上下文使用进度（prompt tokens / 窗口）
+                    _emit_context_progress(_response)
+                    # 记录本轮真实 input_tokens（usage_metadata），供预算计算与压缩触发
+                    _usage = getattr(_response, "usage_metadata", None) or {}
+                    _current_input_tokens = int(_usage.get("input_tokens") or 0)
+                    if not _current_input_tokens:
+                        # 回退：自定义 ChatModel 走 _generate 时 token 位于 response_metadata.token_usage（对齐 _emit_context_progress）
+                        _meta = getattr(_response, "response_metadata", None) or {}
+                        _token_usage = _meta.get("token_usage") or {}
+                        _current_input_tokens = int(_token_usage.get("prompt_tokens") or 0)
+                    react_messages.append(_response)
+                    _tool_calls = getattr(_response, "tool_calls", None) or []
+                    if not _tool_calls:
+                        _tool_break = True
+                        # 尝试直接解析该轮输出为 PlannerOutput（成功则省一次定稿 LLM 调用）
+                        _direct_output = _try_parse_planner_output(_response)
+                        if _direct_output is None:
+                            # 模型未调工具且输出了回答文本：直接采纳为 respond_text（对齐 Codex 自由输出），
+                            # 避免强制定稿二次生成空文本后落入通用兜底、丢失真实结果
+                            _text = str(getattr(_response, "content", "") or "").strip()
+                            if _text:
+                                _direct_output = PlannerOutput(
+                                    effective_query=current_user_input,
+                                    route="respond",
+                                    respond_text=_text,
+                                    reason="Planner 在工具循环内直接输出回答（未调用工具），直接采纳",
+                                )
                         break
-                    # 回答未完成：追加通用提示，让 LLM 用工具补齐数据或给出实际内容（不枚举场景）
-                    react_messages.append(SystemMessage(
-                        content="你的 respond_text 为空，本轮不能结束。"
-                                "若回答所需数据不在上下文中，请先调用工具获取；"
-                                "然后在 respond_text 中写出给用户的实际内容（结果/澄清/确认）。"
-                    ))
-                    # fast 定稿失败（execute/空回答）：后续轮回退 thinking，避免反复快速失败
-                    if _use_fast:
-                        _fast_failed = True
+                    log_tools_called("planner", [str(tc.get("name", "?")) for tc in _tool_calls])
+                    # 同一轮多个 tool_calls 并行执行（execute_query/probe_values 等耗时工具提速，仿 Codex），
+                    # 出错由 execute_query 内部逐级降级；结果按原始顺序回填，保证消息顺序稳定
+                    def _invoke_tool(_tc, _idx, _tool):
+                        try:
+                            if _tc.get("name") == "execute_query":
+                                # 并行执行时给每个 execute_query 唯一 request_id，避免落盘 result_id/CSV 冲突
+                                _exec_ctx = set_execute_query_context(
+                                    f"{state.get('request_id', '')}_p{_idx + 1}",
+                                    str(state.get("conversation_id") or ""),
+                                    str(state.get("topic_id") or ""),
+                                )
+                                try:
+                                    return _tool.invoke(_tc.get("args") or {})
+                                finally:
+                                    reset_execute_query_context(_exec_ctx)
+                            return _tool.invoke(_tc.get("args") or {})
+                        except Exception as _err:
+                            return f"工具调用失败: {_err}"
+
+                    def _exec_tool_call(_tc, _idx, _tool):
+                        # 用 copy_context 传播主线程的日志/会话 ContextVar，保证子线程日志归属正确
+                        _ctx = copy_context()
+                        return _ctx.run(_invoke_tool, _tc, _idx, _tool)
+
+                    # 去重决策在主线程完成（避免并发竞争）；实际工具调用并行执行
+                    _prepared = []
+                    for _idx, _tc in enumerate(_tool_calls):
+                        _tool = planner_tool_map.get(_tc.get("name"))
+                        _dedup_key = ""
+                        if _tc.get("name") in ("search_semantic", "search_tables", "search_columns", "search_databases"):
+                            _arg_key = json.dumps(_tc.get("args") or {}, ensure_ascii=False, sort_keys=True)
+                            _dedup_key = f"{_tc.get('name')}|{_arg_key}"
+                        if _tool is None:
+                            _prepared.append((_tc, _idx, f"未知工具: {_tc.get('name')}"))
+                        elif _dedup_key and _dedup_key in _seen_tool_results:
+                            _prepared.append((_tc, _idx, f"工具 {_tc.get('name')} 同参数已在上文返回，请直接引用上文结果，无需重复检索。"))
+                        else:
+                            if _dedup_key:
+                                _seen_tool_results[_dedup_key] = True
+                            _prepared.append((_tc, _idx, None))
+                    _todo = [(_tc, _idx) for _tc, _idx, _skip in _prepared if _skip is None]
+                    # 按剩余上下文预算计算本轮工具结果配额（对齐 Codex 动态收敛，不写死字符数）
+                    _budget_tokens = _get_context_budget(_current_input_tokens)
+                    _tool_result_quota = max(
+                        TOOL_RESULT_MIN_CHARS,
+                        min(
+                            TOOL_RESULT_MAX_CHARS,
+                            int(_budget_tokens * TOOL_RESULT_MAX_BUDGET_RATIO * CHARS_PER_TOKEN_ESTIMATE),
+                        ),
+                    )
+                    # 预算传给 search_semantic：预算紧张时自动精简口径（完整口径由 execute_query 程序反查）
+                    _sem_budget_token = set_semantic_render_budget(_tool_result_quota)
+                    try:
+                        if len(_todo) > 1:
+                            _parallel = min(len(_todo), MAX_QUERY_PARALLEL)
+                            with ThreadPoolExecutor(max_workers=_parallel) as _ex:
+                                _futs = {
+                                    _ex.submit(_exec_tool_call, _tc, _idx, planner_tool_map.get(_tc.get("name"))): (_tc, _idx)
+                                    for _tc, _idx in _todo
+                                }
+                                _run_results = {}
+                                for _fut, (_tc, _idx) in _futs.items():
+                                    try:
+                                        _run_results[_idx] = _fut.result()
+                                    except Exception as _err:
+                                        _run_results[_idx] = f"工具调用失败: {_err}"
+                        else:
+                            _run_results = {}
+                            for _tc, _idx in _todo:
+                                _run_results[_idx] = _exec_tool_call(_tc, _idx, planner_tool_map.get(_tc.get("name")))
+                    finally:
+                        reset_semantic_render_budget(_sem_budget_token)
+                    _prev_react_chars = sum(len(str(m.content or "")) for m in react_messages)
+                    _new_tool_call_ids = set()
+                    for _tc, _idx, _skip in _prepared:
+                        _result = _skip if _skip is not None else _run_results.get(_idx, "工具调用失败")
+                        if _tc.get("name") == "read_skill":
+                            # 模型显式要求读全文：不走预算收敛，仅受安全上限约束（name 标记供后续摘要化）
+                            _max_result = TOOL_RESULT_MAX_CHARS
+                            _new_tool_call_ids.add(_tc.get("id"))
+                        else:
+                            # 其余工具结果按剩余预算动态收敛（预算充足时全量保留）
+                            _max_result = _tool_result_quota
+                        react_messages.append(ToolMessage(
+                            content=str(_result)[:_max_result],
+                            tool_call_id=_tc.get("id"),
+                            name=("read_skill" if _tc.get("name") == "read_skill" else None),
+                        ))
+                    # 技能全文只在读取那轮保留，后续轮收敛为章节骨架，避免技能正文常驻膨胀
+                    react_messages = _condense_read_skill_results(react_messages, _new_tool_call_ids)
+                    # 触发式上下文压缩：预计下一轮输入将超预算红线时压缩早期轮次（动态，对齐 Codex）
+                    _added_chars = sum(len(str(m.content or "")) for m in react_messages) - _prev_react_chars
+                    react_messages = _maybe_compact_react_messages(
+                        react_messages, used_tokens=_current_input_tokens, added_chars=_added_chars,
+                    )
+                if _direct_output is not None:
+                    # react 轮已直接输出结构化 JSON：直接使用，跳过定稿 LLM 调用
+                    planner_output = _direct_output
+                else:
+                    # 定稿：模型主动停止工具时优先 fast；fast 定稿空文本时回退 thinking 一次（不重跑工具）
+                    _use_fast = _tool_break
+                    planner_output = _invoke_llm_with_retry(
+                        (structured_llm_fast if _use_fast else structured_llm),
+                        react_messages,
+                    )
+                    if _use_fast and not (planner_output.respond_text or "").strip():
+                        planner_output = _invoke_llm_with_retry(structured_llm, react_messages)
+                # 模型输出即终态：空文本仅做一次通用兜底，绝不重试（对齐 Codex）
+                # 模型输出即终态：不再由程序替模型兜底措辞（对齐 Codex 自由输出），respond_text 原样输出
             finally:
                 reset_result_conversation(_conv_token)
                 end_semantic_dedup(_sem_token)
@@ -726,25 +897,13 @@ def build_planner_node(runtime):
                 return _ret
 
             if route_llm == "respond":
-                # respond 分支：直接输出文本给用户（澄清/确认/直接回答由 LLM 自定）
-                if not respond_text:
-                    # 回答未完成且已达重试上限：用通用引导兜底，不暴露内部 reason
-                    respond_text = "请补充最关键的指标、维度或过滤条件，我好继续为您查询。"
+                # respond 分支：直接输出文本给用户（澄清/确认/直接回答由 LLM 自定，空文本原样输出不再替模型兜底）
 
                 planner_reason = "Planner 判定 respond（澄清/回答）：" + planner_output.reason
                 return _respond_return("respond", respond_text, planner_reason)
 
-            # ── route 非 respond 兜底（防御）：单 Agent 下 route 已收敛为 respond，
-            # LLM 异常输出 execute 等值时按 respond 处理，避免崩溃 ──
-            fallback_text = (
-                planner_output.reason.strip()
-                or "请补充查询条件，我再为您查询。"
-            )
-            planner_reason = (
-                "Planner 输出异常 route（非 respond），兜底改为 respond："
-                + planner_output.reason
-            )
-            return _respond_return("respond", fallback_text, planner_reason)
+            # route 已由 schema 约束恒为 respond（Literal["respond"]），此处仅防御意外值
+            return _respond_return("respond", planner_output.reason or "查询遇到问题，请稍后重试。", planner_output.reason or "")
 
 
         except Exception as error:

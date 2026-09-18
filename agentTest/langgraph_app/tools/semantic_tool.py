@@ -4,6 +4,9 @@ import re
 from contextvars import ContextVar
 
 from langchain.tools import tool
+from agentTest.config.semantic import (
+    SEMANTIC_GREP_TOP_K,
+)
 from agentTest.semantic_layer.metric_matcher import (
     grep_metric_files_from_keywords,
     format_metric_context,
@@ -11,6 +14,20 @@ from agentTest.semantic_layer.metric_matcher import (
 
 # 请求级去重集合：记录本轮已展示过的指标 id，避免 Planner 多轮检索重复注入同一候选导致 prompt 膨胀
 _seen_metric_ids: ContextVar = ContextVar("search_semantic_seen_ids", default=None)
+# 按上下文预算动态收敛：Planner 每轮按剩余预算算出 search_semantic 结果配额，
+# 通过 ContextVar 传给工具（copy_context 并行子线程会继承），None 表示预算充足不收敛
+_render_budget: ContextVar = ContextVar("search_semantic_render_budget", default=None)
+
+
+def set_semantic_render_budget(max_chars):
+    """设置本轮 search_semantic 结果最大字符配额（按剩余预算派生），返回 token 供复位。"""
+    return _render_budget.set(max_chars)
+
+
+def reset_semantic_render_budget(token) -> None:
+    """请求结束：复位渲染预算，防止跨请求串状态。"""
+    _render_budget.reset(token)
+
 # 请求级已展示指标清单（id/name/来源表）：供上下文压缩时生成轻量摘要替代早期工具轮
 _seen_metric_meta: ContextVar = ContextVar("search_semantic_seen_meta", default=None)
 
@@ -68,7 +85,10 @@ def build_search_semantic_tool(provider=None, limit: int = 3):
         keywords = _split_keywords(question)
         if not keywords:
             return "未找到匹配结果。"
-        matches = grep_metric_files_from_keywords(keywords, provider=provider, limit=limit)
+        # 多词合并检索时按词数动态放量候选数：确保每个业务词至少可能覆盖一个指标，
+        # 避免固定 top-k 截断导致模型认为漏指标而分轮补搜（对齐 Codex 一次并行检索）
+        _limit = max(SEMANTIC_GREP_TOP_K, len(keywords))
+        matches = grep_metric_files_from_keywords(keywords, provider=provider, limit=_limit)
         if not matches:
             return "未找到匹配结果。"
         # 请求内去重：只返回未展示过的新指标，重复候选提示直接引用，避免上下文累积膨胀
@@ -77,7 +97,8 @@ def build_search_semantic_tool(provider=None, limit: int = 3):
         seen = _seen_metric_ids.get()
         if seen is None:
             # 未开启去重（独立调用场景）：退化为不去重，直接返回全部候选
-            return format_metric_context(matches, compact=False)
+            budget = _render_budget.get()
+            return format_metric_context(matches, compact=budget is not None, max_chars=budget)
         new_matches = [m for m in matches if str(m.get("id") or "") not in seen]
         if not new_matches:
             names = "、".join(str(m.get("name") or m.get("id") or "") for m in matches[:3])
@@ -92,6 +113,8 @@ def build_search_semantic_tool(provider=None, limit: int = 3):
                     "source_model": m.get("source_model", ""),
                 })
         # 完整渲染：命中后返回含备注/枚举/来源文件的完整口径（对齐 codex 打开指标文件读全文）
-        return format_metric_context(new_matches, compact=False)
+        budget = _render_budget.get()
+        # 预算紧张时精简口径并限制长度（完整口径由 execute_query 程序反查使用）
+        return format_metric_context(new_matches, compact=budget is not None, max_chars=budget)
 
     return search_semantic

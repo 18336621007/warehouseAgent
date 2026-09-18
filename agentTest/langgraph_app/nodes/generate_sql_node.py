@@ -2,6 +2,7 @@
 # 新增 SQL 级全量校验：以 confirmed_plan 为基准，校验表名/度量/维度/时间/过滤条件
 # 新增降级 SQL 构造：LLM 重试仍不一致时，根据 confirmed_plan 直接构造标准 SQL
 import re
+from datetime import date, timedelta
 from langchain_core.prompts import ChatPromptTemplate
 
 from agentTest.langchain_app.utils.sql_cleaner import clear_sql
@@ -47,11 +48,11 @@ def _format_examples(docs: list) -> str:
 
 
 
-# ── 标准日期处理函数映射 ──
-DATE_FORMAT_HIVE_EXPR = {
-    "yyyyMMdd": "regexp_replace(date_sub(current_date(), 1), '-', '')",
-    "yyyy-MM-dd": "date_sub(current_date(), 1)",
-}
+# ── 昨天日期字面量（按时间字段格式生成，避免 Hive/Trino 方言函数差异）──
+def _yesterday_literal(time_field: str) -> str:
+    """按时间字段格式生成"昨天"具体日期（无引号）：pt_dt 分区为 yyyyMMdd，其余时间字段默认 yyyy-MM-dd。"""
+    fmt = "%Y%m%d" if str(time_field).lower() == "pt_dt" else "%Y-%m-%d"
+    return (date.today() - timedelta(days=1)).strftime(fmt)
 
 
 def _normalize_join_keys(keys) -> list[str]:
@@ -100,7 +101,7 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     if is_detail and (confirmed_plan.get("time_range", "") or "昨天") != "昨天":
         return ""
 
-    date_expr = DATE_FORMAT_HIVE_EXPR.get("yyyyMMdd", "date_sub(current_date(), 1)")
+    date_expr = f"'{_yesterday_literal(time_field)}'"
 
     # 多表：主表 + JOIN 子句，使用短表名作为别名
     def _short_name(full_name: str) -> str:
@@ -163,7 +164,7 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
             tp_alias = _get_alias(tp_table)
             tp_time = tp.get("time_field", "pt_dt")
             tp_filters = tp.get("filters", "")
-            tp_date_expr = DATE_FORMAT_HIVE_EXPR.get("yyyyMMdd", "date_sub(current_date(), 1)")
+            tp_date_expr = f"'{_yesterday_literal(tp_time)}'"
             table_conditions.setdefault(tp_table, []).append(
                 f"{tp_alias}.{tp_time} = {tp_date_expr}"
             )

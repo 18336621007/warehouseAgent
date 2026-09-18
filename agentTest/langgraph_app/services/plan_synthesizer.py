@@ -58,6 +58,21 @@ def _extract_measure_expression(expression: str, field: str) -> str:
     return f"{agg}({distinct + ' ' if distinct else ''}{field})"
 
 
+def _match_direct_field(word, scope_ids, sl) -> tuple:
+    """维度词未命中实体时，若其本身就是候选模型的真实物理字段则直接采用（字段名直配）。
+
+    返回 (field, table)；找不到返回 None。
+    """
+    w = str(word or "").strip()
+    if not w:
+        return None
+    for model_id in scope_ids:
+        fields = sl.get_table_fields(model_id) or []
+        if w in fields:
+            return (w, model_id)
+    return None
+
+
 def _resolve_dimensional_measure_field(dim_measures: list, dimension_mentions) -> str:
     """从 dimensional_measures 子项按用户指定的子口径（dimension/aliases）解析物理字段。
 
@@ -217,6 +232,26 @@ def build_plan_from_semantic(
             "concept_type": "metric",
         }
 
+    # dimensional_measures 子口径选择词（如"激活电柜"）仅用于解析 {field} 占位符，
+    # 不参与分组维度解析；先收集被消费的词，维度循环中跳过
+    consumed_dims = set()
+    for hit in metric_hits:
+        if not (hit.get("dimensional_measures") or []):
+            continue
+        for _item in hit["dimensional_measures"]:
+            if not isinstance(_item, dict):
+                continue
+            _dim = str(_item.get("dimension") or "")
+            _aliases = [str(a) for a in (_item.get("aliases") or []) if str(a).strip()]
+            for _m in (dimension_mentions or []):
+                _wm = str(_m or "").strip()
+                if not _wm:
+                    continue
+                if (_wm == _dim or any(_wm == a for a in _aliases)
+                        or (_dim and (_dim in _wm or _wm in _dim))
+                        or any(a and (a in _wm or _wm in a) for a in _aliases)):
+                    consumed_dims.add(_wm)
+
     # 维度解析：业务词 → 实体 → 物理字段（分组键 + 展示字段）
     all_models = sl.get_all_semantic_models()
     scope_ids = set(tables)
@@ -229,12 +264,31 @@ def build_plan_from_semantic(
     # 交由 generate_sql 结合 effective_query 与字段上下文自行判断，不阻塞方案构建
     unresolved_dimensions = []
     for word in (dimension_mentions or []):
+        if str(word or "").strip() in consumed_dims:
+            continue
         entity = None
         for candidate in _entity_aliases(word):
             entity = sl.get_entity_by_keyword(candidate)
             if entity:
                 break
         if not entity:
+            # 实体未命中时兜底：维度词本身就是候选表上的真实物理字段时直接采用
+            # （避免 LLM 臆造字段被静默丢弃，如时间维度 date_day/hour）
+            _direct = _match_direct_field(word, scope_ids, sl)
+            if _direct:
+                dim_field, dim_table = _direct
+                if dim_field not in dimensions:
+                    dimensions.append(dim_field)
+                if dim_table not in tables:
+                    tables.append(dim_table)
+                field_sources.setdefault(dim_field, dim_table)
+                concept_resolutions[str(word)] = {
+                    "field": dim_field,
+                    "table": dim_table,
+                    "source": "direct_field_match",
+                    "concept_type": "dimension",
+                }
+                continue
             unresolved_dimensions.append(word)
             continue
         entity_fields = resolve_entity_dimension_fields(

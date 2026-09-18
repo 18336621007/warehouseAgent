@@ -163,8 +163,8 @@ class ExecuteQueryToolTest(unittest.TestCase):
         self.assertEqual(kwargs.get("tier"), "unique")
         self.assertIn("addition_order_num", kwargs.get("metric_ids", []))
 
-    def test_multi_steps_serial_execution(self):
-        """steps 多段串行：每段独立 request_id，Seeker 调用次数=段数，返回各段摘要。"""
+    def test_multi_steps_parallel_execution(self):
+        """steps 多段并行：每段独立 request_id，Seeker 调用次数=段数，返回各段摘要。"""
         seeker = _FakeSeekerGraph(_success_result())
         tool = build_execute_query_tool(_runtime(), seeker)
         steps = json.dumps([
@@ -175,15 +175,15 @@ class ExecuteQueryToolTest(unittest.TestCase):
         self.assertEqual(len(seeker.calls), 2)
         # 每段独立 request_id：落盘 result_id / CSV 文件名唯一，可被 query_stored_result 分别引用
         rids = [c.get("request_id") for c in seeker.calls]
-        self.assertEqual(rids[0], "req-1_s1")
-        self.assertEqual(rids[1], "req-1_s2")
-        self.assertIn("已串行执行多段查询", out)
+        # 并行执行下调用顺序不保证，按集合比较每段独立 request_id
+        self.assertCountEqual(rids, ["req-1_s1", "req-1_s2"])
+        self.assertIn("已并行执行多段查询", out)
         self.assertIn("[s1]", out)
         self.assertIn("[s2]", out)
         self.assertIn("查询成功", out)
 
     def test_multi_steps_saves_script_meta(self):
-        """多段串行：保存查询脚本元数据（每段定义 + SQL + 结果引用），供审计与按段引用。"""
+        """多段并行：保存查询脚本元数据（每段定义 + SQL + 结果引用），供审计与按段引用。"""
         seeker = _FakeSeekerGraph(_success_result())
         tool = build_execute_query_tool(_runtime(), seeker)
         steps = json.dumps([
@@ -238,7 +238,7 @@ class ExecuteQueryToolTest(unittest.TestCase):
         self.assertIn("stag_order_counts", measures)
 
     def test_steps_diff_source_metrics_split_groups(self):
-        """异表多指标：按来源表自动拆组串行执行，每组独立 request_id。"""
+        """异表多指标：按来源表自动拆组并行执行，每组独立 request_id。"""
         seeker = _FakeSeekerGraph(_success_result())
         tool = build_execute_query_tool(_runtime(), seeker)
         steps = json.dumps([{
@@ -249,7 +249,8 @@ class ExecuteQueryToolTest(unittest.TestCase):
         out = tool.invoke({"question": "", "steps": steps})
         self.assertEqual(len(seeker.calls), 2)
         rids = [c.get("request_id") for c in seeker.calls]
-        self.assertEqual(rids, ["req-1_s2_g1", "req-1_s2_g2"])
+        # 并行执行下调用顺序不保证，按集合比较两组独立 request_id
+        self.assertCountEqual(rids, ["req-1_s2_g1", "req-1_s2_g2"])
 
     def test_dimensional_measure_resolves_via_dimension(self):
         """dimensional_measures 子口径：dimension 传入（如“激活电柜”）时解析 {field} 为真实字段。"""

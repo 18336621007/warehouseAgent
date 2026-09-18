@@ -5,6 +5,10 @@ from flask import Flask, request, jsonify, send_from_directory, Response, stream
 from flask_cors import CORS
 import uuid, os, sys, json, threading
 
+# 强制 stdout/stderr 行缓冲，让启动日志与请求日志实时显示（避免块缓冲憋住，进程结束才刷出）
+sys.stdout.reconfigure(line_buffering=True, encoding="utf-8")
+sys.stderr.reconfigure(line_buffering=True, encoding="utf-8")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentTest.langgraph_app.runtime.graph_logger import bind_log_context
 from agentTest.langgraph_app.runtime.graph_logger import reset_log_context

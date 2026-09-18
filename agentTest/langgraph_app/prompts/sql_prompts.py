@@ -20,10 +20,7 @@ def build_sql_generation_prompt():
     9. 涉及"各<…>""按<…>分组""分布""分别"等分组聚合场景时：
        - 维度字段放入 SELECT 和 GROUP BY
        - 度量字段用 SUM/COUNT/AVG 等聚合函数包裹，不得放入 GROUP BY
-    10. 分区字段 pt_dt 格式为 yyyyMMdd（8位数字字符串）。时间条件由你根据问题中的时间语义自动生成，但必须保证与 pt_dt 比较的值也是 yyyyMMdd 字符串：
-        - 昨天：pt_dt = date_format(date_sub(current_date(), 1), 'yyyyMMdd')（也可直接写 8 位字面量，如 pt_dt = '20260826'）
-        - 今天：pt_dt = date_format(current_date(), 'yyyyMMdd')
-        - 近N天：pt_dt >= date_format(date_sub(current_date(), N), 'yyyyMMdd') AND pt_dt <= date_format(current_date(), 'yyyyMMdd')
+    10. 时间条件直接使用 confirmed_section 中已给出的时间过滤条件（值已按字段实际格式写好，如 pt_dt='20260916' 或 create_time >= '2026-01-01'），不得重复添加动态日期条件；若确需自写，写成与时间字段实际存储格式一致的字面量。相对时间（昨天/今天/近N天）按当前日期换算成具体值。禁止使用 date_sub、date_format、current_date 等函数（Trino/Hive 通用）。
     11. 所有查询必须包含方案指定的时间字段过滤条件（时间字段见 confirmed_section：
         通常是 pt_dt 分区，明细查询可能是 create_time 等业务时间字段），比较值格式按该字段类型确定
     12. 如果 {example_section} 不为空，请参考历史优质案例：

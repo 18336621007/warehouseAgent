@@ -1,6 +1,7 @@
 # 多表确认协议与复合Join键回归测试。
 import json
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,6 +66,10 @@ def _build_plan() -> dict:
     }
 
 
+# 兜底/修复 SQL 的"昨天"pt_dt 字面量（程序按当天动态计算）
+_YDAY8 = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+
+
 class MultiTableConfirmationFlowTest(unittest.TestCase):
     """覆盖单次确认和多表Join安全规则。"""
 
@@ -76,9 +81,9 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
 
         self.assertIn("a.pt_platform = b.pt_platform", on_clause)
         self.assertIn("a.company_id = b.company_id", on_clause)
-        self.assertIn("b.pt_dt = regexp_replace", on_clause)
-        self.assertIn("a.pt_dt = regexp_replace", where_clause)
-        self.assertNotIn("b.pt_dt = regexp_replace", where_clause)
+        self.assertIn(f"b.pt_dt = '{_YDAY8}'", on_clause)
+        self.assertIn(f"a.pt_dt = '{_YDAY8}'", where_clause)
+        self.assertNotIn(f"b.pt_dt = '{_YDAY8}'", where_clause)
 
     def test_plan_consistency_accepts_qualified_aggregate_field(self):
         """方案一致性校验必须识别带表别名的聚合字段。"""
@@ -157,7 +162,7 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
         repaired_sql, repair_reasons = _repair_missing_table_filters(sql, plan)
         self.assertTrue(repair_reasons)
         self.assertNotEqual(repaired_sql, sql)
-        self.assertIn("b.pt_dt = regexp_replace", repaired_sql)
+        self.assertIn(f"b.pt_dt = '{_YDAY8}'", repaired_sql)
         self.assertEqual(
             validate_table_plan_filters(
                 repaired_sql,

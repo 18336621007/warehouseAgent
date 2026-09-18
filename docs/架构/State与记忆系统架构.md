@@ -1,6 +1,7 @@
 # State 与记忆系统架构
 
 > 最后更新：2026-08-27
+> ⚠️ 现状（2026-09-17）：Advisor（submit_query_plan / update_draft_plan）与 Evaluator 已随 M4 单 Agent 改造删除，confirmed_plan 仅作状态保存、不再注入 prompt；本文相关章节保留作演进历史参考。
 > [返回文档索引](../文档索引.md)
 
 ## 一、设计目标
@@ -532,15 +533,12 @@ sequenceDiagram
 | `agentTest/langgraph_app/state/query_plan.py` | QueryPlan 结构与 locked/confirmed 校验 |
 | `agentTest/langgraph_app/services/query_plan_service.py` | 方案标准化、锁定和最终确认 |
 | `agentTest/langgraph_app/state/analysis_spec.py` | 指标概念、解析证据与当前 pending 状态 |
-| `agentTest/langgraph_app/services/metric_clarification_service.py` | 固化候选、解析用户选择并回写 AnalysisSpec |
 | `agentTest/langgraph_app/services/query_plan_schema_resolver.py` | 按确认方案精确校验并加载单表 Schema |
 | `agentTest/langgraph_app/nodes/retrieve_schema_node.py` | 调用 Resolver 写入 schema_context |
 | `agentTest/langgraph_app/state/agent_state.py` | GraphInput、GraphOutput、AgentState 聚合 |
 | `agentTest/langgraph_app/nodes/capture_user_message_node.py` | 记录本轮用户消息 |
-| `agentTest/langgraph_app/message_utils.py` | 读取指定 Agent 回复、构造 Advisor 对话上下文 |
+| `agentTest/langgraph_app/message_utils.py` | 读取指定 Agent 回复、构造对话历史上下文 |
 | `agentTest/langgraph_app/graphs/supervisor_graph.py` | 父图编排与 MemorySaver |
-| `agentTest/langgraph_app/graphs/advisor_graph.py` | Advisor 消息与工具链管理 |
-| `agentTest/langgraph_app/nodes/build_final_answer_node.py` | 写入 Seeker 最终消息 |
 | `web/server.py` | Conversation/Topic 管理和 GraphInput 构造 |
 
 相关文档：

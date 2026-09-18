@@ -5,6 +5,8 @@ import unittest
 from unittest import mock
 
 from langchain_core.messages import AIMessage
+# 空 respond_text 的兜底引导语（与 planner_node 保持一致）
+
 from agentTest.langgraph_app.prompts.planner_prompt import (
     PLANNER_SYSTEM_PROMPT,
     PlannerOutput,
@@ -42,7 +44,7 @@ class _FakeReactLLM:
             tc = self._tool_calls_list[self._step]
             self._step += 1
             return AIMessage(content="", tool_calls=[tc])
-        return AIMessage(content="信息已充分，直接输出判定")
+        return AIMessage(content="")
 
 
 class _FakeStructuredLLM:
@@ -108,7 +110,7 @@ def _state(user_input, messages=None, **overrides):
 def _planner_kwargs(**overrides):
     base = {
         "effective_query": "查询徐州大区今年同意返厂的返厂明细",
-        "route": "execute",
+        "route": "respond",
         "respond_text": "",
         "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
         "fields": [],
@@ -164,8 +166,8 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
         self.assertNotIn("SQL 执行成功但无数据", user_content)
 
     def test_zero_row_self_heal_probe_then_execute_query(self):
-        # 0 行自愈链路：react 先调 probe_values 探查，structured 仍 route=execute
-        # 循环提示调 execute_query 工具，重试耗尽后兜底 respond（不直接 route=execute）
+        # 0 行自愈链路：react 先调 probe_values 探查，structured 仍 respond 空文本
+        # 循环提示补齐，重试耗尽后兜底 respond（不直接构建方案执行）
         react_tool_calls = [
             {
                 "name": "search_semantic",
@@ -206,18 +208,11 @@ class EmptyResultRoutingPolicyTest(unittest.TestCase):
                 seeker_empty_result=True,
                 generated_sql="SELECT * FROM ads_trip.ads_gundam_device_return_detail_hour WHERE region_name='徐州'",
             ))
-        # 探查后仍需通过 execute_query 工具查数，Planner 不直接 route=execute
+        # 探查后仍需通过工具查数，Planner 不直接构建方案执行；
+        # respond 空文本直接兜底通用引导，不再循环重试
         self.assertEqual(result.get("route"), "respond")
         self.assertEqual(result.get("topic_status"), "clarifying")
-        self.assertTrue(
-            any(
-                "execute_query 工具" in str(m.content)
-                for msgs in seen
-                for m in msgs
-                if getattr(m, "type", "") == "system"
-            ),
-            "应提示调用 execute_query 工具",
-        )
+        self.assertEqual(result.get("final_answer"), "")
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ class _FakeReactLLM:
             tc = self._tool_calls_list[self._step]
             self._step += 1
             return AIMessage(content="", tool_calls=[tc])
-        return AIMessage(content="信息已充分，直接输出判定")
+        return AIMessage(content="")
 
 
 class _FakeStructuredLLM:
@@ -148,14 +148,11 @@ class PlannerRouteRespondTest(unittest.TestCase):
         # 非执行回看的 respond 不触发 Evaluator
         self.assertFalse(result.get("evaluator_pending"))
 
-    def test_respond_route_empty_text_falls_back_guidance(self):
-        """route=respond 但 respond_text 为空（回答未完成）：回退通用引导语，不暴露内部 reason。"""
+    def test_respond_route_empty_text_passes_through(self):
+        """route=respond 但 respond_text 为空：原样输出空文本，不再由程序替模型兜底措辞（对齐 Codex 自由输出）。"""
         result = self._run_planner(_planner_kwargs(respond_text=""))
         self.assertEqual(result["route"], "respond")
-        self.assertEqual(
-            result["final_answer"],
-            "请补充最关键的指标、维度或过滤条件，我好继续为您查询。",
-        )
+        self.assertEqual(result["final_answer"], "")
 
     def test_respond_message_in_history_context(self):
         """Planner respond 的消息应进入对话历史（供后续追问）。"""
@@ -167,41 +164,6 @@ class PlannerRouteRespondTest(unittest.TestCase):
         ]
         ctx = _build_history_context(messages)
         self.assertIn("已确认无数据", ctx)
-
-    def test_execute_route_without_tool_falls_back_to_respond(self):
-        """route=execute 但未调用 execute_query：循环提示查数，重试耗尽后兜底 respond（不再直接构建方案）。"""
-        seen = []
-        result = self._run_planner(
-            _planner_kwargs(
-                route="execute",
-                effective_query="查询昨天的新增订单数",
-                dimension_mentions=[],
-                filters="pt_dt 昨天",
-                semantic_metrics=[
-                    {
-                        "id": "addition_order_num",
-                        "confidence": 0.95,
-                        "mention": "新增订单",
-                    }
-                ],
-            ),
-            seen_messages=seen,
-        )
-        # 单 Agent：查数必须由 execute_query 工具完成，Planner 不再直接 route=execute
-        self.assertEqual(result["route"], "respond")
-        self.assertEqual(result["topic_status"], "clarifying")
-        self.assertIsNone(result.get("confirmed_plan"))
-        # 循环内提示过"查数必须调用 execute_query 工具"
-        self.assertTrue(
-            any(
-                "execute_query 工具" in str(m.content)
-                for msgs in seen
-                for m in msgs
-                if getattr(m, "type", "") == "system"
-            ),
-            "应提示调用 execute_query 工具",
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

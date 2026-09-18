@@ -70,7 +70,7 @@ def get_llm_fast_extra_body() -> dict:
 
 # 简要注释：模型上下文窗口 token 上限（供前端展示上下文使用进度，可在 .env 按模型覆盖）。
 def get_model_context_window() -> int:
-    value = os.getenv("MODEL_CONTEXT_WINDOW", "128000").strip()
+    value = os.getenv("MODEL_CONTEXT_WINDOW", "256000").strip()
     try:
         return int(value)
     except ValueError:

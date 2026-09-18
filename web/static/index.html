@@ -95,6 +95,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
 /* 上下文使用进度与压缩提示（仿 Codex） */
 .context-info { margin-top: 8px; font-size: 12px; color: #888; }
+
+/* 上下文使用圆环（输入框左侧，仿 Codex）：环形进度 + hover 展示具体用量 */
+.ctx-ring-wrap { display: flex; align-items: center; cursor: default; position: relative; flex-shrink: 0; }
+.ctx-ring-svg { width: 34px; height: 34px; transform: rotate(-90deg); display: block; }
+.ctx-ring-bg { fill: none; stroke: #3E3E3E; stroke-width: 3; }
+.ctx-ring-fg { fill: none; stroke: #10A37F; stroke-width: 3; stroke-linecap: round; transition: stroke-dashoffset 0.4s ease; }
+.ctx-ring-fg.warn { stroke: #F0C040; }
+.ctx-ring-fg.danger { stroke: #E5484D; }
+.ctx-ring-tip { display: none; position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+    background: #171717; color: #ECECF1; border: 1px solid #3E3E3E; border-radius: 6px;
+    padding: 6px 10px; font-size: 12px; white-space: nowrap; z-index: 10; line-height: 1.5; }
+.ctx-ring-wrap:hover .ctx-ring-tip { display: block; }
+.ctx-ring-tip .tip-compacted { color: #F0C040; }
 .context-bar { height: 4px; background: #333; border-radius: 2px; overflow: hidden; margin-top: 4px; }
 .context-bar-fill { height: 100%; width: 0%; background: #10A37F; transition: width 0.4s ease; }
 .context-bar-fill.warn { background: #F0C040; }
@@ -119,6 +132,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
     </div>
     <div class="input-area">
         <div class="input-row">
+            <div id="ctxRingWrap" class="ctx-ring-wrap" title="上下文使用情况">
+                <svg id="ctxRingSvg" class="ctx-ring-svg" viewBox="0 0 36 36">
+                    <circle class="ctx-ring-bg" cx="18" cy="18" r="15.5"></circle>
+                    <circle class="ctx-ring-fg" cx="18" cy="18" r="15.5"></circle>
+                </svg>
+                <div class="ctx-ring-tip" id="ctxRingTip">上下文使用情况</div>
+            </div>
             <input type="text" id="msgInput" placeholder="输入你的数据查询需求..." onkeydown="if(event.key==='Enter') sendMsg()" />
             <button id="sendBtn" onclick="sendMsg()">发送</button>
         </div>

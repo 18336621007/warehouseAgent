@@ -46,7 +46,7 @@ class _FakeReactLLM:
             tc = self._tool_calls_list[self._step]
             self._step += 1
             return AIMessage(content="", tool_calls=[tc])
-        return AIMessage(content="信息已充分，直接输出判定")
+        return AIMessage(content="")
 
 
 class _FakeStructuredLLM:
@@ -113,7 +113,8 @@ def _state(user_input, messages=None):
 def _planner_kwargs(**overrides):
     base = {
         "effective_query": "查询昨天从山东瀛能公司调出的调出明细",
-        "route": "execute",
+        "route": "respond",
+        "respond_text": "已查询到调出明细，请查看。",
         "tables": ["ads_trip.ads_gundam_device_transfer_detail_hour"],
         "fields": ["origin_company_name", "transfer_no"],
         "completeness": "full",
@@ -203,9 +204,9 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         self.assertIn("device_return_detail", ids)
 
     def test_no_semantic_grep_falls_back_to_respond(self):
-        """无 grep 命中：semantic_metrics 为空，Planner 判定 execute 但未调 execute_query，兜底 respond。"""
+        """无 grep 命中：semantic_metrics 为空，Planner 直接 respond（不构建方案执行）。"""
         planner_kwargs = _planner_kwargs(
-            route="execute",
+            route="respond",
             semantic_keywords=["排产"],
             semantic_metrics=[],
         )
@@ -216,10 +217,10 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
         self.assertEqual(result["route"], "respond")
         self.assertIsNone(result.get("confirmed_plan"))
 
-    def test_execute_route_with_semantic_hit_falls_back_to_respond(self):
-        """Planner 判定 execute 且语义层唯一强命中：候选保留供日志/trace，未调工具时兜底 respond。"""
+    def test_respond_route_with_semantic_hit_keeps_candidates(self):
+        """Planner 判定 respond 且语义层唯一强命中：候选保留供日志/trace，不直接构建方案执行。"""
         planner_kwargs = _planner_kwargs(
-            route="execute",
+            route="respond",
             effective_query="查询昨天的新增订单数",
             dimension_mentions=[],
             filters="pt_dt 昨天",
@@ -251,14 +252,14 @@ class PlannerSemanticGrepFlowTest(unittest.TestCase):
                 for t in entities["table_candidates"]
             )
         )
-        # 未调用 execute_query：兜底 respond，不再由 Planner 直接构建 confirmed_plan
+        # respond 分支：不直接构建 confirmed_plan 执行
         self.assertEqual(result["route"], "respond")
         self.assertIsNone(result.get("confirmed_plan"))
 
-    def test_execute_route_without_tables_falls_back_to_respond(self):
-        """Planner 判定 execute 但既无表信息也无法构建方案时，respond 澄清（不再降级 Advisor）。"""
+    def test_respond_route_without_tables_falls_back_to_respond(self):
+        """Planner 判定 respond 且既无表信息也无法构建方案时，respond 澄清（不再降级 Advisor）。"""
         planner_kwargs = _planner_kwargs(
-            route="execute",
+            route="respond",
             effective_query="查询昨天的续租率",
             tables=[],
             fields=[],

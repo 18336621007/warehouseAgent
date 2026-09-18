@@ -19,6 +19,7 @@ async function newChat() {
         $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         refreshConvList();
         updateInputLock();
+        updateContextRing(null, null);
         return true;
     } catch (e) { return false; }
 }
@@ -37,6 +38,19 @@ function loadConversation(conversationIdToLoad) {
     if (pendingRequests[conversationIdToLoad]) appendPendingMessage(conversationIdToLoad);
     refreshConvList();
     updateInputLock();
+    // 恢复该会话最后一次的上下文使用进度（取最后一条含 context_progress/compacted 的助手消息）
+    var lastProgress = null, lastCompacted = null;
+    if (conv && conv.messages) {
+        for (var mi = conv.messages.length - 1; mi >= 0; mi--) {
+            var mm = conv.messages[mi];
+            if (mm.role === "assistant" && (mm.context_progress || mm.context_compacted)) {
+                lastProgress = mm.context_progress || null;
+                lastCompacted = mm.context_compacted || null;
+                break;
+            }
+        }
+    }
+    updateContextRing(lastProgress, lastCompacted);
 }
 
 async function renameConv(conversationIdToRename, event) {
@@ -258,6 +272,8 @@ async function sendMsg() {
                             percent: event.percent,
                         };
                         updatePendingMessage(reqConv);
+                        // 输入框左侧圆环实时更新（仅当前显示会话）
+                        if (reqConv === conversationId) updateContextRing(pend.contextProgress, pend.contextCompacted);
                     } else if (event.type === "context_compacted") {
                         // 上下文压缩提示：展示"已压缩"与节省量
                         pend.contextCompacted = {
@@ -266,6 +282,7 @@ async function sendMsg() {
                             saved_chars: event.saved_chars,
                         };
                         updatePendingMessage(reqConv);
+                        if (reqConv === conversationId) updateContextRing(pend.contextProgress, pend.contextCompacted);
                     } else if (event.type === "done") {
                         pend.doneReceived = true;
                         if (pend.thinkTimer) stopThinkTimer(pend);
@@ -475,11 +492,7 @@ function appendPendingMessage(convId) {
     answerPreview.style.display = "none";
     bubble.appendChild(answerPreview);
 
-    // 上下文使用进度与压缩提示（仿 Codex）：请求过程中实时更新
-    var ctxInfo = document.createElement("div");
-    ctxInfo.className = "context-info";
-    ctxInfo.style.display = "none";
-    bubble.appendChild(ctxInfo);
+    // 上下文使用进度改由输入框左侧圆环展示（updateContextRing），不再在消息气泡内渲染
 
     // 消息区滚动监听只绑定一次：用户上翻历史时暂停自动滚动
     if (!area._scrollBound) {
@@ -524,30 +537,46 @@ function updatePendingMessage(convId) {
             thinkBtn.innerHTML = '<span class="arrow">▼</span> 查看思考过程（' + pend.thinkingSeconds + 's）';
         }
     }
-    // 上下文使用进度：进度条 + 百分比；压缩发生时叠加提示
-    var ctxEl = wrapper.querySelector(".context-info");
-    if (ctxEl) {
-        if (pend.contextProgress && pend.contextProgress.window_tokens) {
-            var pct = pend.contextProgress.percent || 0;
-            var warnCls = pct >= 90 ? " danger" : (pct >= 70 ? " warn" : "");
-            var savedTxt = "";
-            if (pend.contextCompacted) {
-                savedTxt = "<div class=\"context-compacted\">🧹 上下文已压缩，释放 " + fmtNum(pend.contextCompacted.saved_chars) + " 字符</div>";
-            }
-            ctxEl.innerHTML = "上下文使用 " + pct + "%（" + fmtNum(pend.contextProgress.used_tokens)
-                + " / " + fmtNum(pend.contextProgress.window_tokens) + " tokens）"
-                + "<div class=\"context-bar\"><div class=\"context-bar-fill' + warnCls + '\" style=\"width:' + pct + '%\"></div></div>"
-                + savedTxt;
-            ctxEl.style.display = "block";
-        } else if (pend.contextCompacted) {
-            ctxEl.innerHTML = "<div class=\"context-compacted\">🧹 上下文已压缩，释放 " + fmtNum(pend.contextCompacted.saved_chars) + " 字符</div>";
-            ctxEl.style.display = "block";
-        } else {
-            ctxEl.style.display = "none";
-        }
-    }
+    // 上下文使用进度改由输入框左侧圆环展示（updateContextRing），不再在消息气泡内渲染
     // 消息区：随内容增长自动滚动，用户上翻历史时保持不动
     if (area && !area._userScrolledUp) area.scrollTop = area.scrollHeight;
+}
+
+function setRing(pct) {
+    // 圆环进度：按百分比更新 SVG stroke-dashoffset（r=15.5，周长≈97.4）
+    var fg = $("ctxRingWrap") ? $("ctxRingWrap").querySelector(".ctx-ring-fg") : null;
+    if (!fg) return;
+    var c = 2 * Math.PI * 15.5;
+    fg.style.strokeDasharray = c;
+    fg.style.strokeDashoffset = c * (1 - pct / 100);
+}
+
+function updateContextRing(progress, compacted) {
+    // 输入框左侧上下文圆环：环形进度 + hover 显示具体用量（used / window）
+    var wrap = $("ctxRingWrap"); if (!wrap) return;
+    var tip = $("ctxRingTip"); if (!tip) tip = wrap.querySelector(".ctx-ring-tip");
+    if (!progress || !progress.window_tokens) {
+        // 无进度数据：圆环置 0，tooltip 显示占位
+        setRing(0);
+        wrap.title = "上下文使用情况";
+        if (tip) tip.textContent = "上下文使用情况";
+        return;
+    }
+    var pct = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+    setRing(pct);
+    var fg = wrap.querySelector(".ctx-ring-fg");
+    if (fg) {
+        fg.classList.toggle("warn", pct >= 70 && pct < 90);
+        fg.classList.toggle("danger", pct >= 90);
+    }
+    var base = "上下文使用 " + pct + "%（" + fmtNum(progress.used_tokens) + " / " + fmtNum(progress.window_tokens) + " tokens）";
+    var extra = "";
+    if (compacted && compacted.saved_chars) extra = "\n🧹 已压缩，释放 " + fmtNum(compacted.saved_chars) + " 字符";
+    wrap.title = base + extra;
+    if (tip) {
+        tip.innerHTML = "上下文 " + pct + "%<br>" + fmtNum(progress.used_tokens) + " / " + fmtNum(progress.window_tokens) + " tokens"
+            + (compacted && compacted.saved_chars ? "<br><span class=\"tip-compacted\">🧹 已压缩，释放 " + fmtNum(compacted.saved_chars) + " 字符</span>" : "");
+    }
 }
 
 function removePendingMessage(convId) {
@@ -622,25 +651,7 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         bubble.appendChild(tEl);
     }
 
-    // 上下文使用进度与压缩提示（历史消息从 msgObj 读取）
-    if (role === "assistant" && msgObj && (msgObj.context_progress || msgObj.context_compacted)) {
-        var ctxEl = document.createElement("div"); ctxEl.className = "context-info";
-        var pct = msgObj.context_progress ? (msgObj.context_progress.percent || 0) : 0;
-        var savedTxt = "";
-        if (msgObj.context_compacted) {
-            savedTxt = "<div class=\"context-compacted\">🧹 上下文已压缩，释放 " + fmtNum(msgObj.context_compacted.saved_chars) + " 字符</div>";
-        }
-        if (msgObj.context_progress && msgObj.context_progress.window_tokens) {
-            var warnCls = pct >= 90 ? " danger" : (pct >= 70 ? " warn" : "");
-            ctxEl.innerHTML = "上下文使用 " + pct + "%（" + fmtNum(msgObj.context_progress.used_tokens)
-                + " / " + fmtNum(msgObj.context_progress.window_tokens) + " tokens）"
-                + "<div class=\"context-bar\"><div class=\"context-bar-fill' + warnCls + '\" style=\"width:' + pct + '%\"></div></div>"
-                + savedTxt;
-        } else {
-            ctxEl.innerHTML = savedTxt;
-        }
-        bubble.appendChild(ctxEl);
-    }
+    // 上下文使用进度改由输入框左侧圆环展示（切换会话时由 loadConversation 恢复），不再在消息气泡内渲染
 
     if (role === "assistant" && evaluator) {
         var scoreArea = document.createElement("div"); scoreArea.className = "score-area";

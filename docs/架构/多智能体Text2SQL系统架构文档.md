@@ -1,6 +1,7 @@
 # 多智能体 Text2SQL 系统架构文档
 
 > 最后更新：2026-08-13 | Web 前端流式输出（思考过程/最终回答逐字、输入框即时解锁）；全局单一共享查询方案（Planner 改选落草稿、门禁只信 explicit_user）；Evaluator 复杂度预算评分；日志 call_id 配对与 LLM 输入去重
+> ⚠️ **现状提示（2026-09-17）**：系统已演进为 M4 单 Agent 架构（父图仅含 capture_user_message + planner 两个节点，查数通过 execute_query 工具在 Planner ReAct 循环内完成）。本文档中的 Advisor 节点（`advisor_graph.py`）、Evaluator（`evaluator_node.py`）及对应提示词（`advisor_prompt.py`/`evaluator_prompt.py`/`final_answer_prompt.py`/`reranker_prompt.py`）均已删除，相关章节保留作演进历史参考。
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
@@ -121,7 +122,7 @@ state/
 | `MAX_HIGH_SIMILARITY_COUNT` | 3 | 高相似候选统计与告警基线 |
 | `EXAMPLE_SIMILARITY_THRESHOLD` | 0.7 | 优质示例最低相似度 |
 
-### 3.3 Advisor（`graphs/advisor_graph.py`）
+### 3.3 Advisor（~~`graphs/advisor_graph.py`~~ 已废弃：节点与提示词已删除，澄清由 Planner respond 承担）
 
 **职责**：根据 Planner 模糊度选择澄清模式或方案模式，避免模型在业务口径不唯一时自行选字段。
 
@@ -196,7 +197,7 @@ retrieve_schema → generate_sql → validate_sql
 - AST 语法检查。
 - 表名白名单和重试次数保护。
 
-### 3.5 Evaluator（`nodes/evaluator_node.py`）
+### 3.5 Evaluator（~~`nodes/evaluator_node.py`~~ 已废弃：节点与提示词已删除）
 
 **职责**：多维度评分 + 优质对话沉淀，实现系统自迭代。
 
@@ -409,78 +410,44 @@ agentTest/
 ├── config/                          # 全局配置
 │   ├── settings.py                  # 环境变量读取
 │   ├── planner.py                   # Planner 阈值
-│   ├── advisor.py                   # Advisor 参数
-│   └── evaluator.py                 # Evaluator 权重与阈值
+│   ├── semantic.py                  # 语义层检索/置信度阈值
+│   ├── advisor.py / evaluator.py    # 历史配置（Advisor/Evaluator 已删除，常量保留给 example_vector_store/mysql_store）
+│   └── log_config.py                # 日志开关
 ├── metadata/                        # 元数据层
 │   ├── metadata_enricher.py         # 离线：Hive → MySQL 增强
-│   ├── mysql_store.py               # MySQL 读写 + 增量检测
-│   └── hive_meta_provider.py        # Hive 原始 schema 读取
-├── langchain_app/                   # RAG 基础设施
-│   ├── app_builder.py               # RAG 与工具构建入口
-│   ├── embeddings/
-│   │   └── bailian_embeddings.py    # 百炼 Embedding（含批量切分）
-│   ├── vectorstores/
-│   │   ├── schema_vector_store.py   # FAISS 构建/加载/落盘
-│   │   └── example_vector_store.py  # 示例向量库（去重 + 增删同步）
-│   ├── documents/                   # Document 构建器
-│   │   ├── enriched_db_documents.py     # 库级
-│   │   ├── enriched_table_documents.py  # 表级
-│   │   ├── enriched_column_documents.py # 字段级
-│   │   ├── enriched_schema_documents.py # 单层混合（旧）
-│   │   └── schema_documents.py          # 原始 schema
-│   └── retrievers/
-│       ├── schema_retriever.py      # 原始版检索器
-│       └── enriched_schema_retriever.py # 增强版检索器
-├── langgraph_app/                   # 多智能体框架核心
-│   ├── demo.py                      # CLI 多轮交互入口
-│   ├── message_utils.py             # 标准消息读取与可见对话上下文
-│   ├── state/                       # 分层 State
-│   │   ├── base_state.py
-│   │   ├── query_plan.py             # QueryPlan 契约与校验
-│   │   ├── planner_state.py
-│   │   ├── advisor_state.py
-│   │   ├── seeker_state.py
-│   │   └── agent_state.py
-│   ├── graphs/                      # 图定义
-│   │   ├── supervisor_graph.py      # 父图
-│   │   ├── seeker_graph.py          # Seeker 子图（含 Evaluator）
-│   │   └── advisor_graph.py         # Advisor 子图（ReAct Agent）
-│   ├── nodes/                       # 节点实现
+│   ├── mysql_store.py               # MySQL 读写 + 增量检测 + evaluator 表初始化
+│   ├── hive_meta_provider.py        # Hive 原始 schema 读取
+│   ├── semantic_metadata_provider.py # 语义层元数据（physical 兜底）
+│   └── multi_source_meta_provider.py # 多源元数据（Hive 主 + 语义层兜底）
+├── semantic_layer/                  # 语义层资产（YAML：metrics/entities/physical/relationships/join_contracts）
+├── langchain_app/                   # RAG 基础设施（FAISS / BM25 / Embedding / 示例向量库）
+├── langgraph_app/                   # LangGraph 单 Agent 框架核心
+│   ├── graphs/
+│   │   ├── supervisor_graph.py      # 父图：capture_user_message → planner → END
+│   │   └── seeker_graph.py          # 执行链子图（execute_query 工具内部同步调用）
+│   ├── nodes/
 │   │   ├── capture_user_message_node.py # 统一记录用户消息
-│   │   ├── planner_node.py          # Planner 调度
-│   │   ├── generate_sql_node.py     # SQL 生成 + 一致性校验
-│   │   ├── validate_sql_node.py     # SQL 语法与安全校验（自动补 LIMIT）
-│   │   ├── execute_sql_node.py      # Hive 执行
-│   │   ├── retrieve_schema_node.py  # confirmed_plan 精确 Schema 加载
-│   │   ├── build_final_answer_node.py # 最终答案生成
-│   │   └── evaluator_node.py        # Evaluator 评估入库
-│   ├── prompts/                     # LLM 提示词
-│   │   ├── planner_prompt.py
-│   │   ├── advisor_prompt.py
-│   │   ├── sql_generation_prompt.py
-│   │   └── evaluator_prompt.py
-│   ├── routers/
-│   │   ├── planner_router.py        # Planner → Seeker/Advisor
-│   │   └── sql_router.py            # SQL 校验后路由
-│   ├── tools/
-│   │   ├── advisor_tools.py         # Advisor 检索工具
-│   │   └── submit_query_plan.py     # Advisor 完整方案提交工具
-│   ├── services/                    # 查询方案领域服务
-│   │   ├── query_plan_service.py    # locked/confirmed 状态转换
-│   │   └── query_plan_schema_resolver.py # 精确物理 Schema 解析
-│   ├── runtime/
-│   │   ├── graph_runtime.py         # 活动向量库、Provider 与 Resolver 初始化
-│   │   └── graph_logger.py          # 统一日志
-│   └── cache/                       # FAISS 向量索引（统一路径）
-├── scripts/                         # 运维脚本
-│   ├── build_indexes.py             # MySQL → FAISS 构建
-│   └── view_faiss.py                # 查看 FAISS 内容
-├── web/                             # Web 前端
-│   ├── server.py                    # Flask API 服务
-│   ├── intent_classifier.py         # LLM 意图识别
-│   └── static/
-│       ├── index.html               # ChatGPT 风格主页面
-│       └── app.js                   # 前端交互逻辑
+│   │   ├── planner_node.py          # 唯一 Agent（ReAct 工具循环）
+│   │   └── 执行链节点               # retrieve_schema / generate_sql / validate_sql / execute_sql / persist_result / query_error_fallback
+│   ├── prompts/
+│   │   ├── planner_prompt.py        # Planner 系统提示词 + PlannerOutput schema
+│   │   ├── sql_prompts.py           # SQL 生成提示词
+│   │   └── metadata_enricher_prompt.py # 元数据增强
+│   ├── tools/                       # 统一工具注册表（registry.py）
+│   │   ├── semantic_tool.py         # search_semantic（语义层优先于 RAG）
+│   │   ├── schema_tool.py           # search_tables / search_columns / search_databases
+│   │   ├── execute_query_tool.py    # 查数（内部调用 seeker_graph，串行 steps 落盘）
+│   │   ├── probe_values_tool.py     # 0 行自愈：LIKE 探查实际存储值
+│   │   ├── result_query_tool.py     # query_stored_result（落盘结果复用/聚合）
+│   │   ├── skill_tool.py            # read_skill（技能渐进式披露）
+│   │   └── advisor_tools.py         # 检索/落盘结果工具构建（历史命名，供 planner 组复用）
+│   ├── services/                    # 查询方案/执行服务（plan_synthesizer / query_plan_service / result_store / join_planner / thinking_stream_chat）
+│   ├── routers/                     # 执行链路由（sql_router / sql_exec_router / seeker_router / planner_router）
+│   ├── runtime/                     # graph_runtime / graph_logger / stream_bus / llm_log_handler
+│   ├── state/                       # AgentState / QueryPlan / SeekerState / PlannerState / AnalysisSpec
+│   └── skills/                      # 技能（SKILL.md + references）
+├── scripts/                         # 运维脚本（sync_metadata / trace_view / build_indexes / view_faiss / benchmark_models）
+├── web/                             # Web 前端（server.py / intent_classifier.py + static）
 ├── logs/                            # 运行时日志
 └── docs/                            # 统一文档目录
 ```
