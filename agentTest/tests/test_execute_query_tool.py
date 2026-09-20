@@ -1,282 +1,199 @@
-# execute_query 工具单元测试：把 Seeker 执行链封装为一次工具调用
-# 覆盖：metric_id 解析 / grep 兜底 / 结果摘要（成功预览、0 行提示、方案不可行、未命中指标）
+# execute_query 工具单元测试：纯执行 SQL + 安全 + 落盘 + 结果摘要
+# 覆盖：单条 SQL 执行 / LIMIT 追加 / 引擎路由（data_project→doris，其余→trino/hive 兜底）/
+#       跨引擎拒绝 / 校验失败不降级 / 0 行提示 / steps 多段并行 / 已执行 SQL 记录
 import json
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider
-from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 from agentTest.langgraph_app.tools.execute_query_tool import (
     build_execute_query_tool,
     set_execute_query_context,
     reset_execute_query_context,
+    take_executed_sqls,
 )
 
 
-class _FakeSeekerGraph:
-    """Seeker 子图桩：记录入参 state，返回预设结果状态。"""
+class _FakeTool:
+    """模拟 sql_query_{engine} 工具：记录调用参数，返回预设结果或抛错。"""
 
-    def __init__(self, result_state):
-        self._result_state = result_state
-        self.calls = []
+    def __init__(self, name, result=None, error=None, call_log=None):
+        self.name = name
+        self._result = result if result is not None else {"columns": [], "rows": [], "row_count": 0}
+        self._error = error
+        self.calls = [] if call_log is None else call_log
 
-    def invoke(self, state):
-        self.calls.append(state)
-        return self._result_state
+    def invoke(self, args):
+        self.calls.append(dict(args))
+        if self._error:
+            raise self._error
+        return self._result
 
 
-def _runtime():
-    provider = SemanticMetadataProvider(get_semantic_layer_provider())
-    return {"semantic_metadata_provider": provider}
+class _FakeRegistry:
+    """最小工具注册表：get_by_name 返回带 .tool 属性的对象（对齐真实 ToolSpec 结构）。"""
+
+    def __init__(self, tools):
+        self._tools = {t.name: t for t in tools}
+
+    def get_by_name(self, name):
+        if name not in self._tools:
+            raise KeyError(name)
+        return SimpleNamespace(tool=self._tools[name])
 
 
-def _success_result():
+class _FakeSemProvider:
+    """最小语义层 provider：按表返回分区字段（用于 partition_fields 透传测试）。"""
+
+    def __init__(self, part_map=None):
+        self._part = part_map or {}
+
+    def get_partition_fields(self, table):
+        return self._part.get(table, [])
+
+
+def _default_result():
     return {
-        "seeker_plan_error": "",
-        "sql_exec_failed": False,
-        "sql_result": {
-            "columns": ["company_name", "new_rent_counts"],
-            "row_count": 2,
-        },
-        "result_preview": [
-            {"company_name": "科斯特", "new_rent_counts": 120},
-            {"company_name": "锂纳斯", "new_rent_counts": 80},
+        "columns": ["company_name", "new_rent_counts"],
+        "row_count": 2,
+        "rows": [
+            ["科斯特", 120],
+            ["锂纳斯", 80],
         ],
-        "result_id": "rid-1",
-        "result_csv": "D:/tmp/conv1/r1.csv",
     }
 
 
+def _runtime(result=None, fail_engine=None, part_map=None):
+    """构建最小 runtime：引擎工具注册表 + 语义层 provider + 可选失败引擎。"""
+    def _mk(engine):
+        if fail_engine == engine:
+            return _FakeTool(f"sql_query_{engine}", error=RuntimeError(f"{engine} boom"))
+        return _FakeTool(f"sql_query_{engine}", result=result if result is not None else _default_result())
+
+    reg = _FakeRegistry([_mk(e) for e in ("trino", "hive", "doris")])
+    return {"tool_registry": reg, "semantic_metadata_provider": _FakeSemProvider(part_map)}
+
+
 class ExecuteQueryToolTest(unittest.TestCase):
-    """查数工具：语义层方案构建 → Seeker 子图执行 → 结果摘要回填 Agent。"""
+    """查数工具：纯执行 SQL + 安全校验 + 落盘 + 结果摘要回填 Agent。"""
 
     def setUp(self):
         self._tokens = set_execute_query_context("req-1", "conv1", "topic-1")
+        # 清空上一个测试残留的已执行 SQL 记录，避免跨测试累积干扰
+        take_executed_sqls("req-1")
 
     def tearDown(self):
         reset_execute_query_context(self._tokens)
 
-    def test_metric_id_resolves_and_invokes_seeker(self):
-        """按 metric_id 定位指标：构建 confirmed_plan 并调用 Seeker 子图。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({
-            "question": "查询昨天的新增订单数",
-            "metric_id": "addition_order_num",
-            "filters": "pt_dt = '2026-09-13'",
-            "dimensions": "company_name",
-        })
-        self.assertEqual(len(seeker.calls), 1)
-        state = seeker.calls[0]
-        plan = state.get("confirmed_plan") or {}
-        self.assertEqual(plan.get("status"), "confirmed")
-        self.assertIn("new_rent_counts", plan.get("measures", []))
-        # 返回文本前置语义层命中行，便于 LLM/日志审计实际走的指标
-        self.assertIn("已按语义层指标", out)
-        self.assertIn("addition_order_num", out)
+    def _call(self, runtime, **kwargs):
+        """构建工具并调用 execute_query，返回输出文本。"""
+        with mock.patch(
+            "agentTest.langgraph_app.services.result_store.save_query_result",
+            return_value={"result_id": "req-1:result", "round_no": 1, "full_csv": "D:/tmp/conv1/r1.csv"},
+        ):
+            tool = build_execute_query_tool(runtime)
+            out = tool.invoke(kwargs)
+        return out
+
+    def test_execute_simple_sql(self):
+        """单条 SQL：执行成功并返回结果摘要（行数 + 预览 + SQL）。"""
+        runtime = _runtime()
+        out = self._call(runtime, sql="SELECT company_name, SUM(new_rent_counts) AS c FROM ads_trip.tbl WHERE pt_dt = '20260919'")
         self.assertIn("查询成功", out)
         self.assertIn("科斯特", out)
-        self.assertEqual(state.get("request_id"), "req-1")
-        self.assertEqual(state.get("conversation_id"), "conv1")
+        self.assertIn("实际执行 SQL", out)
+        # trino 应被调用且收到默认 partition_fields
+        trino = runtime["tool_registry"].get_by_name("sql_query_trino").tool
+        self.assertEqual(len(trino.calls), 1)
+        self.assertEqual(trino.calls[0]["partition_fields"], ["pt_dt"])
 
-    def test_grep_fallback_when_no_metric_id(self):
-        """未给 metric_id 时按问题词（空格/标点分隔）grep 兜底定位指标。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({"question": "新增订单 昨天"})
-        self.assertEqual(len(seeker.calls), 1)
-        plan = seeker.calls[0].get("confirmed_plan") or {}
-        self.assertIn("new_rent_counts", plan.get("measures", []))
+    def test_missing_sql_returns_error(self):
+        """sql 为空：返回参数错误，不调用引擎。"""
+        runtime = _runtime()
+        out = self._call(runtime, question="查数据")
+        self.assertIn("参数错误", out)
+
+    def test_limit_appended_when_missing(self):
+        """SQL 缺 LIMIT：程序安全追加默认 LIMIT 50。"""
+        runtime = _runtime()
+        self._call(runtime, sql="SELECT company_name FROM ads_trip.tbl WHERE pt_dt = '20260919'")
+        trino = runtime["tool_registry"].get_by_name("sql_query_trino").tool
+        self.assertIn("LIMIT 50", trino.calls[0]["sql"])
+
+    def test_result_limit_used_in_limit(self):
+        """传 result_limit：SQL 缺 LIMIT 时追加指定行数。"""
+        runtime = _runtime()
+        self._call(runtime, sql="SELECT company_name FROM ads_trip.tbl WHERE pt_dt = '20260919'", result_limit=10)
+        trino = runtime["tool_registry"].get_by_name("sql_query_trino").tool
+        self.assertIn("LIMIT 10", trino.calls[0]["sql"])
+
+    def test_trino_failure_fallback_to_hive(self):
+        """trino 失败：降级到 hive 兜底执行成功。"""
+        runtime = _runtime(fail_engine="trino")
+        out = self._call(runtime, sql="SELECT company_name FROM ads_trip.tbl WHERE pt_dt = '20260919'")
         self.assertIn("查询成功", out)
+        hive = runtime["tool_registry"].get_by_name("sql_query_hive").tool
+        self.assertEqual(len(hive.calls), 1)
 
-    def test_no_metric_hit_returns_guidance(self):
-        """完全未命中语义层指标：返回引导文案，不调用 Seeker。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({"question": "请问今天天气如何"})
-        self.assertIn("未匹配到语义层指标", out)
-        self.assertEqual(len(seeker.calls), 0)
-
-    def test_zero_row_note_in_summary(self):
-        """0 行结果：摘要中提示过滤值与实际存储值可能不一致。"""
-        seeker = _FakeSeekerGraph({
-            "seeker_plan_error": "",
-            "sql_exec_failed": False,
-            "sql_result": {"columns": ["company_name"], "row_count": 0},
-            "result_preview": [],
-            "result_id": "rid-0",
-            "result_csv": "",
-        })
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({"question": "查询昨天的新增订单数", "metric_id": "addition_order_num"})
-        self.assertIn("返回 0 行", out)
-
-    def test_plan_error_summary(self):
-        """方案构建不可行：摘要返回失败原因。"""
-        seeker = _FakeSeekerGraph({"seeker_plan_error": "缺少 join 契约", "sql_exec_failed": False})
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({"question": "查询昨天的新增订单数", "metric_id": "addition_order_num"})
-        self.assertIn("查询方案不可行", out)
-        self.assertIn("缺少 join 契约", out)
-
-    def test_exec_failed_summary(self):
-        """执行失败：摘要返回错误文本。"""
-        seeker = _FakeSeekerGraph({
-            "seeker_plan_error": "",
-            "sql_exec_failed": True,
-            "sql_exec_error": "Hive 连接超时",
-        })
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({"question": "查询昨天的新增订单数", "metric_id": "addition_order_num"})
-        self.assertIn("查询执行失败", out)
-        self.assertIn("Hive 连接超时", out)
-
-    def test_metric_hit_logged_with_source_and_tier(self):
-        """工具内部命中语义层时记录 semantic.match（source=execute_query_tool），
-        即使 Planner 未声明 semantic_metrics 也能从日志审计实际走的语义层路径。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        with mock.patch(
-            "agentTest.langgraph_app.tools.execute_query_tool.log_metric_event"
-        ) as mocked:
-            tool.invoke({"question": "新增订单 昨天"})
-        self.assertTrue(mocked.called)
-        kwargs = mocked.call_args.kwargs
-        self.assertEqual(kwargs.get("source"), "execute_query_tool")
-        self.assertEqual(kwargs.get("metric_source"), "grep_fallback")
-        self.assertEqual(kwargs.get("node_name"), "execute_query")
-        self.assertGreaterEqual(kwargs.get("hit_count", 0), 1)
-        self.assertIn("addition_order_num", kwargs.get("metric_ids", []))
-        # 多候选 grep 命中：unique 或 candidate 均属语义层命中（非 rag）
-        self.assertIn(kwargs.get("tier"), ("unique", "candidate"))
-
-    def test_metric_id_hit_logged_as_unique(self):
-        """Agent 明确指定 metric_id：日志记为 unique 强命中（metric_source=metric_id）。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        with mock.patch(
-            "agentTest.langgraph_app.tools.execute_query_tool.log_metric_event"
-        ) as mocked:
-            tool.invoke({"question": "查询昨天的新增订单数", "metric_id": "addition_order_num"})
-        kwargs = mocked.call_args.kwargs
-        self.assertEqual(kwargs.get("metric_source"), "metric_id")
-        self.assertEqual(kwargs.get("tier"), "unique")
-        self.assertIn("addition_order_num", kwargs.get("metric_ids", []))
-
-    def test_multi_steps_parallel_execution(self):
-        """steps 多段并行：每段独立 request_id，Seeker 调用次数=段数，返回各段摘要。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        steps = json.dumps([
-            {"id": "s1", "question": "昨天新增订单数", "metric_id": "addition_order_num", "filters": "", "dimensions": ""},
-            {"id": "s2", "question": "新增订单 昨天", "metric_id": "", "filters": "", "dimensions": ""},
+    def test_validation_error_no_fallback(self):
+        """校验失败（ValueError）：引擎无关，不降级，返回具体原因。"""
+        reg = _FakeRegistry([
+            _FakeTool("sql_query_trino", error=ValueError("SQL 使用了非白名单表")),
+            _FakeTool("sql_query_hive", result=_default_result()),
         ])
-        out = tool.invoke({"question": "", "steps": steps})
-        self.assertEqual(len(seeker.calls), 2)
-        # 每段独立 request_id：落盘 result_id / CSV 文件名唯一，可被 query_stored_result 分别引用
-        rids = [c.get("request_id") for c in seeker.calls]
-        # 并行执行下调用顺序不保证，按集合比较每段独立 request_id
-        self.assertCountEqual(rids, ["req-1_s1", "req-1_s2"])
+        runtime = {"tool_registry": reg, "semantic_metadata_provider": _FakeSemProvider()}
+        out = self._call(runtime, sql="SELECT 1 FROM bad_db.tbl WHERE pt_dt = '20260919'")
+        self.assertIn("安全校验", out)
+        self.assertIn("非白名单表", out)
+        hive = runtime["tool_registry"].get_by_name("sql_query_hive").tool
+        self.assertEqual(len(hive.calls), 0)
+
+    def test_cross_engine_rejected(self):
+        """跨引擎多表（data_project + 其余库）：拒绝并提示拆开。"""
+        runtime = _runtime()
+        sql = "SELECT a.x, b.y FROM data_project.d_tbl a JOIN ads_trip.a_tbl b ON a.id = b.id WHERE a.pt_dt = '20260919'"
+        out = self._call(runtime, sql=sql)
+        self.assertIn("跨引擎", out)
+
+    def test_zero_row_note(self):
+        """0 行结果：摘要提示过滤值与实际存储值可能不一致。"""
+        runtime = _runtime(result={"columns": ["company_name"], "row_count": 0, "rows": []})
+        out = self._call(runtime, sql="SELECT company_name FROM ads_trip.tbl WHERE pt_dt = '20260919'")
+        self.assertIn("0 行", out)
+
+    def test_steps_parallel(self):
+        """steps 多段：每段独立执行并各自落盘，返回多段摘要。"""
+        runtime = _runtime()
+        steps = json.dumps([
+            {"id": "s1", "sql": "SELECT COUNT(*) AS c FROM ads_trip.t1 WHERE pt_dt = '20260919'", "question": "指标1"},
+            {"id": "s2", "sql": "SELECT COUNT(*) AS c FROM ads_trip.t2 WHERE pt_dt = '20260919'", "question": "指标2"},
+        ])
+        out = self._call(runtime, steps=steps)
         self.assertIn("已并行执行多段查询", out)
         self.assertIn("[s1]", out)
         self.assertIn("[s2]", out)
-        self.assertIn("查询成功", out)
 
-    def test_multi_steps_saves_script_meta(self):
-        """多段并行：保存查询脚本元数据（每段定义 + SQL + 结果引用），供审计与按段引用。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        steps = json.dumps([
-            {"id": "s1", "question": "昨天新增订单数", "metric_id": "addition_order_num", "filters": "pt_dt='2026-09-15'", "dimensions": "company_name"},
-        ])
-        with mock.patch("agentTest.langgraph_app.services.result_store.save_query_script") as mocked:
-            tool.invoke({"question": "", "steps": steps})
-        self.assertTrue(mocked.called)
-        args = mocked.call_args[0]
-        self.assertEqual(args[0], "conv1")       # conversation_id
-        self.assertEqual(args[1], "req-1")       # base request_id
-        self.assertEqual(len(args[2]), 1)        # 一段 step_info
-        step = args[2][0]
-        self.assertEqual(step["step_id"], "s1")
-        self.assertEqual(step["result_id"], "rid-1")
-
-    def test_steps_parse_error_returns_guidance(self):
-        """steps 非空但解析失败：返回引导文案，不调用 Seeker。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({"question": "", "steps": "not-a-json"})
+    def test_steps_parse_error(self):
+        """steps 非法：返回解析失败提示。"""
+        runtime = _runtime()
+        out = self._call(runtime, steps="not-json")
         self.assertIn("steps 解析失败", out)
-        self.assertEqual(len(seeker.calls), 0)
 
-    def test_steps_fallback_to_single_when_empty(self):
-        """steps 为空时保持单段逻辑：向后兼容，不新增 Seeker 调用。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        out = tool.invoke({"question": "新增订单 昨天"})
-        self.assertEqual(len(seeker.calls), 1)
-        self.assertEqual(seeker.calls[0].get("request_id"), "req-1")
-        self.assertIn("查询成功", out)
+    def test_executed_sql_recorded(self):
+        """执行后记录已执行 SQL，可由 take_executed_sqls 取回。"""
+        runtime = _runtime()
+        self._call(runtime, sql="SELECT company_name FROM ads_trip.tbl WHERE pt_dt = '20260919'")
+        records = take_executed_sqls("req-1")
+        self.assertEqual(len(records), 1)
+        self.assertIn("LIMIT 50", records[0]["sql"])
 
-    def test_steps_same_source_metrics_merge_one_sql(self):
-        """同表多指标：metric_ids 合并到一个 step，Seeker 只调用 1 次（一条多列聚合 SQL）。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        steps = json.dumps([{
-            "id": "s1", "question": "昨天租赁中、月租、逾期>30天、滞纳订单数",
-            "metric_ids": "renting_order_num,month_renting_order_num,overdue_gt30_order_num,stag_order_num",
-            "filters": "pt_dt='2026-09-15'", "dimensions": "",
-        }])
-        out = tool.invoke({"question": "", "steps": steps})
-        self.assertEqual(len(seeker.calls), 1)
-        self.assertEqual(seeker.calls[0].get("request_id"), "req-1_s1")
-        plan = seeker.calls[0].get("confirmed_plan") or {}
-        measures = plan.get("measures") or []
-        self.assertEqual(len(measures), 4)
-        self.assertIn("rent_order_counts", measures)
-        self.assertIn("month_renting_order_counts", measures)
-        self.assertIn("overdue30_days_rents", measures)
-        self.assertIn("stag_order_counts", measures)
-
-    def test_steps_diff_source_metrics_split_groups(self):
-        """异表多指标：按来源表自动拆组并行执行，每组独立 request_id。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        steps = json.dumps([{
-            "id": "s2", "question": "租赁中订单数和库存电池数",
-            "metric_ids": "renting_order_num,battery_stock_num",
-            "filters": "pt_dt='2026-09-15'", "dimensions": "",
-        }])
-        out = tool.invoke({"question": "", "steps": steps})
-        self.assertEqual(len(seeker.calls), 2)
-        rids = [c.get("request_id") for c in seeker.calls]
-        # 并行执行下调用顺序不保证，按集合比较两组独立 request_id
-        self.assertCountEqual(rids, ["req-1_s2_g1", "req-1_s2_g2"])
-
-    def test_dimensional_measure_resolves_via_dimension(self):
-        """dimensional_measures 子口径：dimension 传入（如“激活电柜”）时解析 {field} 为真实字段。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        steps = json.dumps([{
-            "id": "s3", "question": "激活电柜数", "metric_id": "cabinet_active_num",
-            "filters": "pt_dt='2026-09-15'", "dimensions": "", "dimension": "激活电柜",
-        }])
-        out = tool.invoke({"question": "", "steps": steps})
-        self.assertEqual(len(seeker.calls), 1)
-        plan = seeker.calls[0].get("confirmed_plan") or {}
-        self.assertEqual(plan.get("measures") or [], ["active_cabinet_num"])
-
-    def test_dimensional_measure_without_dimension_fails(self):
-        """dimensional_measures 子口径：未传 dimension 时 {field} 无法解析，方案构建失败且不调用 Seeker。"""
-        seeker = _FakeSeekerGraph(_success_result())
-        tool = build_execute_query_tool(_runtime(), seeker)
-        steps = json.dumps([{
-            "id": "s4", "question": "激活电柜数", "metric_id": "cabinet_active_num",
-            "filters": "pt_dt='2026-09-15'", "dimensions": "", "dimension": "",
-        }])
-        out = tool.invoke({"question": "", "steps": steps})
-        self.assertEqual(len(seeker.calls), 0)
-        self.assertIn("方案构建失败", out)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_partition_fields_from_semantic(self):
+        """明细表非 pt_dt 分区：从语义层取分区字段透传执行守卫。"""
+        part_map = {"ads_trip.detail_tbl": ["create_time"]}
+        runtime = _runtime(part_map=part_map)
+        self._call(
+            runtime,
+            sql="SELECT detail FROM ads_trip.detail_tbl WHERE create_time >= '2026-01-01' AND create_time < '2026-02-01' LIMIT 5",
+        )
+        trino = runtime["tool_registry"].get_by_name("sql_query_trino").tool
+        self.assertIn("create_time", trino.calls[0]["partition_fields"])

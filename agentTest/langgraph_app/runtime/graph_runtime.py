@@ -8,7 +8,6 @@ from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec, ToolS
 from agentTest.llm import LLM
 from agentTest.metadata.mysql_store import load_enriched_columns  # 加载字段类型映射
 from agentTest.metadata.mysql_store import init_evaluator_table  # 初始化 Evaluator 评估表
-from agentTest.langgraph_app.prompts.sql_prompts import build_sql_generation_prompt
 from agentTest.langchain_app.app_builder import build_column_rag
 from agentTest.langchain_app.app_builder import build_db_rag
 from agentTest.langchain_app.app_builder import build_langchain_tools
@@ -170,7 +169,6 @@ def build_graph_runtime():
     return {
         "embedding": embedding,
         "llm": llm,
-        "prompt": build_sql_generation_prompt(),  # prompt 直接构建，不依赖 Hive
         # Seeker 使用确认方案精确加载 Schema
         "query_plan_schema_resolver": (
             query_plan_schema_resolver

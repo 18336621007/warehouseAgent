@@ -300,12 +300,17 @@ def build_plan_from_semantic(
         if not entity_fields:
             unresolved_dimensions.append(word)
             continue
-        # 优先选来源表上的本地维度字段；跨表时取第一个可达结果
+        # 优先选主表本地维度（分组键归属来源表），其次带展示字段的 entry（如经销商名称，通常落在维表），最后兜底
         chosen = None
         for entry in entity_fields:
             if str(entry.get("table") or "") in tables:
                 chosen = entry
                 break
+        if chosen is None:
+            for entry in entity_fields:
+                if str(entry.get("display_field") or ""):
+                    chosen = entry
+                    break
         if chosen is None:
             chosen = entity_fields[0]
         dim_field = str(chosen.get("field") or "")
@@ -324,16 +329,28 @@ def build_plan_from_semantic(
             "source": "semantic_layer",
             "concept_type": "dimension",
         }
-        # 展示字段（如经销商名称）默认带出，便于阅读
-        display_field = str(chosen.get("display_field") or "")
-        if display_field and display_field != dim_field and display_field not in dimensions:
-            dimensions.append(display_field)
-            field_sources.setdefault(display_field, dim_table)
+        # 展示字段（如经销商名称/大区/城市）默认带出，便于阅读；归属各自实际所在表（多为维表），
+        # 优先取实体配置的 display_fields 全集（去重、限数防膨胀），兼容旧的单个 display_field
+        _display_items = chosen.get("display_fields") or []
+        if not _display_items:
+            _df0 = str(chosen.get("display_field") or "")
+            _dt0 = str(chosen.get("display_table") or "") or dim_table
+            if _df0 and _df0 != dim_field:
+                _display_items = [{"field": _df0, "table": _dt0}]
+        for _di in _display_items[:4]:
+            _df = str(_di.get("field") or "")
+            _dt = str(_di.get("table") or "") or dim_table
+            if not _df or _df == dim_field or _df in dimensions:
+                continue
+            dimensions.append(_df)
+            field_sources.setdefault(_df, _dt)
+            if _dt and _dt not in tables:
+                tables.append(_dt)
 
     draft = draft or {}
 
-    # 时间字段：filters 中的时间条件为口径权威（用户确认的时间字段一定写入 filters），
-    # 其次草稿已确认字段 > 表默认分区字段
+    # 时间字段：唯一来源是 filters 中的时间条件（不再落盘独立槽位）；
+    # 这里仅用于无分区明细表安全判断与明细字段过滤
     main_table = tables[0] if tables else ""
     # 过滤：草稿确认与 Planner 槽位合并去重
     filter_parts = []
@@ -343,22 +360,11 @@ def build_plan_from_semantic(
             filter_parts.append(part)
     final_filters = " AND ".join(filter_parts) if filter_parts else ""
     _filter_time_field, _filter_time_range = _extract_time_from_filters(final_filters)
-    time_field = _filter_time_field or str(draft.get("time_field") or "")
-    if not time_field:
-        time_field = semantic_provider.get_table_time_field(main_table) or ""
-    # 无分区明细表必须由 filters/草稿明确业务时间字段，禁止回退默认 pt_dt
+    # 时间字段唯一来源是 filters（不再落盘独立槽位）
+    time_field = _filter_time_field or ""
+    # 明细查询必须由 filters 明确业务时间字段，禁止回退默认 pt_dt（避免无时间过滤全表扫描）
     if detail_flag and not time_field:
         return None
-    if not time_field:
-        time_field = "pt_dt"
-
-    # 时间范围：优先从 filters 的 yyyy-MM-dd 条件派生，其次草稿/Planner 槽位，最后默认昨天
-    final_time_range = (
-        _filter_time_range
-        or str(draft.get("time_range") or "")
-        or time_range
-        or "昨天"
-    )
 
     # 过滤字段归属表（加入 field_sources 与 tables，保证 Join 规划覆盖）
     if final_filters:
@@ -406,8 +412,6 @@ def build_plan_from_semantic(
             (draft.get("select_fields") or []) + measures + dimensions
         )),
         "detail_query": detail_flag,
-        "time_field": time_field,
-        "time_range": final_time_range,
         "filters": final_filters,
         "field_sources": [f"{table}.{field}" for field, table in field_sources.items()],
         "order_by": list(draft.get("order_by") or []),

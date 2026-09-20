@@ -4,18 +4,15 @@
 from langgraph.graph import StateGraph, START, END
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.nodes.planner_node import build_planner_node
-from agentTest.langgraph_app.graphs.seeker_graph import build_seeker_subgraph
 from langgraph.checkpoint.memory import MemorySaver
 from agentTest.langgraph_app.nodes.capture_user_message_node import capture_user_message_node
 from agentTest.langgraph_app.tools.registry import ToolSpec, ToolSecurity
 
 
 def build_supervisor_graph(runtime):
-    # 构建 Seeker 子图：不再作为父图节点，由 execute_query 工具内部同步调用
-    seeker_graph = build_seeker_subgraph(runtime)
-    # 注册 execute_query 工具（持有 seeker_graph），Planner 单 Agent 循环里自主调用
+    # execute_query 工具内部内联执行原 Seeker 执行链（方案 B：不再嵌套子图）
     from agentTest.langgraph_app.tools.execute_query_tool import build_execute_query_tool
-    execute_query_tool = build_execute_query_tool(runtime, seeker_graph)
+    execute_query_tool = build_execute_query_tool(runtime)
     runtime["tool_registry"].register(ToolSpec(
         name="execute_query",
         description=execute_query_tool.description,

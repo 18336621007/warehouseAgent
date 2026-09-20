@@ -4,11 +4,17 @@ import json
 import logging
 import time
 
+import urllib3
 import trino
 from trino import auth
+from urllib3.exceptions import InsecureRequestWarning
 
 from agentTest.datasource.base_datasource import BaseDataSource
 from agentTest.db.trino_config import get_trino_config
+
+# Trino 连接明确使用 verify=False（SSLVerification=NONE，证书校验由 Trino 侧配置控制），
+# 静默 urllib3 对"未验证 HTTPS"的 InsecureRequestWarning，避免每次查询在控制台刷屏。
+urllib3.disable_warnings(InsecureRequestWarning)
 
 # 404 重试退避：给多 coordinator 负载均衡恢复粘滞的时间，避免极端情况连续重复执行查询
 RETRY_BACKOFF_SECONDS = 0.5

@@ -9,11 +9,14 @@ from agentTest.db.hive_guardrails import ALLOW_AI_INFERRED_JOIN
 from agentTest.db.hive_guardrails import REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES
 from agentTest.langgraph_app.nodes.generate_sql_node import _build_fallback_sql
 from agentTest.langgraph_app.nodes.generate_sql_node import _validate_sql_against_plan
-from agentTest.langgraph_app.nodes.generate_sql_node import _repair_missing_table_filters
 from agentTest.langgraph_app.nodes.validate_sql_node import _validate_multi_table
 from agentTest.langgraph_app.services.join_planner import JoinPlanner
 from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
 from agentTest.langgraph_app.services.query_plan_service import lock_query_plan
+
+
+# 兜底/修复 SQL 的"昨天"pt_dt 字面量（程序按当天动态计算）
+_YDAY8 = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
 
 
 def _build_plan() -> dict:
@@ -26,8 +29,6 @@ def _build_plan() -> dict:
         ],
         "measures": ["new_order"],
         "dimensions": ["company_name", "company_business_type", "sales_manager"],
-        "time_field": "pt_dt",
-        "time_range": "昨天",
         "filters": "",
         "having": "",
         "order_by": [{"field": "new_order", "direction": "DESC"}],
@@ -44,13 +45,13 @@ def _build_plan() -> dict:
                 "table": "ads_trip.ads_exchange_platform_operations_report_day",
                 "time_field": "pt_dt",
                 "time_range": "昨天",
-                "filters": "",
+                "filters": f"pt_dt = '{_YDAY8}'",
             },
             {
                 "table": "dim_trip.dim_company_snapshot_day",
                 "time_field": "pt_dt",
                 "time_range": "昨天",
-                "filters": "",
+                "filters": f"pt_dt = '{_YDAY8}'",
             },
         ],
         "joins": [
@@ -64,10 +65,6 @@ def _build_plan() -> dict:
             }
         ],
     }
-
-
-# 兜底/修复 SQL 的"昨天"pt_dt 字面量（程序按当天动态计算）
-_YDAY8 = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
 
 
 class MultiTableConfirmationFlowTest(unittest.TestCase):
@@ -139,37 +136,6 @@ class MultiTableConfirmationFlowTest(unittest.TestCase):
         self.assertEqual(
             plan_by_table["dim_trip.dim_company_snapshot_day"]["filters"],
             "",
-        )
-
-    def test_missing_dimension_time_filter_triggers_deterministic_repair(self):
-        """日志同款SQL缺少维表pt_dt时必须自动重建为安全SQL。"""
-        plan = _build_plan()
-        sql = (
-            "SELECT b.true_name, SUM(a.new_order) AS new_order "
-            "FROM ads_trip.ads_exchange_platform_operations_report_day a "
-            "LEFT JOIN dim_trip.dim_company_snapshot_day b "
-            "ON a.pt_platform = b.pt_platform AND a.company_id = b.company_id "
-            "WHERE a.pt_dt = regexp_replace(date_sub(current_date(), 1), '-', '') "
-            "GROUP BY b.true_name LIMIT 1"
-        )
-
-        issues = validate_table_plan_filters(sql, plan["tables"], plan["table_plans"])
-        self.assertTrue(any("dim_trip.dim_company_snapshot_day" in issue for issue in issues))
-        self.assertTrue(any("b.pt_dt" in issue for issue in issues))
-        consistency_issues = _validate_sql_against_plan(sql, plan)
-        self.assertTrue(any("b.pt_dt" in issue for issue in consistency_issues))
-
-        repaired_sql, repair_reasons = _repair_missing_table_filters(sql, plan)
-        self.assertTrue(repair_reasons)
-        self.assertNotEqual(repaired_sql, sql)
-        self.assertIn(f"b.pt_dt = '{_YDAY8}'", repaired_sql)
-        self.assertEqual(
-            validate_table_plan_filters(
-                repaired_sql,
-                plan["tables"],
-                plan["table_plans"],
-            ),
-            [],
         )
 
     def test_partition_key_join_does_not_replace_dimension_filter(self):

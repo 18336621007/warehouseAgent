@@ -97,6 +97,37 @@ def _read_metric_file(metric: dict) -> str:
         return ""
 
 
+
+
+# read_metric 增强：渲染指标来源表物理字段清单（字段名 + 类型 + 语义注释 + 分区标记），
+# 供 Planner 自行生成 SQL 时选择字段（对齐"读到指标顺带返回来源表字段"的设计）
+_FIELD_LIST_LIMIT = 50
+
+
+def _format_table_fields(provider, full_name: str) -> str:
+    """把指标来源表的物理字段清单格式化为文本（语义层未定义时返回空串）。"""
+    if not full_name:
+        return ""
+    phys = provider.get_physical_table(full_name)
+    if not phys:
+        return ""
+    fields = phys.get("fields") or {}
+    partitions = set(phys.get("partition") or [])
+    lines = [f"来源表 {full_name} 字段清单（生成 SQL 时只能使用以下字段名）："]
+    for name, info in list(fields.items())[:_FIELD_LIST_LIMIT]:
+        if isinstance(info, dict):
+            ftype = str(info.get("type") or "")
+            comment = str(info.get("semantic") or "")
+        else:
+            ftype = str(info or "")
+            comment = ""
+        mark = " [分区]" if name in partitions else ""
+        if comment:
+            lines.append(f"- {name}: {ftype}{mark}  {comment}")
+        else:
+            lines.append(f"- {name}: {ftype}{mark}")
+    return "\n".join(lines)
+
 def build_semantic_tools(provider=None, limit: int | None = None):
     """构建 LLM 驱动的语义层检索工具集（grep + read + list）。
 
@@ -112,7 +143,8 @@ def build_semantic_tools(provider=None, limit: int | None = None):
         """在语义层指标文件中全文 grep 定位指标候选（对齐 Codex 文件 grep）。
 
         用核心业务短词检索（如"推广""调出""返厂"），可一次传多个词（逗号分隔）从不同角度并行定位；
-        不要传整句或时间词；返回命中指标文件路径、指标名、命中词与命中行片段；命中后用 read_metric 读取完整口径。
+        不要传整句或时间词；返回全部命中指标文件的清单（路径+名称+命中词），不设文件数上限、不展开命中行；
+        命中后用 read_metric 读取完整口径。
         参数：keywords 一个或多个核心业务关键词，多个用逗号分隔。
         """
         kws = _split_grep_keywords(keywords)
@@ -137,33 +169,32 @@ def build_semantic_tools(provider=None, limit: int | None = None):
                     entry["kw_hits"][kw] = matched
         if not per_metric:
             return "未找到匹配结果。"
-        # 多命中返回前 N 个候选：命中词数多者优先，其次总命中行数（对齐 skill 多命中返回多个候选）
-        ordered = sorted(
-            per_metric.values(),
-            key=lambda e: (-len(e["kw_hits"]), -sum(len(v) for v in e["kw_hits"].values())),
-        )
-        # 文件数按词数动态放量，但封顶防膨胀
-        file_limit = max(_GREP_FILE_LIMIT, min(len(kws), _GREP_KEYWORD_LIMIT))
-        ordered = ordered[:file_limit]
+        # 排序优化：强命中（name/aliases 精确/子串，语义层 _score_metric_keywords）优先，
+        # 再命中词数、再总命中行数；不设文件数上限（指标多也不截断候选，防漏召回）
+        _sl = get_semantic_layer_provider()
+        _kws_low = [str(k).lower() for k in kws]
+
+        def _grep_sort_key(_e):
+            _strong = 0
+            if _sl is not None:
+                _strong = _sl._score_metric_keywords(_e["metric"], _kws_low)[0]
+            return (-_strong, -len(_e["kw_hits"]), -sum(len(v) for v in _e["kw_hits"].values()))
+
+        ordered = sorted(per_metric.values(), key=_grep_sort_key)
         kw_label = "、".join(kws)
+        # 清单式返回：每文件一行（路径+名称+命中词+read_metric 指引），不展开命中行，
+        # 保证命中文件再多也不膨胀；细节由 LLM 按需 read_metric 读取
         out = [f'grep "{kw_label}" 命中 {len(ordered)} 个指标文件：']
         for i, entry in enumerate(ordered, start=1):
             metric = entry["metric"]
             hit_words = "、".join(entry["kw_hits"].keys())
-            out.append(f"{i}. {_norm_path(metric.get('file_path', ''))}（{metric.get('name', '')}, id={metric.get('id', '')}，命中: {hit_words}）")
-            for kw, lines in entry["kw_hits"].items():
-                for ln in lines:
-                    out.append(f"   [{kw}] {ln}")
-            fp = _norm_path(metric.get('file_path', ''))
-            out.append(f'   → read_metric("{fp}") 读取完整口径')
+            fp = _norm_path(metric.get("file_path", ""))
+            out.append(f"{i}. {fp}（{metric.get('name', '')}, id={metric.get('id', '')}，命中: {hit_words}）→ read_metric(\"{fp}\") 读取完整口径")
         text = "\n".join(out)
-        # 预算紧张时降级为文件清单（去掉命中行），仍超再截断并标注
+        # 极端场景兜底：清单仍超预算时截断并标注可后续分段查看
         budget = _render_budget.get()
         if budget is not None and len(text) > budget:
-            compact = [f"- {_norm_path(e['metric'].get('file_path', ''))}（{e['metric'].get('name', '')}，命中: {'、'.join(e['kw_hits'].keys())}）" for e in ordered]
-            text = "grep 命中文件清单：\n" + "\n".join(compact)
-            if len(text) > budget:
-                text = text[:budget] + "\n…（已按预算精简，可用 read_metric 读取）"
+            text = text[:budget] + "\n…（已按预算精简，可用 read_metric 读取）"
         return text
 
     @tool
@@ -198,7 +229,14 @@ def build_semantic_tools(provider=None, limit: int | None = None):
                 return f"指标 {metric.get('id', '')} 已在上文展示完整口径，直接引用其 id 与子口径即可，无需重复读取。"
             seen.add(fp)
         budget = _render_budget.get()
-        return format_metric_context([metric], compact=budget is not None, max_chars=budget)
+        text = format_metric_context([metric], compact=budget is not None, max_chars=budget)
+        # 增强：附带来源表字段清单（Planner 生成 SQL 时据此选字段，避免臆造字段名）
+        _src = str(metric.get("source_model") or "")
+        if _src:
+            _fields_text = _format_table_fields(provider, _src)
+            if _fields_text:
+                text = text + "\n\n" + _fields_text
+        return text
 
     @tool
     def list_metric_files(subject: str = "") -> str:

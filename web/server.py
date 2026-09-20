@@ -318,19 +318,37 @@ def chat():
             topic_status = result.get("topic_status", "")
             final_answer = result.get("final_answer", "")
             generated_sql = result.get("generated_sql", "")
-            # generated_sql 持久化在 AgentState 中会跨轮残留，只有本轮真正
-            # 执行过 Seeker 查询链路时才透传，避免澄清/追问轮展示上一轮的旧 SQL
-            sql_query_nodes = {
-                "retrieve_schema",
-                "generate_sql",
-                "validate_sql",
-                "prepare_sql_fix",
-                "execute_sql",
-                "prepare_sql_exec_fix",
-                "persist_result",
-            }
-            has_sql_query = bool(seen & sql_query_nodes)
-            display_sql = generated_sql if has_sql_query else ""
+            # 优先展示本轮实际执行过的 SQL（execute_query 工具收集 → Planner 写入 executed_sql）：
+            # 单条直接展示，多条（多段/并行）按代码块分开展示，每条带步骤/表名/行数标题。
+            # executed_sql 由 Planner 每轮重新写入，本轮未查数为空列表，天然不残留上一轮 SQL。
+            executed_sql = result.get("executed_sql") or []
+            if executed_sql:
+                if len(executed_sql) == 1:
+                    display_sql = str(executed_sql[0].get("sql") or "")
+                else:
+                    _sql_blocks = []
+                    for _i, _e in enumerate(executed_sql, 1):
+                        _title = f"步骤 {_i}"
+                        if _e.get("step_id"):
+                            _title += f" · {_e.get('step_id')}"
+                        if _e.get("table"):
+                            _title += f" · {_e.get('table')}"
+                        _title += f"（{_e.get('row_count', 0)} 行）"
+                        _sql_blocks.append(f"{_title}\n```sql\n{_e.get('sql', '')}\n```")
+                    display_sql = "\n\n".join(_sql_blocks)
+            else:
+                # 兜底：旧链路（generated_sql + 节点判定）无 executed_sql 时沿用原逻辑
+                sql_query_nodes = {
+                    "retrieve_schema",
+                    "generate_sql",
+                    "validate_sql",
+                    "prepare_sql_fix",
+                    "execute_sql",
+                    "prepare_sql_exec_fix",
+                    "persist_result",
+                }
+                has_sql_query = bool(seen & sql_query_nodes)
+                display_sql = generated_sql if has_sql_query else ""
             # Evaluator 已并入 Planner（单 Agent），评分功能移除：统一空值兼容前端
             evaluator_payload = None
             dialogue_id = 0

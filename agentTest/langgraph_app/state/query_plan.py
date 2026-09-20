@@ -133,9 +133,9 @@ def validate_query_plan(
         if not (plan.get("select_fields") or str(plan.get("filters") or "").strip()):
             errors.append("measures 和 dimensions 不能同时为空")
 
-    if not isinstance(time_field, str) or not time_field.strip():
-        errors.append("缺少时间字段 time_field")
-
+    # 时间字段唯一来源是 filters（不再有顶层独立槽位）；仅校验类型，允许为空
+    if not isinstance(time_field, str):
+        errors.append("time_field 必须是字符串")
     if not isinstance(time_range, str):
         errors.append("time_range 必须是字符串")
 

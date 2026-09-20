@@ -89,7 +89,7 @@ def resolve_entity_dimension_fields(
     results: list[dict] = []
     seen: set[tuple] = set()
 
-    def _append(field: str, table: str, display_field: str = "") -> None:
+    def _append(field: str, table: str, display_field: str = "", display_table: str = "") -> None:
         dedupe_key = (field, table)
         if dedupe_key in seen:
             return
@@ -104,6 +104,8 @@ def resolve_entity_dimension_fields(
         }
         if display_field:
             entry["display_field"] = display_field
+            # 展示字段实际所在表（默认与分组键同表；跨表展示字段由下方兜底补充承载表）
+            entry["display_table"] = display_table or table
         results.append(entry)
 
     # 1) 语义维度 key == 实体 id：带出 field 与 display_field（先执行，保证去重保留展示字段）
@@ -129,7 +131,41 @@ def resolve_entity_dimension_fields(
             _dim_field = _dim_info.get("field") if isinstance(_dim_info, dict) else _dim_key
             if _dim_key != entity_id and _dim_field == entity_key_field:
                 _append(_dim_field, _model.get("id", ""))
+    # 实体展示字段兜底：本地维度未声明 display_field 时，从实体配置 display_fields 收集全部，
+    # 逐个在 scope 内定位实际所在表（通常为维表），供 plan 带出多个展示字段并参与 Join 规划；
+    # 同时保留 display_field/display_table 指向第一个，兼容旧调用方。
+    for _r in results:
+        if _r.get("field") != entity_key_field or _r.get("display_fields"):
+            continue
+        _displays = []
+        for _cand in (entity.get("display_fields") or []):
+            _cand = str(_cand or "").strip()
+            if not _cand or _cand == entity_key_field or _cand == _r.get("field"):
+                continue
+            if any(_d.get("field") == _cand for _d in _displays):
+                continue
+            _df_table = _locate_field_table(_cand, scope_models, provider)
+            if _df_table:
+                _displays.append({"field": _cand, "table": _df_table})
+        if _displays:
+            _r["display_fields"] = _displays
+            _r["display_field"] = _displays[0]["field"]
+            _r["display_table"] = _displays[0]["table"]
     return results
+
+
+def _locate_field_table(field_name: str, scope_models: list[dict], provider=None) -> str:
+    """在候选模型内定位某字段实际所在表：优先语义维度字段，其次物理表字段。"""
+    for _m in scope_models:
+        _model_dims = _m.get("dimensions") or {}
+        for _di in _model_dims.values():
+            if isinstance(_di, dict) and str(_di.get("field") or "") == field_name:
+                return _m.get("id", "")
+        if provider is not None:
+            _phys = provider.get_physical_table(_m.get("id", ""))
+            if _phys and field_name in (_phys.get("fields") or {}):
+                return _m.get("id", "")
+    return ""
 
 
 def _collect_metric_enum_values(provider, metric: dict) -> list[str]:

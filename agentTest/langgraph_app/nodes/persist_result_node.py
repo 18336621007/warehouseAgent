@@ -96,7 +96,7 @@ def persist_result_node(state: AgentState):
                     "seeker_empty_result": True,
                     "empty_result_rounds": empty_rounds + 1,
                     "topic_status": "generating_sql",
-                    "self_heal_note": "执行返回 0 行，需核实是过滤条件与实际存储值不一致，还是确实无匹配数据，返回核实后决定重查或直接告知。",
+                    "self_heal_note": "执行返回 0 行：先确认是否过滤值与实际存储值不一致（尤其时间字段格式，如 pt_dt 库中可能存 yyyyMMdd），可用 probe_values 探查真实取值后再决定重查或直接告知；确实无匹配数据则直接告知用户。",
                     **result_update,
                 }
                 log_node_end("persist_result", branch="empty_self_heal", rows=0, rounds=empty_rounds, ms=elapsed_ms(timer))

@@ -39,6 +39,9 @@ def build_sql_generation_prompt():
                 SELECT 0 AS x, 0 AS y, SUM(...) AS z FROM tbl3 WHERE pt_dt=...
               ) sub
         - 严禁：FROM tbl1 JOIN tbl2 ON tbl1.company_id = tbl2.company_id JOIN tbl3 ON ...
+    14. 信息完整度：以回答用户问题所需信息完整度为标准决定 SELECT 字段与返回行数。
+        - 涉及比较/排名（最多/最高/前N/TOP）时给出合理规模的排名列表，不要擅自 LIMIT 1（除非用户明确只要 1 条）；
+        - 业务对象维度（如经销商）默认带出实体展示字段（名称/区域/城市/类型，见方案 dimensions），避免只输出用户字面点名的字段。
     """
 
     human_prompt = """
@@ -69,10 +72,6 @@ SQL_COMPLEX_HUMAN_TEMPLATE = "用户问题：\n{question}\n\n{confirmed_section}
 SQL_FIX_SYSTEM_PROMPT = "你是一个面向 Hive 数仓场景的 SQL 助手。请根据用户问题、schema 信息和上一次 SQL 的错误原因，重新生成更符合 Hive 语法和约束的 SQL。返回纯 SQL，不要包含解释，也不要带结尾分号。"
 SQL_FIX_HUMAN_TEMPLATE = "用户问题：\n{question}\n\n相关 schema 信息：\n{schema_context}\n\n上一次生成的 SQL：\n{previous_sql}\n\n所有已指出的错误原因：\n{sql_fix_reason}"
 
-
-# ── 方案一致性修复：按不一致原因重新生成 ──
-SQL_CONSISTENCY_FIX_SYSTEM_PROMPT = "你是一个面向 Hive 数仓场景的 SQL 助手。请根据用户问题、schema 信息和方案不一致的原因，重新生成 SQL。返回纯 SQL，不要包含解释，也不要带结尾分号。"
-SQL_CONSISTENCY_FIX_HUMAN_TEMPLATE = "用户问题：\n{question}\n\n已确认的方案信息：\n{confirmed_section}\n\n相关 schema 信息：\n{schema_context}\n\n方案不一致的原因：\n{inconsistency}\n\n上次生成的 SQL：\n{previous_sql}\n\n提示：多表 JOIN 时所有字段必须加表别名前缀（如 dim_company_snapshot_day.company_name），参考字段来源表确认每个字段属于哪张表。"
 
 
 # ── SQL 审计：对比方案与 SQL 的一致性 ──

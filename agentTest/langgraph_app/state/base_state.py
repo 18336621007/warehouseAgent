@@ -62,6 +62,9 @@ class TopicState(IdentityState, total=False):
     # 上一轮查询结果快照（引用+预览+实体键），结果追问用
     last_query_result: QueryResultSnapshot
 
+    # 本轮实际执行过的 SQL（execute_query 工具收集，Planner 回传前端"查看执行 SQL"展示）
+    executed_sql: list
+
 
 
 class BaseState(TopicState, total=False):

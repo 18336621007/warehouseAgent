@@ -48,6 +48,7 @@ from agentTest.langgraph_app.tools.result_query_tool import (
 from agentTest.langgraph_app.tools.execute_query_tool import (
     set_execute_query_context,
     reset_execute_query_context,
+    take_executed_sqls,
 )
 from agentTest.langgraph_app.tools.semantic_tool import (
     begin_semantic_dedup,
@@ -131,7 +132,7 @@ def _build_minimal_plan(planner_output) -> dict | None:
         f for f in fields
         if re.fullmatch(r"[A-Za-z_]+\([^)]*\)", str(f).strip()) is None
     ]
-    time_field, time_range = _extract_time_from_filters(filters)
+    time_field, _time_range = _extract_time_from_filters(filters)
     if time_field and not is_detail:
         clean_fields = [f for f in clean_fields if f != time_field]
     # 非明细聚合查询：filters 未显式给出时间条件时回退默认分区字段 pt_dt；
@@ -144,8 +145,6 @@ def _build_minimal_plan(planner_output) -> dict | None:
         "select_fields": clean_fields,
         "filters": filters,
         "detail_query": is_detail,
-        "time_field": time_field,
-        "time_range": time_range or "昨天",
         "result_limit": 1000,
     }
     try:
@@ -661,6 +660,10 @@ def build_planner_node(runtime):
             # 语义层命中审计由 execute_query 工具的 semantic.match 承担（工具内部按实际命中记录），
             # Planner 不再做分档路由/置信度判定，语义层定位交给工具在查数时确定
 
+            # 收集本轮实际执行过的 SQL（execute_query 工具线程安全缓冲），回传前端"查看执行 SQL"展示；
+            # 本轮未查数返回空列表，自然覆盖上一轮残留，避免澄清/追问轮展示旧 SQL
+            executed_sqls = take_executed_sqls(state.get("request_id", ""))
+
             # ── Planner 是唯一决策者：route 收敛为 respond 单一终态 ──
             # respond=给用户输出文本（澄清/确认/最终回答由 LLM 自定）；查数已在工具循环内通过 execute_query 完成
             route_llm = "respond"
@@ -702,7 +705,7 @@ def build_planner_node(runtime):
 
             # respond 分支：直接输出文本给用户（澄清/确认/直接回答由 LLM 自定，空文本原样输出不再替模型兜底）
             planner_reason = "Planner 自由文本输出（澄清/回答）：" + (respond_text or "")[:120]
-            return _respond_return("respond", respond_text, planner_reason)
+            return _respond_return("respond", respond_text, planner_reason, extra={"executed_sql": executed_sqls})
 
 
         except Exception as error:
@@ -710,5 +713,7 @@ def build_planner_node(runtime):
             raise
         finally:
             reset_execute_query_context(_exec_ctx)
+            # 兜底清理：异常退出时该请求在缓冲里的 SQL 记录可能未被取走，防内存残留
+            take_executed_sqls(state.get("request_id", ""))
 
     return planner_node

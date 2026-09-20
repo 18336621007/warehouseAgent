@@ -42,7 +42,7 @@ class PlanSynthesizerTest(unittest.TestCase):
         self.assertIsNone(plan)
 
     def test_detail_metric_with_draft_builds_plan(self):
-        # 返厂明细：明细型指标 + 已确认 create_time 时间字段 → 可直达执行链
+        # 返厂明细：明细型指标 + filters 已确认 create_time 时间条件 → 可直达执行链
         sl = get_semantic_layer_provider()
         sp = self._provider()
         draft = {
@@ -50,9 +50,7 @@ class PlanSynthesizerTest(unittest.TestCase):
             "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
             "measures": [],
             "dimensions": [],
-            "time_field": "create_time",
-            "time_range": "今年",
-            "filters": "region_name = '徐州大区' AND status = '同意返厂'",
+            "filters": "region_name = '徐州大区' AND status = '同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
             "field_sources": [],
             "result_limit": 1000,
             "complex": False,
@@ -60,12 +58,13 @@ class PlanSynthesizerTest(unittest.TestCase):
         plan = build_plan_from_semantic(
             [sl.get_metric_by_id("device_return_detail")], sp,
             dimension_mentions=[], time_range="今年",
-            filters="region_name = '徐州大区' AND status = '同意返厂'",
+            filters="region_name = '徐州大区' AND status = '同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
             draft=draft,
         )
         self.assertIsNotNone(plan)
         self.assertTrue(plan.get("detail_query"))
-        self.assertEqual(plan.get("time_field"), "create_time")
+        # 时间字段唯一在 filters 原文，不再有独立槽位
+        self.assertIn("create_time", plan.get("filters") or "")
         self.assertEqual(plan.get("measures"), [])
 
     def test_detail_metric_without_draft_returns_none(self):
@@ -85,9 +84,7 @@ class PlanSynthesizerTest(unittest.TestCase):
             "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
             "measures": [],
             "dimensions": [],
-            "time_field": "create_time",
-            "time_range": "今年",
-            "filters": "region_name = '徐州大区' AND status = '同意返厂'",
+            "filters": "region_name = '徐州大区' AND status = '同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
             "field_sources": [],
             "detail_query": True,
             "result_limit": 1000,
@@ -164,8 +161,9 @@ class PlanSynthesizerTest(unittest.TestCase):
         )
         self.assertIsNotNone(plan)
         self.assertTrue(plan.get("detail_query"))
-        self.assertEqual(plan.get("time_field"), "create_time")
-        self.assertEqual(plan.get("time_range"), "2026-01-01 至 2026-12-31")
+        # 时间字段唯一在 filters 原文，不再有独立槽位
+        self.assertIn("create_time", plan.get("filters") or "")
+        self.assertIn("create_time >= '2026-01-01'", plan.get("filters") or "")
         self.assertEqual(plan.get("status"), "confirmed")
 
     def test_detail_metric_without_time_field_returns_none(self):
@@ -201,7 +199,8 @@ class SeekerDirectFlowTest(unittest.TestCase):
         self.assertNotIn("count(*)", plan.get("dimensions") or [])
         self.assertNotIn("create_time", plan.get("dimensions") or [])
         self.assertIn("disable_type", plan.get("dimensions") or [])
-        self.assertEqual(plan.get("time_field"), "create_time")
+        # 时间字段唯一在 filters 原文，不再有独立槽位
+        self.assertIn("create_time", plan.get("filters") or "")
         self.assertTrue(plan.get("table_plans"))
 
     def test_minimal_plan_requires_tables(self):

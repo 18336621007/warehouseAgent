@@ -121,10 +121,13 @@ def validate_table_plan_filters(
         # 全局必选字段必须在每张表上分别形成真实过滤，字段对字段Join不算过滤。
         # 调用方可传入 required_filter_fields 覆盖默认（明细查询无 pt_dt 时用方案时间字段）。
         required_fields = (
-            list(required_filter_fields) if required_filter_fields
+            list(required_filter_fields) if required_filter_fields is not None
             else list(REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES)
         )
-        if time_field and time_field not in required_fields:
+        # 仅当调用方未显式解析必选字段时，才用 table_plan 的时间字段补充默认分区字段；
+        # 显式提供（如 resolve_required_filter_fields）时以调用方为准，避免程序判定的
+        # 时间字段（如 date_day）被强加到不含该列的表，具体过滤字段交由 LLM 决定
+        if required_filter_fields is None and time_field and time_field not in required_fields:
             required_fields.append(time_field)
         for required_field in required_fields:
             qualified_pattern = rf"\b{re.escape(alias)}\s*\.\s*`?{re.escape(required_field)}`?\b"
@@ -147,7 +150,10 @@ def resolve_required_filter_fields(confirmed_plan: dict) -> list[str]:
 
     tables = confirmed_plan.get("tables") or []
     table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
-    time_field = (confirmed_plan.get("time_field") or "").strip() or "pt_dt"
+    # 时间字段唯一来源是 filters（不再落盘独立槽位），无时间条件时回退默认分区字段
+    from agentTest.langgraph_app.services.query_plan_service import _extract_time_from_filters
+    _ft, _fr = _extract_time_from_filters(str(confirmed_plan.get("filters") or ""))
+    time_field = (_ft or "").strip() or "pt_dt"
     if not table:
         return list(REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES)
     info = get_semantic_layer_provider().get_physical_table(table)

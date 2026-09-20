@@ -2,7 +2,6 @@
 # 新增 SQL 级全量校验：以 confirmed_plan 为基准，校验表名/度量/维度/时间/过滤条件
 # 新增降级 SQL 构造：LLM 重试仍不一致时，根据 confirmed_plan 直接构造标准 SQL
 import re
-from datetime import date, timedelta
 from langchain_core.prompts import ChatPromptTemplate
 
 from agentTest.langchain_app.utils.sql_cleaner import clear_sql
@@ -18,18 +17,16 @@ from agentTest.langgraph_app.message_utils import get_last_ai_content
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.services.sql_table_filter_validator import validate_table_plan_filters
 from agentTest.langgraph_app.services.sql_table_filter_validator import resolve_required_filter_fields
+from agentTest.langgraph_app.services.query_plan_service import _extract_time_from_filters
 from agentTest.langgraph_app.prompts.sql_prompts import (
     SQL_AUDIT_HUMAN_TEMPLATE,
     SQL_AUDIT_SYSTEM_PROMPT,
     SQL_COMPLEX_HUMAN_TEMPLATE,
     SQL_COMPLEX_SYSTEM_PROMPT,
-    SQL_CONSISTENCY_FIX_HUMAN_TEMPLATE,
-    SQL_CONSISTENCY_FIX_SYSTEM_PROMPT,
     SQL_FIX_HUMAN_TEMPLATE,
     SQL_FIX_SYSTEM_PROMPT,
 )
 
-MAX_CONSISTENCY_RETRIES = 2  # 方案一致性校验最多重试次数
 
 def _format_examples(docs: list) -> str:
     """将检索到的历史优质示例转为 Few-shot 文本，LLM 自行从完整 SQL 中学模式"""
@@ -46,13 +43,6 @@ def _format_examples(docs: list) -> str:
         lines.append(f"  SQL：{s}")
     return "\n".join(lines)
 
-
-
-# ── 昨天日期字面量（按时间字段格式生成，避免 Hive/Trino 方言函数差异）──
-def _yesterday_literal(time_field: str) -> str:
-    """按时间字段格式生成"昨天"具体日期（无引号）：pt_dt 分区为 yyyyMMdd，其余时间字段默认 yyyy-MM-dd。"""
-    fmt = "%Y%m%d" if str(time_field).lower() == "pt_dt" else "%Y-%m-%d"
-    return (date.today() - timedelta(days=1)).strftime(fmt)
 
 
 def _normalize_join_keys(keys) -> list[str]:
@@ -86,7 +76,6 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
-    time_field = confirmed_plan.get("time_field", "pt_dt")
     filters = confirmed_plan.get("filters", "")
     joins = confirmed_plan.get("joins") or []  # 多表Join边
     field_sources = confirmed_plan.get("field_sources") or {}  # {字段名: db.table}
@@ -97,11 +86,7 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
         return ""
     if not measures and not dimensions and not is_detail:
         return ""
-    # 明细查询兜底只支持“昨天”这类固定日期表达式，其他时间范围交给 LLM/上层处理
-    if is_detail and (confirmed_plan.get("time_range", "") or "昨天") != "昨天":
-        return ""
-
-    date_expr = f"'{_yesterday_literal(time_field)}'"
+    # 时间条件唯一在 filters 原文（含业务过滤），程序不生成/格式化日期，格式由 LLM 探查确认
 
     # 多表：主表 + JOIN 子句，使用短表名作为别名
     def _short_name(full_name: str) -> str:
@@ -158,26 +143,19 @@ def _build_fallback_sql(confirmed_plan: dict) -> str:
     table_plans = confirmed_plan.get("table_plans") or []
     table_conditions: dict[str, list[str]] = {}
     if table_plans:
-        # 按 table_plans 逐表生成过滤条件，右表条件稍后放入JOIN ON以保留外连接语义。
+        # 按 table_plans 逐表生成过滤条件（时间+业务都在 filters 原文），右表条件稍后放入JOIN ON以保留外连接语义。
         for tp in table_plans:
             tp_table = tp.get("table", "")
             tp_alias = _get_alias(tp_table)
-            tp_time = tp.get("time_field", "pt_dt")
             tp_filters = tp.get("filters", "")
-            tp_date_expr = f"'{_yesterday_literal(tp_time)}'"
-            table_conditions.setdefault(tp_table, []).append(
-                f"{tp_alias}.{tp_time} = {tp_date_expr}"
-            )
             if tp_filters and tp_filters.strip():
                 table_conditions.setdefault(tp_table, []).append(
                     f"{tp_alias}.{tp_filters.strip()}"
                 )
     else:
-        # 兼容旧格式：只用全局 time_field
-        qualified_time = f"{left_alias}.{time_field}" if joins else time_field
-        table_conditions[table] = [f"{qualified_time} = {date_expr}"]
+        # 兼容旧格式：filters 含时间与业务条件，直接作为主表过滤
         if filters and filters.strip():
-            table_conditions[table].append(filters.strip())
+            table_conditions[table] = [filters.strip()]
 
     where_parts = list(table_conditions.pop(table, []))
     joined_tables = {table}
@@ -253,43 +231,6 @@ def _detail_required_fields(confirmed_plan: dict) -> list[str]:
     return resolve_required_filter_fields(confirmed_plan)
 
 
-def _repair_missing_table_filters(sql: str, confirmed_plan: dict) -> tuple[str, list[str]]:
-    """简单查询缺少逐表过滤时，使用已确认方案确定性重建安全SQL。"""
-    tables = confirmed_plan.get("tables") or []
-    table_plans = confirmed_plan.get("table_plans") or []
-    filter_issues = validate_table_plan_filters(
-        sql,
-        tables,
-        table_plans,
-        required_filter_fields=_detail_required_fields(confirmed_plan),
-    )
-    if not filter_issues or confirmed_plan.get("complex", False):
-        return sql, filter_issues
-
-    # 当前确定性构造器只支持“昨天”，其他时间范围继续交给现有LLM重试链。
-    unsupported_ranges = [
-        table_plan.get("time_range", "")
-        for table_plan in table_plans
-        if table_plan.get("time_range") and "昨天" not in table_plan.get("time_range", "")
-    ]
-    if unsupported_ranges:
-        return sql, filter_issues
-
-    fallback_sql = _build_fallback_sql(confirmed_plan)
-    if not fallback_sql:
-        return sql, filter_issues
-
-    repaired_issues = validate_table_plan_filters(
-        fallback_sql,
-        tables,
-        table_plans,
-        required_filter_fields=_detail_required_fields(confirmed_plan),
-    )
-    if repaired_issues:
-        return sql, filter_issues
-    return fallback_sql, filter_issues
-
-
 def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     issues = []
     sql_upper = sql.upper()
@@ -297,7 +238,9 @@ def _validate_sql_against_plan(sql: str, confirmed_plan: dict) -> list:
     table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
     measures = confirmed_plan.get("measures", [])
     dimensions = confirmed_plan.get("dimensions", [])
-    time_field = confirmed_plan.get("time_field", "pt_dt")
+    # 时间字段唯一来源是 filters，无时间条件时回退默认分区字段（仅存在性校验，不校验格式）
+    _ft, _fr = _extract_time_from_filters(str(confirmed_plan.get("filters") or ""))
+    time_field = _ft or "pt_dt"
 
     if not table:
         return issues
@@ -415,7 +358,9 @@ def build_generate_sql_node(runtime):
             table = confirmed_plan.get("table", "") or (tables[0] if tables else "")
             measures = confirmed_plan.get("measures", [])
             dimensions = confirmed_plan.get("dimensions", [])
-            time_field = confirmed_plan.get("time_field", "pt_dt")
+            # 时间字段唯一来源是 filters，这里现算供提示（不校验格式）
+            _ft, _fr = _extract_time_from_filters(str(confirmed_plan.get("filters") or ""))
+            time_field = _ft or "pt_dt"
             joins = confirmed_plan.get("joins") or []  # 多表Join边
             field_sources = confirmed_plan.get("field_sources") or {}  # 字段来源映射
             filters = confirmed_plan.get("filters", "")
@@ -446,7 +391,7 @@ def build_generate_sql_node(runtime):
                         "直接 SELECT 需要展示的字段（无指定字段时可用 *），"
                         "必须带 WHERE 时间过滤与 LIMIT"
                     )
-            time_range_cs = confirmed_plan.get("time_range", "") or "昨天"
+            time_range_cs = _fr or "昨天"
             parts.append(f"- 主表时间分区（必须在 WHERE 中）: {time_field}（{time_range_cs}）")
             if filters:
                 parts.append(f"- 额外过滤条件（必须在 WHERE 中）: {filters}")
@@ -485,13 +430,13 @@ def build_generate_sql_node(runtime):
                 parts.append(
                     "- 注意：部分表之间缺少预配置关联关系，请根据各表字段语义推断合适的 JOIN 键（如 company_id、order_id 等）"
                 )
-            # 每表的时间过滤规则
+            # 逐表过滤提示：只列出各表方案内的过滤条件，时间/分区字段由 LLM 参考上方 schema 自行决定
             table_plans = confirmed_plan.get("table_plans") or []
             if table_plans:
                 tp_lines = []
                 for tp in table_plans:
-                    tp_lines.append(f"  {tp.get('table','')}: time={tp.get('time_field','pt_dt')}({tp.get('time_range','')}), filters={tp.get('filters','') or '无'}")
-                parts.append("- 逐表时间过滤（主表放WHERE，被连接表放对应JOIN ON；每张表都必须过滤）:\n" + "\n".join(tp_lines))
+                    tp_lines.append(f"  {tp.get('table','')}: filters={tp.get('filters','') or '无'}")
+                parts.append("- 逐表过滤条件（主表过滤放 WHERE，被连接表过滤放对应 JOIN ON；请参考上方各表 schema 字段，自行决定每张表适用的时间/分区过滤字段）:\n" + "\n".join(tp_lines))
             # 排序规则
             order_by = confirmed_plan.get("order_by") or []
             if order_by:
@@ -591,65 +536,24 @@ def build_generate_sql_node(runtime):
             generated_sql = llm.invoke(prompt_value)
             generated_sql = clear_sql(generated_sql)
 
-            # 简单查询缺少某张表过滤时优先确定性修复，避免带膨胀风险的SQL进入执行链。
-            repaired_sql, missing_filter_issues = _repair_missing_table_filters(
-                generated_sql,
-                confirmed_plan,
-            )
-            if repaired_sql != generated_sql:
-                log_node_event(
-                    "generate_sql",
-                    "逐表过滤自动修复: " + "; ".join(missing_filter_issues),
-                )
-                generated_sql = repaired_sql
-
-            # ── 方案一致性校验 ──
-            consistency_retry = 0
+            # ── 方案一致性校验（只校验记录，不再自动修复/降级构造）──
+            # 校验通过则记录本次 SQL 供后续 exec_retry 参考；
+            # 校验不过仅记录日志，交由 validate_sql 执行前门禁兜底安全，方案问题由执行后返工/用户反馈处理。
             enum_lookup_simple = runtime.get("sample_values_map_simple") or {}
             pass_history = list(state.get("sql_pass_history") or [])
             final_sql_for_history = ""
             if confirmed_plan.get("table") or confirmed_plan.get("tables"):
-                while consistency_retry < MAX_CONSISTENCY_RETRIES:
-                    inconsistency = _check_plan_consistency(
-                        generated_sql, confirmed_plan, advisor_last_answer, llm,
-                        enum_lookup_simple=enum_lookup_simple,
+                inconsistency = _check_plan_consistency(
+                    generated_sql, confirmed_plan, advisor_last_answer, llm,
+                    enum_lookup_simple=enum_lookup_simple,
+                )
+                if not inconsistency:
+                    final_sql_for_history = generated_sql
+                else:
+                    log_node_event(
+                        "generate_sql",
+                        f"一致性校验未通过（仅记录，不自动修复/降级）: {inconsistency[:120]}",
                     )
-                    if not inconsistency:
-                        # 记录本次 PASS 的 SQL，供后续 exec_retry 时回灌给 LLM 参考
-                        final_sql_for_history = generated_sql
-                        break
-
-                    consistency_retry += 1
-                    retry_count += 1
-                    log_node_start("generate_sql", retry=retry_count,
-                                   consistency_fix=inconsistency[:80])
-
-                    fix_prompt = ChatPromptTemplate.from_messages([
-                        ("system", SQL_CONSISTENCY_FIX_SYSTEM_PROMPT),
-                        ("human", SQL_CONSISTENCY_FIX_HUMAN_TEMPLATE),
-                    ])
-                    fix_input = {
-                        "question": question,
-                        "confirmed_section": confirmed_section,
-                "example_section": example_section,
-                        "schema_context": schema_context,
-                        "inconsistency": inconsistency,
-                        "previous_sql": generated_sql,
-                    }
-                    generated_sql = clear_sql(llm.invoke(fix_prompt.invoke(fix_input)))
-
-                # ── 降级：重试耗尽 → 直接构造标准 SQL ──
-                if consistency_retry >= MAX_CONSISTENCY_RETRIES:
-                    remaining_issues = _validate_sql_against_plan(generated_sql, confirmed_plan)
-                    if remaining_issues:
-                        fallback_sql = _build_fallback_sql(confirmed_plan)
-                        if fallback_sql:
-                            log_node_event("generate_sql",
-                                f"降级 SQL 构造: LLM 重试 {MAX_CONSISTENCY_RETRIES} 次仍不一致，"
-                                f"使用 confirmed_plan 直接构造。剩余问题: {remaining_issues}")
-                            generated_sql = fallback_sql
-                            # 降级构造的 SQL 也视作通过校验，加入 history
-                            final_sql_for_history = fallback_sql
 
             # 把本次 PASS 的 SQL 写入 history（去重，最多保留最近 3 条）
             if final_sql_for_history:

@@ -93,16 +93,12 @@ def _derive_execution_fields(plan: dict) -> None:
         plan["measures"] = _deduplicate(measures)
     if dimensions:
         plan["dimensions"] = _deduplicate(dimensions)
-    # 时间字段从过滤条件识别（时间属于过滤字段，不新增独立槽位）
-    time_field, time_range = _extract_time_from_filters(str(plan.get("filters") or ""))
-    if time_field:
-        plan["time_field"] = time_field
-    if time_range:
-        plan["time_range"] = time_range
+    # 时间字段从过滤条件识别（时间唯一在 filters，不落盘独立槽位，仅用于字段覆盖分析）
+    time_field, _time_range = _extract_time_from_filters(str(plan.get("filters") or ""))
     # fields 汇总：度量 + 维度 + 时间字段
     all_fields = list(plan.get("measures") or []) + list(plan.get("dimensions") or [])
-    if plan.get("time_field"):
-        all_fields.append(plan["time_field"])
+    if time_field:
+        all_fields.append(time_field)
     plan["fields"] = _deduplicate(all_fields)
 
 
@@ -182,7 +178,7 @@ def merge_draft_plan(current_plan: dict, draft_args: dict) -> QueryPlan:
         "select_fields",
     ]
     scalar_keys = [
-        "time_field", "time_range", "filters", "having",
+        "filters", "having",
         "result_limit", "complex", "detail_query",
     ]
     for key in list_keys:
@@ -222,6 +218,9 @@ def merge_draft_plan(current_plan: dict, draft_args: dict) -> QueryPlan:
 def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> QueryPlan:
     """将 Advisor 生成的完整方案标准化为 locked 方案。table 从 tables[0] 推导。"""
     plan = deepcopy(proposed_plan)
+    # 时间字段唯一来源是 filters：清理历史草稿遗留的 time_field/time_range 槽位，统一从 filters 现算
+    plan.pop("time_field", None)
+    plan.pop("time_range", None)
 
     # 兼容业务方案字段输入：只有 select_fields/filters 时先派生执行字段
     if plan.get("select_fields") and not plan.get("measures") and not plan.get("dimensions"):
@@ -229,7 +228,11 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
 
     measures = plan.get("measures") or []
     dimensions = plan.get("dimensions") or []
-    time_field = plan.get("time_field", "")
+    # 时间字段唯一来源是 filters（不再落盘独立槽位），这里现算供字段覆盖/逐表过滤计划使用
+    _time_field, _time_range = _extract_time_from_filters(str(plan.get("filters") or ""))
+    # 安全：明细查询必须由 filters 明确业务时间字段，禁止无时间过滤（可能全表扫描）
+    if plan.get("detail_query") and not _time_field:
+        raise ValueError("明细查询必须由 filters 明确业务时间字段，无法锁定方案")
     advisors_tables = plan.get("tables") or []
     advisors_field_sources = plan.get("field_sources") or []  # ["db.table.field", ...]
 
@@ -276,8 +279,8 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
     plan.pop("_field_sources", None)
 
     fields = list(measures) + list(dimensions)
-    if time_field:
-        fields.append(time_field)
+    if _time_field:
+        fields.append(_time_field)
     # 过滤字段（如 A类→company_category）只用于过滤不进入 SELECT/GROUP BY，
     # 但需登记进 fields 供字段覆盖分析定位归属表，保证维表参与 Join 规划
     for _filter_field in (source_map or {}):
@@ -302,8 +305,8 @@ def lock_query_plan(proposed_plan: dict, concept_resolutions: dict = None) -> Qu
         if REQUIRED_FILTER_FIELDS_FOR_ALL_TABLES
         else "pt_dt"
     )
-    shared_time = plan.get("time_field") or default_filter_field
-    shared_range = plan.get("time_range", "昨天")
+    shared_time = _time_field or default_filter_field
+    shared_range = _time_range or "昨天"
     shared_filters = plan.get("filters", "")
     primary_table = plan.get("table", "")
     # 全局 filters 按过滤字段归属分发到对应表，未声明归属的过滤段回退主表
