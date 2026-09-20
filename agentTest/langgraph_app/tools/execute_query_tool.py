@@ -50,6 +50,34 @@ def _split_keywords(question: str) -> list[str]:
     return [t.strip() for t in _TOKEN_SPLIT.split(str(question or "")) if t and t.strip()]
 
 
+def _precheck_filter_fields(filters: str, metric_hits: list, semantic_provider) -> tuple:
+    """预校验 filters 字段能否在指标来源表/关联表内定位，返回 (无法定位字段, 来源表列表)。
+
+    与 build_plan_from_semantic 的 scope 对齐（来源表 + join contracts 一跳可达表），
+    提前拦截模型臆造字段，把具体失败信息（哪个字段、表时间分区字段）交给模型探查修正。
+    """
+    from agentTest.langgraph_app.services.plan_synthesizer import (
+        _extract_filter_fields,
+        _find_field_table,
+    )
+    fields = _extract_filter_fields(filters)
+    if not fields:
+        return [], []
+    sl = semantic_provider.semantic_layer
+    tables = set()
+    for _m in (metric_hits or []):
+        _src = str(_m.get("source_model") or "")
+        if _src:
+            tables.add(_src)
+    scope_ids = set(tables)
+    for _mid in list(scope_ids):
+        for _c in sl.get_join_contracts_for_model(_mid):
+            scope_ids.add(str(_c.get("left_model") or ""))
+            scope_ids.add(str(_c.get("right_model") or ""))
+    unmapped = [f for f in fields if not _find_field_table(f, scope_ids, sl)]
+    return unmapped, sorted(tables)
+
+
 def _log_metric_hit(metric_hits, question, metric_source):
     """记录 execute_query 工具内部的真实语义层命中（与 Planner 的 semantic.match 并存）。
 
@@ -186,7 +214,7 @@ def build_execute_query_tool(runtime, seeker_graph):
                 limit=3,
             )[:1]
         if not metric_hits:
-            return None, "未匹配到语义层指标，无法构建查询方案。可先用 search_semantic 检索指标，或补充指标/口径信息后再试。"
+            return None, "未匹配到语义层指标，无法构建查询方案。可先用 grep_semantic/read_metric 定位指标，或补充指标/口径信息后再试。"
         # 记录工具内部真实语义层命中（供日志审计"实际走的语义层路径"）
         metric_hits = _log_metric_hit(metric_hits, question, metric_source)
         # 命中行同时带 name 与 id，便于 LLM/日志审计实际走的指标（id 为稳定标识）
@@ -196,6 +224,24 @@ def build_execute_query_tool(runtime, seeker_graph):
             _i = str(_m.get("id") or "")
             _hit_parts.append(f"{_n}（id={_i}）" if _i and _i != _n else _n)
         _hit_line = "已按语义层指标「" + "、".join(_hit_parts) + "」执行查询。"
+        # 2.0 filters 字段预校验：拦截模型臆造字段，失败信息具体化（哪个字段、表时间分区字段）
+        _unmapped_filters, _src_tables = _precheck_filter_fields(
+            filters, metric_hits, semantic_provider
+        )
+        if _unmapped_filters:
+            _tables_str = "、".join(_src_tables) or "相关表"
+            # 收集来源表时间分区字段，作为修正时间过滤条件的提示
+            _time_hints = []
+            for _t in _src_tables:
+                _tf = semantic_provider.get_table_time_field(_t)
+                if _tf and _tf not in _time_hints:
+                    _time_hints.append(_tf)
+            _time_str = ("；若为时间过滤，该表时间分区字段为 " + "、".join(_time_hints)) if _time_hints else ""
+            _bad_fields = "、".join(f"「{_f}」" for _f in _unmapped_filters)
+            return None, (
+                f"过滤字段 {_bad_fields} 无法在指标来源表及关联表（{_tables_str}）中定位{_time_str}。"
+                "请用 search_columns 查询相关表确认真实字段名后修正 filters 重试。"
+            )
         # 2. 语义层确定性方案构建（字段由语义层权威决定，避免 LLM 猜字段）
         # dimension（dimensional_measures 子口径）并入维度提及，供 {field} 占位符解析
         _dims = [d.strip() for d in str(dimensions or "").split(",") if d.strip()]
@@ -379,7 +425,7 @@ def build_execute_query_tool(runtime, seeker_graph):
 
         需要查数时调用；多指标可用 steps 一次提交多段查询（并行执行、每段结果独立落盘，仿 Codex 查询脚本）。参数：
         - question：查询意图（如"查询徐州大区今年同意返厂的返厂明细"）
-        - metric_id：语义层指标 id（可选，先用 search_semantic 确认后传入更准）
+        - metric_id：语义层指标 id（可选，先用 grep_semantic/read_metric 确认后传入更准）
         - filters：过滤条件（如"region_name='徐州大区' AND status='同意返厂'"），时间用 yyyy-MM-dd 日期区间
         - dimensions：需要展示/分组的维度（逗号分隔，可选）
         - dimension：指标的可选子口径，填与用户问法一致的口径名称（如"激活电柜"），不是物理字段名；拿不准时先 search_columns 确认可选口径再决定执行

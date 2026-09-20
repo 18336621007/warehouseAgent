@@ -183,11 +183,12 @@ class ThinkingStreamChatModel(BaseChatModel):
     model: str = Field(default="")
     extra_body: dict | None = Field(default=None)
     answer_field: str = Field(default="", description="最终回答流式：结构化 JSON 中该字段的文本在生成中实时推前端")
+    stream_raw_content: bool = Field(default=False, description="自由文本流式：直接增量推送 content 到前端回答区（对齐 Codex）")
     _client: OpenAI = PrivateAttr()
 
-    def __init__(self, api_key: str, base_url: str, model: str, extra_body=None, callbacks=None, answer_field=""):
+    def __init__(self, api_key: str, base_url: str, model: str, extra_body=None, callbacks=None, answer_field="", stream_raw_content=False):
         super().__init__(model=model, extra_body=extra_body or None, callbacks=callbacks,
-                         answer_field=answer_field)
+                         answer_field=answer_field, stream_raw_content=stream_raw_content)
         # OpenAI 客户端实例不作为 pydantic 字段，仅保存为私有属性
         self._client = OpenAI(api_key=api_key, base_url=base_url)
 
@@ -279,7 +280,9 @@ class ThinkingStreamChatModel(BaseChatModel):
         reasoning_sid = f"reasoning-{os.urandom(3).hex()}"
         content_parts = []
         # 最终回答流式：从生成中的 JSON 增量提取指定字段（如 respond_text），实时推前端
-        stream_answer = bool(self.answer_field) and get_stream_output_enabled() and bus is not None
+        # 最终回答流式：自由文本直接推 content；否则从生成中的 JSON 增量提取 answer_field
+        stream_raw = bool(self.stream_raw_content) and get_stream_output_enabled() and bus is not None
+        stream_answer = (not stream_raw) and bool(self.answer_field) and get_stream_output_enabled() and bus is not None
         json_streamer = _JsonFieldStreamer(self.answer_field) if stream_answer else None
         # 流式工具调用增量按 index 累积（function calling / structured output）
         tool_calls_acc = {}
@@ -302,7 +305,10 @@ class ThinkingStreamChatModel(BaseChatModel):
             content = getattr(delta, "content", None) or ""
             if content:
                 content_parts.append(content)
-                if json_streamer is not None:
+                if stream_raw:
+                    # 自由文本：生成即推前端回答区（对齐 Codex 实时输出）
+                    bus.emit_token("answer", content, live=True)
+                elif json_streamer is not None:
                     # 已确认可输出的目标字段文本增量：实时推前端回答区
                     piece = json_streamer.feed(content)
                     if piece:

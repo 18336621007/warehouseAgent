@@ -650,61 +650,18 @@ def _plan_summary(plan):
     }
 
 
-def _resolution_summary(resolutions):
-    # 指标/维度解析证据摘要，只保留状态、命中字段与候选数量
-    top_n = log_config.LOG_STATE_TOP_N
-    summary = []
-    for item in (resolutions or [])[:top_n]:
-        summary.append({
-            "mention": item.get("mention", ""),
-            "status": item.get("status", ""),
-            "selected_field": item.get("selected_field", ""),
-            "selected_table": item.get("selected_table", ""),
-            "source": item.get("resolution_source", ""),
-            "candidate_count": len(item.get("candidates") or []),
-        })
-    return summary
-
-
-def _spec_summary(spec):
-    # AnalysisSpec 摘要：业务概念与解析证据只保留 Top-N
-    if not spec:
-        return {}
-    return {
-        "analysis_type": spec.get("analysis_type", ""),
-        "metric_mentions": spec.get("metric_mentions") or [],
-        "dimension_mentions": spec.get("dimension_mentions") or [],
-        "time_range": spec.get("time_range", ""),
-        "time_grain": spec.get("time_grain", ""),
-        "order_by": spec.get("order_by") or [],
-        "metric_resolutions": _resolution_summary(spec.get("metric_resolutions")),
-        "dimension_resolutions": _resolution_summary(spec.get("dimension_resolutions")),
-    }
-
-
 def build_state_snapshot(state, node_name=""):
-    # 从共享 State 提取分层摘要：共享层（route/topic/方案/分析意图）+ Agent 层关键字段
+    # 从共享 State 提取分层摘要：共享层（route/topic/方案）+ Agent 层关键字段
     snapshot = {}
     snapshot["route"] = state.get("route", "")
     snapshot["topic_status"] = state.get("topic_status", "")
-    snapshot["advisor_turns"] = state.get("advisor_turns", 0)
     snapshot["effective_query"] = _short_text(
         state.get("effective_query", ""),
         max_length=300,
     )
     snapshot["confirmed_plan"] = _plan_summary(state.get("confirmed_plan") or {})
-    snapshot["analysis_spec"] = _spec_summary(state.get("analysis_spec") or {})
 
-    # Agent 层：Planner 实体与原因
-    entities = state.get("planner_entities") or {}
-    if entities:
-        snapshot["planner_entities"] = {
-            "table": entities.get("table", ""),
-            "tables": entities.get("tables") or [],
-            "fields": entities.get("fields") or [],
-            "completeness": entities.get("completeness", ""),
-            "unresolved_dimensions": entities.get("unresolved_dimensions") or [],
-        }
+    # Agent 层：Planner 原因
     if state.get("planner_reason"):
         snapshot["planner_reason"] = _short_text(
             state.get("planner_reason", ""),
@@ -739,8 +696,6 @@ def build_state_snapshot(state, node_name=""):
                 max_length=200,
             ),
         }
-    if state.get("evaluator_score") is not None:
-        snapshot["evaluator_score"] = state.get("evaluator_score")
     return snapshot
 
 

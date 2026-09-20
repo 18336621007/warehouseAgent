@@ -108,17 +108,17 @@ def build_graph_runtime():
         groups=("planner",),
         security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
     ))
-    # 统一工具注册表：Planner 专属语义层检索工具（agent 自主调用，优先级高于 RAG）
-    # 语义层候选不再程序强制注入 prompt，由 Planner ReAct 按需调用 search_semantic 获取
-    from agentTest.langgraph_app.tools.semantic_tool import build_search_semantic_tool
-    semantic_tool = build_search_semantic_tool()
-    tool_registry.register(ToolSpec(
-        name="search_semantic",
-        description=semantic_tool.description,
-        tool=semantic_tool,
-        groups=("planner",),
-        security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
-    ))
+    # 统一工具注册表：Planner 专属语义层检索工具集（LLM 驱动：grep + read + list，优先级高于 RAG）
+    # 由 LLM 自己选核心词 grep 全文、按需读指标文件确认口径，程序只保证安全（仅语义层目录）与预算截断
+    from agentTest.langgraph_app.tools.semantic_tool import build_semantic_tools
+    for semantic_tool in build_semantic_tools():
+        tool_registry.register(ToolSpec(
+            name=semantic_tool.name,
+            description=semantic_tool.description,
+            tool=semantic_tool,
+            groups=("planner",),
+            security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
+        ))
     # 统一工具注册表：Planner 专属技能读取工具（渐进式披露，仿 Codex）
     # 每轮只向 LLM 披露所有技能 name+description 索引，选中某技能后由 read_skill 按需读完整正文
     skill_manager = build_skill_manager()

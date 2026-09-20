@@ -1,19 +1,12 @@
-# 语义层 grep 两阶段流程集成测试：mock LLM + 向量库，验证 planner 分档路由
-# 覆盖：grep 命中注入、semantic_metrics 分档、强命中短路跳过 FAISS、Advisor 候选传递
+# Planner ReAct 工具循环测试（自由文本模式）：mock LLM + 桩工具，
+# 覆盖：grep_semantic 检索回填、工具结果以 ToolMessage 进入上下文、同参数去重、自由文本最终回答
 import unittest
 from unittest import mock
 
 from langchain_core.messages import AIMessage
-from agentTest.langgraph_app.prompts.planner_prompt import (
-    PlannerOutput,
-    SemanticKeywordsOutput,
-    SemanticMetricHit,
-)
 
 
 class _FakeVectorStore:
-    """极简向量库桩：返回空检索结果。"""
-
     def similarity_search_with_score(self, question, k, **kwargs):
         return []
 
@@ -35,61 +28,49 @@ class _FakeTool:
 
 
 class _FakeReactLLM:
-    """ReAct 循环桩：按预设序列返回 tool_calls，序列耗尽后返回无 tool_calls。"""
+    """ReAct 循环桩：按预设序列返回 tool_call 或自由文本；序列耗尽返回空文本。"""
 
-    def __init__(self, tool_calls_list):
-        self._tool_calls_list = list(tool_calls_list)
+    def __init__(self, react_calls):
+        self._calls = list(react_calls)
         self._step = 0
+        self.seen_messages = []
 
     def invoke(self, messages):
-        if self._step < len(self._tool_calls_list):
-            tc = self._tool_calls_list[self._step]
+        self.seen_messages.append(messages)
+        if self._step < len(self._calls):
+            item = self._calls[self._step]
             self._step += 1
-            return AIMessage(content="", tool_calls=[tc])
+            if isinstance(item, dict):  # tool_call
+                return AIMessage(content="", tool_calls=[item])
+            return AIMessage(content=item)  # 自由文本回答
         return AIMessage(content="")
 
 
-class _FakeStructuredLLM:
-    """按结构化模型类型返回预设输出（keyword 小调用 / 完整 PlannerOutput）。"""
+class _FakeLLM:
+    """自由文本模式 Planner 的 LLM 桩：invoke 首次（rewrite）返回 effective_query，
+    后续 invoke（chat_openai 兜底）返回 fallback_text；bind_tools 返回 _FakeReactLLM。"""
 
-    def __init__(self, keyword_list, planner_kwargs, react_tool_calls=None, seen_messages=None):
-        self._keyword_list = keyword_list
-        self._planner_kwargs = planner_kwargs
-        self._react_tool_calls = react_tool_calls or []
-        self._seen_messages = seen_messages  # 记录传给结构化 LLM 的 messages，供断言工具回填
+    def __init__(self, effective_query="", react_calls=None, fallback_text=""):
+        self._effective_query = effective_query
+        self._react = _FakeReactLLM(react_calls or [])
+        self._fallback_text = fallback_text
+        self._invoke_count = 0
 
-    def invoke(self, prompt_value):
-        return self  # 简化：invoke 直接返回
+    def invoke(self, messages):
+        self._invoke_count += 1
+        if self._invoke_count == 1:
+            return AIMessage(content=self._effective_query)
+        return AIMessage(content=self._fallback_text)
 
     def bind_tools(self, tools):
-        return _FakeReactLLM(self._react_tool_calls)
-
-    def with_structured_output(self, model, **kwargs):
-        if model is SemanticKeywordsOutput:
-            return _FakeStructuredCallable(
-                SemanticKeywordsOutput(semantic_keywords=self._keyword_list)
-            )
-        return _FakeStructuredCallable(PlannerOutput(**self._planner_kwargs), self._seen_messages)
-
-
-class _FakeStructuredCallable:
-    def __init__(self, value, seen_messages=None):
-        self._value = value
-        self._seen_messages = seen_messages
-
-    def invoke(self, prompt_value):
-        # 工具链场景：记录最终结构化输入，供测试断言工具结果已回填
-        if self._seen_messages is not None:
-            self._seen_messages.append(prompt_value)
-        return self._value
+        return self._react
 
 
 def _build_runtime():
     from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
     from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec
-    # M2：Planner 从统一注册表取 planner 组工具（本测试用桩工具）
     registry = ToolRegistry()
-    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "search_semantic"):
+    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "probe_values", "grep_semantic", "execute_query"):
         registry.register(ToolSpec(name=name, description="stub", tool=_FakeTool(name), groups=("planner",)))
     return {
         "table_vector_store": _FakeVectorStore(),
@@ -101,199 +82,65 @@ def _build_runtime():
     }
 
 
-def _state(user_input, messages=None):
-    return {
+def _state(user_input, messages=None, **overrides):
+    state = {
         "current_user_input": user_input,
         "messages": messages or [],
         "confirmed_plan": {},
-        "analysis_spec": {},
+        "request_id": "req-grep",
     }
-
-
-def _planner_kwargs(**overrides):
-    base = {
-        "effective_query": "查询昨天从山东瀛能公司调出的调出明细",
-        "route": "respond",
-        "respond_text": "已查询到调出明细，请查看。",
-        "tables": ["ads_trip.ads_gundam_device_transfer_detail_hour"],
-        "fields": ["origin_company_name", "transfer_no"],
-        "completeness": "full",
-        "complex": False,
-        "metric_mentions": ["调出明细"],
-        "dimension_mentions": ["山东瀛能"],
-        "analysis_type": "detail",
-        # 明细查询必须由 filters 明确业务时间字段（无分区明细表禁止回退 pt_dt）
-        "filters": "pt_dt 昨天",
-        "reason": "语义层命中调货明细",
-        "semantic_keywords": ["调出", "明细"],
-        "semantic_metrics": [],
-    }
-    base.update(overrides)
-    return base
+    state.update(overrides)
+    return state
 
 
 class PlannerSemanticGrepFlowTest(unittest.TestCase):
-    """Planner 两阶段语义层流程测试。"""
+    """Planner ReAct 工具循环：自主检索语义层/元数据并基于工具结果写回答。"""
 
-    def _run_planner(self, keyword_list, planner_kwargs, react_tool_calls=None, seen_messages=None):
+    def _run(self, react_calls, user_input="查询昨天从山东瀛能公司调出的调出明细"):
         from agentTest.langgraph_app.nodes import planner_node
-
-        fake_llm = _FakeStructuredLLM(keyword_list, planner_kwargs, react_tool_calls, seen_messages)
+        fake_llm = _FakeLLM(effective_query="查询昨天从山东瀛能公司调出的调出明细", react_calls=react_calls)
         with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
-            return node(_state("查询昨天从山东瀛能公司调出的调出明细"))
-
-    def test_strong_grep_shortcut_skips_faiss(self):
-        """调出明细：grep 强命中 device_transfer_detail，LLM 唯一强命中 → semantic unique 短路。"""
-        planner_kwargs = _planner_kwargs(
-            semantic_metrics=[
-                SemanticMetricHit(
-                    id="device_transfer_detail",
-                    confidence=0.95,
-                    mention="调出明细",
-                )
-            ]
-        )
-        result = self._run_planner(["调出", "明细"], planner_kwargs)
-        entities = result["planner_entities"]
-        self.assertTrue(entities["semantic_metrics"])
-        self.assertEqual(
-            entities["semantic_metrics"][0]["id"],
-            "device_transfer_detail",
-        )
-        # 语义候选保留在 planner_entities（供日志/trace 与后续轮次参考）
-        self.assertTrue(
-            any(
-                c.get("id") == "device_transfer_detail"
-                for c in entities["semantic_candidates"]
-            )
-        )
-        # table_candidates 来自语义层推荐
-        self.assertTrue(
-            any(
-                t.get("table") == "ads_trip.ads_gundam_device_transfer_detail_hour"
-                for t in entities["table_candidates"]
-            )
-        )
-
-    def test_candidate_tier_routes_to_respond(self):
-        """0.55~0.9 候选反问：Planner 直接 respond 澄清（不再降级 Advisor）。"""
-        planner_kwargs = _planner_kwargs(
-            route="respond",
-            completeness="partial",
-            respond_text="您说的“调出”可能对应多个口径：1) 调货明细；2) 返厂明细。请确认是哪一个？",
-            semantic_metrics=[
-                SemanticMetricHit(
-                    id="device_transfer_detail",
-                    confidence=0.8,
-                    mention="调出",
-                ),
-                SemanticMetricHit(
-                    id="device_return_detail",
-                    confidence=0.7,
-                    mention="调出",
-                ),
-            ],
-        )
-        result = self._run_planner(["调出", "明细"], planner_kwargs)
-        self.assertEqual(result["route"], "respond")
-        entities = result["planner_entities"]
-        # 两个候选都保留在 planner_entities，供日志/trace 与后续轮次参考
-        ids = {m["id"] for m in entities["semantic_metrics"]}
-        self.assertIn("device_transfer_detail", ids)
-        self.assertIn("device_return_detail", ids)
-
-    def test_no_semantic_grep_falls_back_to_respond(self):
-        """无 grep 命中：semantic_metrics 为空，Planner 直接 respond（不构建方案执行）。"""
-        planner_kwargs = _planner_kwargs(
-            route="respond",
-            semantic_keywords=["排产"],
-            semantic_metrics=[],
-        )
-        result = self._run_planner(["排产电人比"], planner_kwargs)
-        entities = result["planner_entities"]
-        self.assertEqual(entities["semantic_metrics"], [])
-        # 单 Agent：查数必须由 execute_query 工具完成，Planner 不直接构建方案执行
-        self.assertEqual(result["route"], "respond")
-        self.assertIsNone(result.get("confirmed_plan"))
-
-    def test_respond_route_with_semantic_hit_keeps_candidates(self):
-        """Planner 判定 respond 且语义层唯一强命中：候选保留供日志/trace，不直接构建方案执行。"""
-        planner_kwargs = _planner_kwargs(
-            route="respond",
-            effective_query="查询昨天的新增订单数",
-            dimension_mentions=[],
-            filters="pt_dt 昨天",
-            semantic_metrics=[
-                SemanticMetricHit(
-                    id="addition_order_num",
-                    confidence=0.95,
-                    mention="新增订单",
-                )
-            ],
-        )
-        result = self._run_planner(
-            ["新增订单"],
-            planner_kwargs,
-            react_tool_calls=[{
-                "name": "search_semantic",
-                "args": {"question": "新增订单"},
-                "id": "call_semantic_1",
-            }],
-        )
-        entities = result["planner_entities"]
-        # 语义命中候选与推荐表保留（供日志/trace 与后续 execute_query 复用）
-        self.assertTrue(
-            any(c.get("id") == "addition_order_num" for c in entities["semantic_candidates"])
-        )
-        self.assertTrue(
-            any(
-                t.get("table") == "ads_trip.ads_region_rent_order_analysis_hour"
-                for t in entities["table_candidates"]
-            )
-        )
-        # respond 分支：不直接构建 confirmed_plan 执行
-        self.assertEqual(result["route"], "respond")
-        self.assertIsNone(result.get("confirmed_plan"))
-
-    def test_respond_route_without_tables_falls_back_to_respond(self):
-        """Planner 判定 respond 且既无表信息也无法构建方案时，respond 澄清（不再降级 Advisor）。"""
-        planner_kwargs = _planner_kwargs(
-            route="respond",
-            effective_query="查询昨天的续租率",
-            tables=[],
-            fields=[],
-            dimension_mentions=[],
-            semantic_metrics=[
-                SemanticMetricHit(
-                    id="renewal_rate",
-                    confidence=0.95,
-                    mention="续租率",
-                )
-            ],
-        )
-        result = self._run_planner(["续租率"], planner_kwargs)
-        self.assertEqual(result["route"], "respond")
-        self.assertIsNone(result.get("confirmed_plan"))
+            return node(_state(user_input)), fake_llm
 
     def test_react_tool_loop_feeds_tool_result(self):
-        """Planner ReAct：LLM 调用 search_columns 后，工具结果以 ToolMessage 回填进最终结构化输入。"""
-        seen = []
-        planner_kwargs = _planner_kwargs()
-        self._run_planner(
-            ["调出"],
-            planner_kwargs,
-            react_tool_calls=[{
-                "name": "search_columns",
-                "args": {"question": "山东瀛能", "table": "ads_trip.ads_gundam_device_transfer_detail_hour"},
-                "id": "call_1",
-            }],
-            seen_messages=seen,
-        )
-        self.assertTrue(seen, "结构化 LLM 应收到 messages")
-        tool_msgs = [m for m in seen[0] if getattr(m, "type", "") == "tool"]
+        """ReAct：LLM 调 grep_semantic 后，工具结果以 ToolMessage 回填进上下文，最终自由文本回答。"""
+        react_calls = [
+            {"name": "grep_semantic", "args": {"question": "调出明细"}, "id": "call_semantic_1"},
+            "已查询到调出明细，请查看。",
+        ]
+        result, fake_llm = self._run(react_calls)
+        self.assertEqual(result["route"], "respond")
+        self.assertIn("调出明细", result["final_answer"])
+        # 工具结果应作为 ToolMessage 进入下一轮 React 输入
+        all_msgs = [m for batch in fake_llm._react.seen_messages for m in batch]
+        tool_msgs = [m for m in all_msgs if getattr(m, "type", "") == "tool"]
         self.assertTrue(tool_msgs, "工具结果应以 ToolMessage 回填")
-        self.assertIn("search_columns", tool_msgs[0].content)
+        self.assertIn("grep_semantic", tool_msgs[0].content)
+
+    def test_dedup_same_args_skips_rerun(self):
+        """同参数工具调用去重：第二次同参数调用返回提示，不重复注入全量结果。"""
+        react_calls = [
+            {"name": "grep_semantic", "args": {"question": "调出明细"}, "id": "call_semantic_1"},
+            {"name": "grep_semantic", "args": {"question": "调出明细"}, "id": "call_semantic_2"},
+            "已基于语义层结果回答。",
+        ]
+        result, fake_llm = self._run(react_calls)
+        self.assertEqual(result["route"], "respond")
+        # 第二次同参调用应命中去重提示（工具结果不再重复全量注入）
+        all_msgs = [m for batch in fake_llm._react.seen_messages for m in batch]
+        tool_msgs = [m for m in all_msgs if getattr(m, "type", "") == "tool"]
+        self.assertTrue(
+            any("同参数已在上文返回" in m.content for m in tool_msgs),
+            "同参数第二次调用应返回去重提示",
+        )
+        self.assertIn("grep_semantic -> 工具结果", tool_msgs[0].content)
+
+    def test_react_direct_answer_without_tools(self):
+        """信息充分不调工具：直接自由文本回答结束本轮。"""
+        result, _ = self._run(["山东瀛能昨日无调出明细记录。"])
+        self.assertEqual(result["route"], "respond")
+        self.assertIn("无调出明细记录", result["final_answer"])
 
 
 if __name__ == "__main__":

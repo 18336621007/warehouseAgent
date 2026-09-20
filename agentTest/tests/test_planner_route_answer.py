@@ -1,12 +1,11 @@
-# Planner route=respond 测试：Planner 直接输出文本给用户（澄清/确认/最终回答由 LLM 自定）
-# 覆盖：respond 分支生成 respond_text 并结束、空 respond_text 回退通用引导、消息入历史
+# Planner route=respond 测试（自由文本模式）：Planner 直接输出文本给用户（澄清/确认/最终回答由 LLM 自定）
+# 覆盖：ReAct 轮自由文本即最终回答、query 改写 effective_query、空文本通用兜底、消息入历史
 import unittest
 from unittest import mock
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from agentTest.langgraph_app.prompts.planner_prompt import (
-    PlannerOutput,
-    SemanticKeywordsOutput,
+    REWRITE_SYSTEM_PROMPT,
 )
 
 
@@ -30,55 +29,57 @@ class _FakeTool:
 
 
 class _FakeReactLLM:
-    def __init__(self, tool_calls_list):
-        self._tool_calls_list = list(tool_calls_list)
+    """ReAct 桩：按预设序列返回 tool_call 或自由文本；序列耗尽返回空文本。"""
+
+    def __init__(self, react_calls):
+        self._calls = list(react_calls)
         self._step = 0
+        self.seen_messages = []
 
     def invoke(self, messages):
-        if self._step < len(self._tool_calls_list):
-            tc = self._tool_calls_list[self._step]
+        self.seen_messages.append(messages)
+        if self._step < len(self._calls):
+            item = self._calls[self._step]
             self._step += 1
-            return AIMessage(content="", tool_calls=[tc])
+            if isinstance(item, dict):  # tool_call
+                return AIMessage(content="", tool_calls=[item])
+            return AIMessage(content=item)  # 自由文本回答
         return AIMessage(content="")
 
 
-class _FakeStructuredLLM:
-    def __init__(self, keyword_list, planner_kwargs, react_tool_calls=None, seen_messages=None):
-        self._keyword_list = keyword_list
-        self._planner_kwargs = planner_kwargs
-        self._react_tool_calls = react_tool_calls or []
-        self._seen_messages = seen_messages
+class _FakeLLM:
+    """自由文本模式 Planner 的 LLM 桩：
+    invoke 首次（rewrite_llm）返回 effective_query 文本，后续 invoke（chat_openai 兜底）返回 fallback_text；
+    bind_tools 返回 _FakeReactLLM 驱动 ReAct 工具循环。
+    """
 
-    def invoke(self, prompt_value):
-        return self
+    def __init__(self, effective_query="", react_calls=None, fallback_text=""):
+        self._effective_query = effective_query
+        self._react = _FakeReactLLM(react_calls or [])
+        self._fallback_text = fallback_text
+        self._invoke_count = 0
+        self.rewrite_messages = None
+        self.thinking_calls = []
+
+    def invoke(self, messages):
+        self._invoke_count += 1
+        if self._invoke_count == 1:
+            # rewrite_llm：返回改写后的 effective_query 自由文本
+            self.rewrite_messages = messages
+            return AIMessage(content=self._effective_query)
+        # 撞 MAX_PLANNER_TOOL_STEPS 上限后的 thinking 定稿
+        self.thinking_calls.append(messages)
+        return AIMessage(content=self._fallback_text)
 
     def bind_tools(self, tools):
-        return _FakeReactLLM(self._react_tool_calls)
-
-    def with_structured_output(self, model, **kwargs):
-        if model is SemanticKeywordsOutput:
-            return _FakeStructuredCallable(
-                SemanticKeywordsOutput(semantic_keywords=self._keyword_list)
-            )
-        return _FakeStructuredCallable(PlannerOutput(**self._planner_kwargs), self._seen_messages)
-
-
-class _FakeStructuredCallable:
-    def __init__(self, value, seen_messages=None):
-        self._value = value
-        self._seen_messages = seen_messages
-
-    def invoke(self, prompt_value):
-        if self._seen_messages is not None:
-            self._seen_messages.append(prompt_value)
-        return self._value
+        return self._react
 
 
 def _build_runtime():
     from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
     from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec
     registry = ToolRegistry()
-    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "probe_values"):
+    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "probe_values", "grep_semantic"):
         registry.register(ToolSpec(name=name, description="stub", tool=_FakeTool(name), groups=("planner",)))
     return {
         "table_vector_store": _FakeVectorStore(),
@@ -95,46 +96,25 @@ def _state(user_input, messages=None, **overrides):
         "current_user_input": user_input,
         "messages": messages or [],
         "confirmed_plan": {},
-        "analysis_spec": {},
         "request_id": "req-answer",
     }
     state.update(overrides)
     return state
 
 
-def _planner_kwargs(**overrides):
-    base = {
-        "effective_query": "查询徐州大区今年同意返厂的返厂明细",
-        "route": "respond",
-        "respond_text": "已确认：2026 年徐州大区没有同意返厂的返厂记录。",
-        "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
-        "fields": [],
-        "completeness": "full",
-        "complex": False,
-        "metric_mentions": ["返厂明细"],
-        "dimension_mentions": ["徐州大区"],
-        "analysis_type": "detail",
-        "reason": "0 行反馈后 probe_values 确认无匹配数据，直接告知用户",
-        "semantic_keywords": ["返厂", "明细"],
-        "semantic_metrics": [],
-    }
-    base.update(overrides)
-    return base
-
-
 class PlannerRouteRespondTest(unittest.TestCase):
     """Planner route=respond：直接输出文本给用户（澄清/确认/最终回答）。"""
 
-    def _run_planner(self, planner_kwargs, messages=None, state_overrides=None, seen_messages=None):
+    def _run_planner(self, effective_query="", react_calls=None, messages=None, fallback_text=""):
         from agentTest.langgraph_app.nodes import planner_node
-        fake_llm = _FakeStructuredLLM(["返厂", "明细"], planner_kwargs, seen_messages=seen_messages)
+        fake_llm = _FakeLLM(effective_query=effective_query, react_calls=react_calls, fallback_text=fallback_text)
         with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
-            return node(_state("查询徐州大区今年同意返厂的返厂明细", messages, **(state_overrides or {})))
+            return node(_state("查询徐州大区今年同意返厂的返厂明细", messages)), fake_llm
 
     def test_respond_route_returns_text(self):
-        """route=respond + respond_text 非空：直接返回文本并结束本轮。"""
-        result = self._run_planner(_planner_kwargs())
+        """react 轮自由文本即最终回答：直接返回文本并结束本轮。"""
+        result, _ = self._run_planner(react_calls=["已确认：2026 年徐州大区没有同意返厂的返厂记录。"])
         self.assertEqual(result["route"], "respond")
         self.assertEqual(result["topic_status"], "clarifying")
         self.assertIn("没有同意返厂的返厂记录", result["final_answer"])
@@ -145,25 +125,71 @@ class PlannerRouteRespondTest(unittest.TestCase):
         self.assertEqual(msg.name, "planner")
         # 消费 0 行自愈标记，避免残留
         self.assertFalse(result.get("seeker_empty_result"))
-        # 非执行回看的 respond 不触发 Evaluator
-        self.assertFalse(result.get("evaluator_pending"))
 
-    def test_respond_route_empty_text_passes_through(self):
-        """route=respond 但 respond_text 为空：原样输出空文本，不再由程序替模型兜底措辞（对齐 Codex 自由输出）。"""
-        result = self._run_planner(_planner_kwargs(respond_text=""))
+    def test_effective_query_rewritten(self):
+        """query 改写：rewrite_llm 输出作为 effective_query 落盘/展示。"""
+        result, fake_llm = self._run_planner(
+            effective_query="查询徐州大区今年同意返厂的返厂明细（改写后）",
+            react_calls=["已确认无匹配数据。"],
+        )
+        self.assertIn("改写后", result["effective_query"])
+        # rewrite 调用收到 REWRITE_SYSTEM_PROMPT
+        self.assertIsNotNone(fake_llm.rewrite_messages)
+        self.assertIn(REWRITE_SYSTEM_PROMPT, fake_llm.rewrite_messages[0].content)
+
+    def test_rewrite_failure_falls_back_to_raw_input(self):
+        """query 改写异常：沿用本轮原始输入，不影响主流程。"""
+        from agentTest.langgraph_app.nodes import planner_node
+        fake_llm = _FakeLLM(effective_query="", react_calls=["直接回答。"])
+        real_invoke = fake_llm.invoke
+
+        def broken_invoke(messages):
+            raise RuntimeError("改写服务不可用")
+
+        fake_llm.invoke = broken_invoke
+        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
+            node = planner_node.build_planner_node(_build_runtime())
+            result = node(_state("查询徐州大区返厂明细"))
+        self.assertEqual(result["effective_query"], "查询徐州大区返厂明细")
+        self.assertIn("直接回答", result["final_answer"])
+
+    def test_empty_text_generic_fallback(self):
+        """react 与 thinking 定稿均空文本：通用占位，避免空回复。"""
+        result, fake_llm = self._run_planner(react_calls=[""], fallback_text="")
         self.assertEqual(result["route"], "respond")
-        self.assertEqual(result["final_answer"], "")
+        self.assertEqual(result["final_answer"], "查询遇到问题，请稍后重试。")
+        self.assertTrue(fake_llm.thinking_calls, "空文本应触发一次 thinking 定稿")
 
     def test_respond_message_in_history_context(self):
         """Planner respond 的消息应进入对话历史（供后续追问）。"""
         from agentTest.langgraph_app.nodes.planner_node import _build_history_context
-        from langchain_core.messages import HumanMessage
         messages = [
             HumanMessage(content="查询徐州大区返厂明细", id="u1"),
             AIMessage(content="已确认无数据。", name="planner", id="r1:respond"),
         ]
         ctx = _build_history_context(messages)
         self.assertIn("已确认无数据", ctx)
+
+    def test_first_turn_history_excludes_current_input(self):
+        """首轮无历史：排除本轮 user 消息（{request_id}:user）后，对话历史应为空。"""
+        from agentTest.langgraph_app.nodes.planner_node import _build_history_context
+        messages = [HumanMessage(content="查询昨天租赁中的订单数", id="req-first:user")]
+        ctx = _build_history_context(messages, exclude_user_id="req-first:user")
+        self.assertEqual(ctx.strip(), "", "首轮不应把本轮输入当作对话历史")
+
+    def test_multi_turn_history_excludes_current_only(self):
+        """多轮：排除本轮 user 后，只保留真正的历史（上一轮 user + 上一轮回答）。"""
+        from agentTest.langgraph_app.nodes.planner_node import _build_history_context
+        messages = [
+            HumanMessage(content="查询昨天新增订单数", id="u1:user"),
+            AIMessage(content="昨天新增订单 100 单。", name="planner", id="r1:respond"),
+            HumanMessage(content="那租赁中订单数呢", id="u2:user"),
+        ]
+        ctx = _build_history_context(messages, exclude_user_id="u2:user")
+        self.assertNotIn("那租赁中订单数呢", ctx, "本轮输入不应出现在历史中")
+        self.assertIn("查询昨天新增订单数", ctx)
+        self.assertIn("昨天新增订单 100 单", ctx)
+
 
 if __name__ == "__main__":
     unittest.main()

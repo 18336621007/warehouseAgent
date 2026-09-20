@@ -35,9 +35,6 @@ def query_error_fallback_node(state: AgentState):
                 id=f"{state.get('request_id', '')}:seeker",
             )
         ],
-        # 执行链兜底：不触发 Evaluator、不回 Planner 评审
-        "execution_review": False,
-        "evaluator_pending": False,
     }
     log_node_end("query_error_fallback", error=message[:120], ms=elapsed_ms(timer))
     log_state_snapshot("query_error_fallback", {**state, **update})

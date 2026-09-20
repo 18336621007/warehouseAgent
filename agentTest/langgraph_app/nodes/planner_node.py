@@ -1,10 +1,10 @@
-# Planner 调度节点（单 Agent / Codex 模式）：元数据检索 → LLM 解析 → ReAct 循环内查数写回答
+# Planner 调度节点（单 Agent / Codex 模式）：轻量 query 改写 + ReAct 工具循环内查数写回答
 #
 # Planner 是唯一 Agent：查数通过 execute_query 工具在循环内完成，route 收敛为 respond 单一终态（直接输出文本）。
 # 流程：
-#   ① 第0层拆检索词 + Planner ReAct 工具循环（search_semantic/search_tables/search_columns/probe_values/query_stored_result/execute_query）
-#   ② LLM 解析：输出 effective_query / route / respond_text / 槽位 / semantic_metrics（置信度）
-#   ③ 查数通过 execute_query 工具在循环内完成（结果回填后直接写回答）；route 一律 respond，直接输出澄清/回答文本结束本轮
+#   ① 轻量 query 改写（fast 独立小调用）：结合本轮输入与对话历史还原完整有效需求 effective_query
+#   ② Planner ReAct 工具循环（grep_semantic/read_metric/list_metric_files/search_tables/search_columns/probe_values/query_stored_result/execute_query）
+#   ③ 模型主动停止工具时，自由文本即最终回答；查数结果回填后直接写回答，route 一律 respond 结束本轮
 import json
 import re
 import time
@@ -24,13 +24,12 @@ from agentTest.config.settings import (
     get_model_name,
     get_model_extra_body,
     get_llm_fast_model,
-    get_llm_fast_extra_body,
     get_model_context_window,
     get_skill_index_max_chars,
 )
 from agentTest.langgraph_app.prompts.planner_prompt import (
-    PlannerOutput,
     PLANNER_SYSTEM_PROMPT,
+    REWRITE_SYSTEM_PROMPT,
 )
 from agentTest.langgraph_app.runtime.graph_logger import elapsed_ms
 from agentTest.langgraph_app.runtime.graph_logger import log_node_end
@@ -38,7 +37,6 @@ from agentTest.langgraph_app.runtime.graph_logger import log_example_retrieved
 from agentTest.langgraph_app.runtime.graph_logger import log_node_error
 from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
-from agentTest.langgraph_app.runtime.graph_logger import log_metric_event
 from agentTest.langgraph_app.runtime.graph_logger import log_tools_called
 from agentTest.langgraph_app.runtime.graph_logger import log_skill_event
 from agentTest.langgraph_app.runtime.graph_logger import log_state_snapshot
@@ -63,8 +61,6 @@ from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.config.planner import (
     MAX_PLANNER_TOOL_STEPS,
     MAX_LLM_RETRY,
-    MAX_EMPTY_RESULT_ROUNDS,
-    MAX_EXECUTION_ROUNDS,
     CONTEXT_BUDGET_OUTPUT_RESERVE_RATIO,
     TOOL_RESULT_MAX_BUDGET_RATIO,
     TOOL_RESULT_MIN_CHARS,
@@ -77,20 +73,18 @@ from agentTest.config.planner import (
 )
 from openai import APIError
 
-from agentTest.config.semantic import (
-    SEMANTIC_UNIQUE_GAP_THRESHOLD,
-    SEMANTIC_GREP_TOP_K,
-    SEMANTIC_CONFIDENCE_UNIQUE,
-    SEMANTIC_CONFIDENCE_CANDIDATE,
-)
 
-
-def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
-    """把最近几轮用户消息与最终回答组装成对话历史，过滤工具消息与 ReAct 中间步骤。"""
+def _build_history_context(messages, max_turns=10, max_chars_per_msg=500, exclude_user_id=""):
+    """把最近几轮用户消息与最终回答组装成对话历史，过滤工具消息与 ReAct 中间步骤。
+    exclude_user_id：本轮输入的 user 消息 id（{request_id}:user），用于排除本轮、只保留真正历史。"""
     from langchain_core.messages import ToolMessage, AIMessage
     lines = []
     for msg in (messages or [])[-max_turns * 2:]:
         name = getattr(msg, "name", "") or ""
+        msg_id = str(getattr(msg, "id", "") or "")
+        if exclude_user_id and msg_id == exclude_user_id:
+            # 本轮输入不计入历史（首轮无历史，避免"对话历史=本轮输入"重复）
+            continue
         if isinstance(msg, HumanMessage):
             role = "用户"
         elif isinstance(msg, ToolMessage):
@@ -101,7 +95,6 @@ def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
             # 过滤 ReAct 中间步骤（含 tool_calls 或纯文本思考）
             if getattr(msg, "tool_calls", None):
                 continue
-            msg_id = str(getattr(msg, "id", "") or "")
             if not (msg_id.endswith(":respond") or msg_id.endswith(":seeker") or msg_id.endswith(":advisor")):
                 continue
             role = f"助手({name})" if name else "助手"
@@ -119,59 +112,6 @@ def _build_history_context(messages, max_turns=10, max_chars_per_msg=500):
                 content = content[:max_chars_per_msg] + "……（该条历史回答较长已截断）"
         lines.append(f"{role}: {content}")
     return "\n".join(lines)
-
-
-def _build_recent_candidates_text(recent_shown_candidates, resolutions=None):
-    """把最近展示候选组装成精简事实文本，供 Planner 判断用户选择。
-
-    候选不带程序编号：编号由模型在澄清文案中定义，模型需结合对话历史中的
-    展示文案还原“编号→字段”映射；已确认概念回退展示候选快照，供改选指代参照。
-    """
-    lines = []
-    for group in recent_shown_candidates or []:
-        mention = group.get("mention", "")
-        candidates = group.get("candidates") or []
-        if not mention or not candidates:
-            continue
-        lines.append(f"[{mention} 最近展示候选]")
-        for candidate in candidates:
-            field = candidate.get("field", "")
-            table = str(candidate.get("table") or "").split(".")[-1]
-            comment = str(candidate.get("comment") or "").strip()
-            lines.append(f"- {field}（含义：{comment}，表：{table}）")
-    if not lines:
-        for resolution in (resolutions or []):
-            if resolution.get("status") != "resolved":
-                continue
-            candidates = resolution.get("candidates") or []
-            if len(candidates) <= 1:
-                continue
-            lines.append(f"[{resolution.get('mention', '')} 历史展示候选（改选时参考）]")
-            for candidate in candidates:
-                field = candidate.get("field", "")
-                table = str(candidate.get("table") or "").split(".")[-1]
-                comment = str(candidate.get("comment") or "").strip()
-                lines.append(f"- {field}（含义：{comment}，表：{table}）")
-    return "\n".join(lines)
-
-def _resolve_semantic_matches(semantic_metrics, provider) -> list[dict]:
-    """用 Planner LLM 声明的指标 id 反查语义层完整口径（来源表/表达式/维度/备注）。
-
-    search_semantic 工具只负责把候选展示给 LLM，命中判定与置信度由 LLM 输出；
-    程序据此反查 provider 拿权威定义，供 build_plan_from_semantic 确定性构建与 Advisor 复用。
-    """
-    if not semantic_metrics or provider is None:
-        return []
-    matches = []
-    for m in semantic_metrics:
-        metric = provider.get_metric_by_id(str(m.id or ""))
-        if not metric:
-            continue
-        entry = dict(metric)
-        entry["confidence"] = float(m.confidence or 0)
-        entry["mention"] = str(m.mention or "")
-        matches.append(entry)
-    return matches
 
 
 def _build_minimal_plan(planner_output) -> dict | None:
@@ -239,31 +179,6 @@ def _format_result_index(result_index: list) -> str:
         lines.append(line)
     return "\n".join(lines)
 
-def _try_parse_planner_output(response):
-    """尝试把 ReAct 轮输出文本直接解析为 PlannerOutput；失败返回 None（成功则省一次定稿 LLM 调用）。"""
-    if response is None:
-        return None
-    text = getattr(response, "content", None)
-    text = str(text or "").strip()
-    if not text:
-        return None
-    # 兼容 ```json ... ``` 代码块包裹
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-    try:
-        data = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    try:
-        return PlannerOutput.model_validate(data)
-    except Exception:
-        return None
-
-
 def _emit_context_progress(response):
     """每轮工具调用后推送上下文使用进度（prompt tokens / 窗口），供前端展示进度条。"""
     bus = get_stream_bus()
@@ -298,6 +213,32 @@ def _emit_context_compacted(before_chars, after_chars):
         "after_chars": after_chars,
         "saved_chars": max(0, before_chars - after_chars),
     })
+
+
+# 工具名 → 前端步骤文案：思考面板展示真实执行步骤（对齐 Codex），不暴露工具内部实现细节
+_TOOL_LABELS = {
+    "grep_semantic": "正在检索语义层指标...",
+    "read_metric": "正在读取指标口径...",
+    "list_metric_files": "正在浏览语义层指标清单...",
+    "search_databases": "正在检索数据库...",
+    "search_tables": "正在检索数据表...",
+    "search_columns": "正在检索字段...",
+    "query_stored_result": "正在读取历史查询结果...",
+    "probe_values": "正在探查字段实际值...",
+    "execute_query": "正在执行查询...",
+    "read_skill": "正在读取技能说明...",
+}
+
+
+def _emit_tool_event(tool_name: str) -> None:
+    """工具实际执行前推送一步事件到前端，让思考面板展示真实工具步骤。"""
+    bus = get_stream_bus()
+    if bus is None:
+        return
+    label = _TOOL_LABELS.get(tool_name)
+    if not label:
+        return
+    bus.emit({"type": "thinking", "node": tool_name, "text": label})
 
 
 def _estimate_tokens(text) -> int:
@@ -437,12 +378,9 @@ def build_planner_node(runtime):
         model=get_model_name(),
         extra_body=get_model_extra_body(),
         callbacks=[build_llm_logging_handler("planner")],
-        # 最终回答流式：structured 定稿生成 JSON 时实时提取 respond_text 推前端
-        answer_field="respond_text",
+        # 自由文本：增量 content 直接推前端回答区（对齐 Codex）
+        stream_raw_content=True,
     )
-    # with_structured_output：结构化方式由配置 LLM_STRUCTURED_OUTPUT_METHOD 驱动
-    # （qwen thinking 模式用 json_mode/response_format，自定义 ChatModel 统一处理）
-    structured_llm = chat_openai.with_structured_output(PlannerOutput)
     # 方案2：工具循环/快速定稿模型（与主模型同开思考，避免非思考误判路由）；模型名可用 LLM_FAST_MODEL 覆盖
     chat_openai_fast = ThinkingStreamChatModel(
         api_key=get_openai_api_key(),
@@ -450,38 +388,38 @@ def build_planner_node(runtime):
         model=get_llm_fast_model(),
         extra_body=get_model_extra_body(),
         callbacks=[build_llm_logging_handler("planner_fast")],
-        # 最终回答流式：结构化定稿生成 JSON 时实时提取 respond_text 推前端
-        answer_field="respond_text",
+        # 自由文本：增量 content 直接推前端回答区（对齐 Codex）
+        stream_raw_content=True,
     )
-    structured_llm_fast = chat_openai_fast.with_structured_output(PlannerOutput)
+    # 轻量 query 改写：fast 独立小调用（不流式到前端），结合本轮输入与对话历史
+    # 还原完整有效需求 effective_query，供展示/落盘/execute_query 复用
+    rewrite_llm = ThinkingStreamChatModel(
+        api_key=get_openai_api_key(),
+        base_url=get_openai_base_url(),
+        model=get_llm_fast_model(),
+        extra_body=get_model_extra_body(),
+        callbacks=[build_llm_logging_handler("planner_rewrite")],
+    )
 
-    # M2：ReAct 工具循环 LLM，可自主调用 planner_tools 补充信息；最终仍由 structured_llm 输出 JSON
-    # 动作分层：工具调用轮用 fast 模型提速；fast 与主模型同开思考，保证路由判断质量
+    # M2：ReAct 工具循环 LLM，可自主调用 planner_tools 补充信息；信息足够后直接输出最终回答文本
+    # 动作分层：工具调用轮用 fast 模型提速；fast 与主模型同开思考，保证判断质量
     react_llm = chat_openai_fast.bind_tools(planner_tools)
 
     def planner_node(state):
         # 每次调用只要求传入本轮输入
         current_user_input = state["current_user_input"]
-        # 单 Agent 模式：无执行链回环（查数由 execute_query 工具在循环内完成）
-        from_execution_review = False
-        from_empty_result = False
         # 注入查数工具上下文（request/会话归属，工具内部日志与落盘用）
         _exec_ctx = set_execute_query_context(
             state.get("request_id", ""),
             state.get("conversation_id", ""),
             state.get("topic_id", ""),
         )
-        # 开启 search_semantic 请求内去重：多轮 ReAct 检索不重复注入同一指标候选
+        # 开启语义层指标读取去重：read_metric 同一文件重复读时提示直接引用，不重复注入完整口径
         _sem_token = begin_semantic_dedup()
 
-        # 去 Topic 化：不再使用 original_question 固定基线，
-        # 当前需求由 LLM 结合【完整对话历史】+【本轮输入】每轮判断（query 改写 effective_query）
-
-
         # ── 去 Topic 化：不再向 prompt 注入【当前查询方案】（confirmed_context）──
-        # Planner 完全依赖【完整对话历史】判断当前需求（历史含 Advisor/Seeker 最终回答的方案信息），
-        # 避免上一轮遗留方案干扰新需求理解；confirmed_plan 仅作为状态供确认/执行链使用（不注入 prompt）
-        confirmed_plan = state.get("confirmed_plan") or {}
+        # Planner 完全依赖【完整对话历史】判断当前需求（历史含最终回答的方案信息），
+        # 避免上一轮遗留方案干扰新需求理解；查询方案由 execute_query 工具按语义层构建
 
         # ── LLM 评估流程 ──
         timer = start_timer()
@@ -489,15 +427,34 @@ def build_planner_node(runtime):
 
         try:
 
-            # ── 第0层：组装对话历史（方案1后不再独立调用关键词提取，semantic_keywords 取最终输出）──
-            history_context = _build_history_context(state.get("messages") or [])
+            # ── 第0层：组装对话历史（排除本轮 user 消息，首轮应为空）──
+            _history_user_id = f"{state.get('request_id', '')}:user"
+            history_context = _build_history_context(
+                state.get("messages") or [],
+                exclude_user_id=_history_user_id,
+            )
 
-            # ── 第1层：语义层候选由 Planner ReAct 自主调用 search_semantic 获取 ──
-            # 不再程序强制 grep/注入 prompt；命中指标 id 由 LLM 在 semantic_metrics 中声明，
-            # 程序在步骤②后用 id 反查 provider 组装完整候选（见 _resolve_semantic_matches）
-            semantic_matches = []
-            # 候选表：语义层命中后由反查结果填充；RAG 元数据由 agent 自主调 search_tables/search_columns
-            table_candidates = []
+            # ── 轻量 query 改写（对齐 Codex）：结合本轮输入与对话历史还原完整有效需求 ──
+            # 独立 fast 小调用产出 effective_query 字符串（供展示/落盘/execute_query 复用），
+            # 改写失败不影响主流程，沿用本轮原始输入
+            effective_query = current_user_input
+            try:
+                _rewrite_sections = [f"【当前日期】\n{date.today().isoformat()}"]
+                if history_context:
+                    _rewrite_sections.append(f"【对话历史（最近 N 轮）】\n{history_context}")
+                _rewrite_sections.append(f"【本轮输入】\n{current_user_input}")
+                _rewrite_resp = _invoke_llm_with_retry(
+                    rewrite_llm,
+                    [
+                        SystemMessage(content=REWRITE_SYSTEM_PROMPT),
+                        HumanMessage(content="\n\n".join(_rewrite_sections)),
+                    ],
+                )
+                _rewrite_text = str(getattr(_rewrite_resp, "content", "") or "").strip()
+                if _rewrite_text:
+                    effective_query = _rewrite_text
+            except Exception as _err:
+                log_sub_info(f"query 改写失败，沿用原始输入: {type(_err).__name__}", node_name="planner")
 
             # ── 检索历史优质示例（仅对话首轮注入，避免历史相似问题干扰当前需求）──
             example_vs = runtime.get("example_vector_store")
@@ -521,12 +478,11 @@ def build_planner_node(runtime):
                     )
 
 
-            # ── 步骤②：LLM 结构化解析 ──
+            # ── 步骤②：组装用户消息并进入 ReAct 工具循环 ──
             # 组装用户消息 sections：有内容的才带标题，避免空标题占用 token
-            # （history_context 已在第0层关键词提取时计算；M2b 后元数据由工具自主检索，不再程序注入）
+            # （元数据由工具自主检索，不再程序注入）
             sections = [
                 f"【当前日期】\n{date.today().isoformat()}",
-                f"【当前需求基线】\n{current_user_input}",
             ]
             if history_context:
                 sections.append(f"【对话历史（最近 N 轮）】\n{history_context}")
@@ -536,6 +492,9 @@ def build_planner_node(runtime):
             result_index = list_result_index(state.get("conversation_id") or "", limit=8)
             if result_index:
                 sections.append("【最近查询结果索引】\n" + _format_result_index(result_index))
+            # 用户本轮输入（rewrite 改写后的完整需求 effective_query）放在最后，
+            # 作为离模型决策最近的一条消息，对齐 Codex「最新一条用户消息即当前任务」的结构
+            sections.append(f"【用户本轮输入】\n{effective_query}")
             user_content = "\n\n".join(sections)
 
             # ── M2：Planner ReAct 工具循环（自主决定是否补充检索/读落盘结果）──
@@ -565,18 +524,11 @@ def build_planner_node(runtime):
             planner_tool_map = {t.name: t for t in planner_tools}
             # query_stored_result 依赖会话上下文：循环期间注入，结束后复位
             _conv_token = set_result_conversation(str(state.get("conversation_id") or ""))
-            # 只读检索类工具的同参数去重集合：重复调用不再重复注入全量结果，防 prompt 膨胀
+            # 工具同参数去重集合：重复调用不再重复注入全量结果，防 prompt 膨胀
             _seen_tool_results = {}
             try:
-                # respond 但无实际内容视为"回答未完成"，给 LLM 补工具/补内容后再定稿（通用完整性约束）
-                planner_output = None
-                # 方案2：模型主动停止工具调用（信息已充分）时用快速模型定稿，省 thinking 时间；
-                # 快速模型定稿失败（execute/空回答）后回退 thinking，保证判断质量
-                _fast_failed = False
-                # 单程工具循环（对齐 Codex）：模型自主决定停止与回答，程序仅做步数保护，不做空文本强制重试
-                _tool_break = False
-                _use_fast = False
-                _direct_output = None
+                # 单程工具循环（对齐 Codex）：模型自主决定停止与回答，程序仅做步数保护
+                _final_text = ""
                 # 本轮真实 input_tokens：供工具结果收敛与压缩按剩余预算动态决策
                 _current_input_tokens = 0
                 for _step in range(MAX_PLANNER_TOOL_STEPS):
@@ -594,20 +546,8 @@ def build_planner_node(runtime):
                     react_messages.append(_response)
                     _tool_calls = getattr(_response, "tool_calls", None) or []
                     if not _tool_calls:
-                        _tool_break = True
-                        # 尝试直接解析该轮输出为 PlannerOutput（成功则省一次定稿 LLM 调用）
-                        _direct_output = _try_parse_planner_output(_response)
-                        if _direct_output is None:
-                            # 模型未调工具且输出了回答文本：直接采纳为 respond_text（对齐 Codex 自由输出），
-                            # 避免强制定稿二次生成空文本后落入通用兜底、丢失真实结果
-                            _text = str(getattr(_response, "content", "") or "").strip()
-                            if _text:
-                                _direct_output = PlannerOutput(
-                                    effective_query=current_user_input,
-                                    route="respond",
-                                    respond_text=_text,
-                                    reason="Planner 在工具循环内直接输出回答（未调用工具），直接采纳",
-                                )
+                        # 模型主动停止工具：该轮自由文本即最终回答（对齐 Codex），直接结束循环
+                        _final_text = str(getattr(_response, "content", "") or "").strip()
                         break
                     log_tools_called("planner", [str(tc.get("name", "?")) for tc in _tool_calls])
                     # 同一轮多个 tool_calls 并行执行（execute_query/probe_values 等耗时工具提速，仿 Codex），
@@ -630,6 +570,8 @@ def build_planner_node(runtime):
                             return f"工具调用失败: {_err}"
 
                     def _exec_tool_call(_tc, _idx, _tool):
+                        # 推送工具执行事件到前端（实际执行的工具才推，去重跳过的不推）
+                        _emit_tool_event(str(_tc.get("name") or ""))
                         # 用 copy_context 传播主线程的日志/会话 ContextVar，保证子线程日志归属正确
                         _ctx = copy_context()
                         return _ctx.run(_invoke_tool, _tc, _idx, _tool)
@@ -638,17 +580,15 @@ def build_planner_node(runtime):
                     _prepared = []
                     for _idx, _tc in enumerate(_tool_calls):
                         _tool = planner_tool_map.get(_tc.get("name"))
-                        _dedup_key = ""
-                        if _tc.get("name") in ("search_semantic", "search_tables", "search_columns", "search_databases"):
-                            _arg_key = json.dumps(_tc.get("args") or {}, ensure_ascii=False, sort_keys=True)
-                            _dedup_key = f"{_tc.get('name')}|{_arg_key}"
+                        # 所有工具按同参数去重：重复调用不再重复注入全量结果，防 prompt 膨胀
+                        _arg_key = json.dumps(_tc.get("args") or {}, ensure_ascii=False, sort_keys=True)
+                        _dedup_key = f"{_tc.get('name')}|{_arg_key}"
                         if _tool is None:
                             _prepared.append((_tc, _idx, f"未知工具: {_tc.get('name')}"))
-                        elif _dedup_key and _dedup_key in _seen_tool_results:
+                        elif _dedup_key in _seen_tool_results:
                             _prepared.append((_tc, _idx, f"工具 {_tc.get('name')} 同参数已在上文返回，请直接引用上文结果，无需重复检索。"))
                         else:
-                            if _dedup_key:
-                                _seen_tool_results[_dedup_key] = True
+                            _seen_tool_results[_dedup_key] = True
                             _prepared.append((_tc, _idx, None))
                     _todo = [(_tc, _idx) for _tc, _idx, _skip in _prepared if _skip is None]
                     # 按剩余上下文预算计算本轮工具结果配额（对齐 Codex 动态收敛，不写死字符数）
@@ -660,7 +600,7 @@ def build_planner_node(runtime):
                             int(_budget_tokens * TOOL_RESULT_MAX_BUDGET_RATIO * CHARS_PER_TOKEN_ESTIMATE),
                         ),
                     )
-                    # 预算传给 search_semantic：预算紧张时自动精简口径（完整口径由 execute_query 程序反查）
+                    # 预算传给语义层检索工具：预算紧张时自动精简口径（完整口径由 execute_query 程序反查）
                     _sem_budget_token = set_semantic_render_budget(_tool_result_quota)
                     try:
                         if len(_todo) > 1:
@@ -705,143 +645,26 @@ def build_planner_node(runtime):
                     react_messages = _maybe_compact_react_messages(
                         react_messages, used_tokens=_current_input_tokens, added_chars=_added_chars,
                     )
-                if _direct_output is not None:
-                    # react 轮已直接输出结构化 JSON：直接使用，跳过定稿 LLM 调用
-                    planner_output = _direct_output
-                else:
-                    # 定稿：模型主动停止工具时优先 fast；fast 定稿空文本时回退 thinking 一次（不重跑工具）
-                    _use_fast = _tool_break
-                    planner_output = _invoke_llm_with_retry(
-                        (structured_llm_fast if _use_fast else structured_llm),
-                        react_messages,
-                    )
-                    if _use_fast and not (planner_output.respond_text or "").strip():
-                        planner_output = _invoke_llm_with_retry(structured_llm, react_messages)
-                # 模型输出即终态：空文本仅做一次通用兜底，绝不重试（对齐 Codex）
-                # 模型输出即终态：不再由程序替模型兜底措辞（对齐 Codex 自由输出），respond_text 原样输出
+                # 循环结束兜底：撞 MAX_PLANNER_TOOL_STEPS 上限仍无最终回答时，
+                # 用主模型（thinking）基于现有上下文定稿一次补充最终回答（对齐 Codex）
+                if not _final_text.strip():
+                    _final_text = str(getattr(
+                        _invoke_llm_with_retry(chat_openai, react_messages),
+                        "content", "") or "").strip()
+                # 空文本仅做一次通用兜底，绝不重试（对齐 Codex）
+                if not _final_text.strip():
+                    _final_text = "查询遇到问题，请稍后重试。"
             finally:
                 reset_result_conversation(_conv_token)
                 end_semantic_dedup(_sem_token)
 
-            effective_query = (
-                    planner_output.effective_query.strip()
-                    or current_user_input
-            )
-            # 方案1：semantic_keywords 直接取最终结构化输出（不再独立调用，省一次 LLM 调用）
-            semantic_keywords = [
-                str(k).strip()
-                for k in (planner_output.semantic_keywords or [])
-                if str(k).strip()
-            ]
-            log_sub_info(f"semantic_keywords: {semantic_keywords}", node_name="planner")
-            # ── 信任 LLM 的 completeness 判定，不做覆盖 ──
-            tables = planner_output.tables
-            fields = planner_output.fields
-            completeness = planner_output.completeness
-
-            # ── 第3层：LLM 置信度 → 分档路由（对齐 skill 置信度规则）──
-            # >=0.9 唯一强命中短路；0.55~0.9 候选反问；<0.55 走 RAG
-            semantic_metrics = sorted(
-                (m for m in (planner_output.semantic_metrics or [])),
-                key=lambda m: float(m.confidence or 0),
-                reverse=True,
-            )
-            # 用 LLM 声明的指标 id 反查语义层完整口径（权威定义，供确定性构建与 Advisor 复用）
-            semantic_matches = _resolve_semantic_matches(
-                semantic_metrics,
-                runtime.get("semantic_metadata_provider"),
-            )
-            if semantic_matches:
-                # 语义层命中：候选表来自语义层推荐，供 Advisor/Seeker 参考
-                table_candidates = [
-                    {
-                        "table": _sm.get("source_model", ""),
-                        "score": 1.0,
-                        "comment": f"语义层推荐：{_sm.get('name', '')}",
-                    }
-                    for _sm in semantic_matches
-                    if _sm.get("source_model")
-                ]
-            if semantic_metrics:
-                _top_confidence = max(
-                    (float(m.confidence or 0) for m in semantic_metrics),
-                    default=0.0,
-                )
-                _semantic_unique = (
-                    len(semantic_metrics) == 1
-                    and _top_confidence >= SEMANTIC_CONFIDENCE_UNIQUE
-                ) or (
-                    len(semantic_metrics) >= 2
-                    and _top_confidence >= SEMANTIC_CONFIDENCE_UNIQUE
-                    and (
-                        float(semantic_metrics[0].confidence or 0)
-                        - float(semantic_metrics[1].confidence or 0)
-                    ) >= SEMANTIC_UNIQUE_GAP_THRESHOLD
-                )
-            else:
-                semantic_metrics = []
-                _top_confidence = 0.0
-                _semantic_unique = False
-
-            # 分档：unique=唯一强命中短路；candidate=候选反问；rag=走检索召回
-            if _semantic_unique:
-                _tier = "unique"
-            elif _top_confidence >= SEMANTIC_CONFIDENCE_CANDIDATE:
-                _tier = "candidate"
-            else:
-                _tier = "rag"
-
-            # 语义层命中日志：记录每个指标的分数/置信度与短路判定，
-            # 便于排查"走了语义层还是召回"
-            log_metric_event(
-                "semantic.match",
-                node_name="planner",
-                mention=current_user_input[:100],
-                hit_count=len(semantic_matches),
-                metric_ids=[m.get("id", "") for m in semantic_matches],
-                metric_names=[m.get("name", "") for m in semantic_matches],
-                metric_scores=[m.get("score", 0) for m in semantic_matches],
-                metric_confidences=[
-                    round(float(m.get("confidence", 0) or 0), 2)
-                    for m in semantic_matches
-                ],
-                top_confidence=round(_top_confidence, 2),
-                semantic_unique=_semantic_unique,
-                tier=_tier,
-            )
-
-            # 语义层候选：完整指标信息 + LLM 置信度，供 Advisor 复用（避免 Advisor 词法漏召）
-            semantic_candidates = [dict(m) for m in semantic_matches]
-            _conf_by_id = {
-                str(m.id): float(m.confidence or 0)
-                for m in (planner_output.semantic_metrics or [])
-            }
-            for _sc in semantic_candidates:
-                _sc["confidence"] = _conf_by_id.get(
-                    _sc.get("id", ""), _sc.get("confidence", 0.0)
-                )
-                # score 统一为 grep 得分，供 Advisor/日志展示使用
-                _sc.setdefault("score", _sc.get("grep_score", 0))
-
-            # M2b：移除 effective_query 二次 FAISS 探测，高相似度统计随之置 0
-            # 兜底：LLM 未填 completeness 或填了无效值
-            if completeness not in ("full", "partial", "none"):
-                if not tables:
-                    completeness = "none"
-                elif not fields:
-                    completeness = "partial"
-                else:
-                    completeness = "full"
-
-
-            # M2b：FAISS 检索移除后不再有分数与高相似度统计，置 0 保持日志结构稳定
-            high_similarity_table_count = 0
-            high_similarity_column_count = 0
+            # 语义层命中审计由 execute_query 工具的 semantic.match 承担（工具内部按实际命中记录），
+            # Planner 不再做分档路由/置信度判定，语义层定位交给工具在查数时确定
 
             # ── Planner 是唯一决策者：route 收敛为 respond 单一终态 ──
             # respond=给用户输出文本（澄清/确认/最终回答由 LLM 自定）；查数已在工具循环内通过 execute_query 完成
-            route_llm = planner_output.route or "respond"
-            respond_text = (planner_output.respond_text or "").strip()
+            route_llm = "respond"
+            respond_text = _final_text
 
             def _respond_return(route_value, text, reason, extra=None):
                 """respond 分支统一出口：写文本给用户并结束本轮（等用户回复）。"""
@@ -862,22 +685,8 @@ def build_planner_node(runtime):
                     ],
                     # 消费回环标记，避免残留影响后续轮次路由
                     "seeker_empty_result": False,
-                    "execution_review": False,
                     "seeker_plan_error": None,
                     "seeker_error_unresolvable": None,
-                    # 仅执行回看触发的 respond（基于结果写回答）才触发 Evaluator
-                    "evaluator_pending": bool(from_execution_review),
-                    # 语义层命中/候选快照（供日志/trace 参考，respond 不消费）
-                    "planner_entities": {
-                        "effective_query": effective_query,
-                        "tables": tables,
-                        "fields": fields,
-                        "completeness": completeness,
-                        "semantic_metrics": [dict(m) for m in semantic_candidates],
-                        "semantic_candidates": semantic_candidates,
-                        "table_candidates": table_candidates,
-                        "route": route_value,
-                    },
                 }
                 if extra:
                     _ret.update(extra)
@@ -885,25 +694,15 @@ def build_planner_node(runtime):
                     "planner",
                     route=route_value,
                     route_source="planner_llm",
-                    completeness=completeness,
-                    tables=str(tables),
-                    fields=str(fields),
-                    high_sim_tables=high_similarity_table_count,
-                    high_sim_columns=high_similarity_column_count,
                     reason=reason,
                     ms=elapsed_ms(timer),
                 )
                 log_state_snapshot("planner", {**state, **_ret})
                 return _ret
 
-            if route_llm == "respond":
-                # respond 分支：直接输出文本给用户（澄清/确认/直接回答由 LLM 自定，空文本原样输出不再替模型兜底）
-
-                planner_reason = "Planner 判定 respond（澄清/回答）：" + planner_output.reason
-                return _respond_return("respond", respond_text, planner_reason)
-
-            # route 已由 schema 约束恒为 respond（Literal["respond"]），此处仅防御意外值
-            return _respond_return("respond", planner_output.reason or "查询遇到问题，请稍后重试。", planner_output.reason or "")
+            # respond 分支：直接输出文本给用户（澄清/确认/直接回答由 LLM 自定，空文本原样输出不再替模型兜底）
+            planner_reason = "Planner 自由文本输出（澄清/回答）：" + (respond_text or "")[:120]
+            return _respond_return("respond", respond_text, planner_reason)
 
 
         except Exception as error:

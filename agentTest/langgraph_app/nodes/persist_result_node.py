@@ -1,7 +1,6 @@
-# 执行链收尾节点：结果强制落盘 + 回 Planner 评审
-# A1：build_final_answer 删除后，执行成功的查询统一在此落盘。
-#   - 有数据 → execution_review=True，回 Planner 基于结果撰写最终回答（respond）；
-#   - 0 行   → seeker_empty_result=True，回 Planner 用 probe_values 自愈或确认无数据后告知。
+# 执行链收尾节点：结果强制落盘（供 execute_query 工具回填给 Agent 撰写回答）
+#   - 有数据 → 结果快照回填，Agent 基于预览/全量 CSV 直接写回答；
+#   - 0 行   → seeker_empty_result=True，回 Agent 用 probe_values 自愈或确认无数据后告知。
 # 落盘是旁路能力：save_query_result 内部已吞掉写盘失败，不影响主流程。
 import datetime
 
@@ -87,18 +86,15 @@ def persist_result_node(state: AgentState):
             "result_id": snapshot["result_id"],
             "result_preview": snapshot["preview_rows"],
             "result_csv": snapshot.get("full_csv", ""),
-            "plan_results": [snapshot],
         }
 
         if row_count == 0:
-            # 0 行：回 Planner 核实（过滤值不匹配或确实无数据），未达上限自愈，达上限如实告知
+            # 0 行：回 Agent 核实（过滤值不匹配或确实无数据），未达上限自愈，达上限如实告知
             empty_rounds = state.get("empty_result_rounds") or 0
             if empty_rounds < MAX_EMPTY_RESULT_ROUNDS:
                 update = {
                     "seeker_empty_result": True,
                     "empty_result_rounds": empty_rounds + 1,
-                    "execution_review": False,
-                    "evaluator_pending": False,
                     "topic_status": "generating_sql",
                     "self_heal_note": "执行返回 0 行，需核实是过滤条件与实际存储值不一致，还是确实无匹配数据，返回核实后决定重查或直接告知。",
                     **result_update,
@@ -107,24 +103,20 @@ def persist_result_node(state: AgentState):
                 log_state_snapshot("persist_result", {**state, **update})
                 return update
 
-            # 已达 0 行重试上限：仍回 Planner，由 Planner 依据上限提示直接告知用户无数据
+            # 已达 0 行重试上限：仍回 Agent，由 Agent 依据上限提示直接告知用户无数据
             update = {
                 "seeker_empty_result": True,
                 "empty_result_rounds": empty_rounds + 1,
-                "execution_review": False,
-                "evaluator_pending": False,
                 "topic_status": "generating_sql",
-                "self_heal_note": "0 行已达重试上限，回 Planner 确认无数据后直接告知用户。",
+                "self_heal_note": "0 行已达重试上限，回 Agent 确认无数据后直接告知用户。",
                 **result_update,
             }
             log_node_end("persist_result", branch="empty_result_limit", rows=0, rounds=empty_rounds, ms=elapsed_ms(timer))
             log_state_snapshot("persist_result", {**state, **update})
             return update
 
-        # 有数据：回 Planner 评审撰写最终回答，并触发 Evaluator 评估本轮问答质量
+        # 有数据：结果快照回填，供 Agent 基于预览/全量 CSV 撰写最终回答
         update = {
-            "execution_review": True,
-            "evaluator_pending": True,
             "seeker_empty_result": False,
             "topic_status": "executing",
             **result_update,

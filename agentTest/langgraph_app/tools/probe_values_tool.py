@@ -80,8 +80,9 @@ def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_V
             if candidates:
                 probe_datasource = engine_registry.get_datasource(candidates[0]) or datasource
         # 表名/库名来自元数据（简单标识符）裸写，让 validate_hive_sql 的表白名单检查生效；
-        # 字段名加反引号防保留字干扰。
-        quoted_col = f"`{real_column}`"
+        # 字段名加引用符防保留字干扰：Trino 用双引号，Hive/Doris 用反引号（兼容 MySQL 语法）
+        _engine = str(getattr(probe_datasource, "engine", "") or "").lower()
+        quoted_col = f'"{real_column}"' if _engine == "trino" else f"`{real_column}`"
         quoted_from = f"{database_name}.{table_name}"
 
         # 关键词为空：返回该字段任意取值；非空：LIKE 转义后模糊匹配

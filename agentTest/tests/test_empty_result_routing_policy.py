@@ -1,18 +1,11 @@
 # -*- coding: utf-8 -*-
-# 0 行自愈路由策略测试：事实问题必须由 Planner 探查（probe_values）解决，禁止 respond 向用户询问过滤值
-# 覆盖：prompt 0 行规则强化文本、0 行反馈 section 注入、0 行自愈走 probe_values→seeker 重跑链路
+# 0 行自愈路由策略测试（自由文本模式）：查数返回 0 行由 Planner 自主判断——probe_values 探查 / 修正 filters 重查 / 确认无数据直接告知
+# 覆盖：prompt 0 行规则、probe_values→execute_query 重跑链路、直接告知无数据
 import unittest
 from unittest import mock
 
 from langchain_core.messages import AIMessage
-# 空 respond_text 的兜底引导语（与 planner_node 保持一致）
-
-from agentTest.langgraph_app.prompts.planner_prompt import (
-    PLANNER_SYSTEM_PROMPT,
-    PlannerOutput,
-    SemanticKeywordsOutput,
-    SemanticMetricHit,
-)
+from agentTest.langgraph_app.prompts.planner_prompt import PLANNER_SYSTEM_PROMPT
 
 
 class _FakeVectorStore:
@@ -35,55 +28,49 @@ class _FakeTool:
 
 
 class _FakeReactLLM:
-    def __init__(self, tool_calls_list):
-        self._tool_calls_list = list(tool_calls_list)
+    """ReAct 桩：按预设序列返回 tool_call 或自由文本；序列耗尽返回空文本。"""
+
+    def __init__(self, react_calls):
+        self._calls = list(react_calls)
         self._step = 0
+        self.seen_messages = []
 
     def invoke(self, messages):
-        if self._step < len(self._tool_calls_list):
-            tc = self._tool_calls_list[self._step]
+        self.seen_messages.append(messages)
+        if self._step < len(self._calls):
+            item = self._calls[self._step]
             self._step += 1
-            return AIMessage(content="", tool_calls=[tc])
+            if isinstance(item, dict):  # tool_call
+                return AIMessage(content="", tool_calls=[item])
+            return AIMessage(content=item)  # 自由文本回答
         return AIMessage(content="")
 
 
-class _FakeStructuredLLM:
-    def __init__(self, keyword_list, planner_kwargs, react_tool_calls=None, seen_messages=None):
-        self._keyword_list = keyword_list
-        self._planner_kwargs = planner_kwargs
-        self._react_tool_calls = react_tool_calls or []
-        self._seen_messages = seen_messages
+class _FakeLLM:
+    """自由文本模式 Planner 的 LLM 桩：invoke 首次（rewrite）返回 effective_query，
+    后续 invoke（chat_openai 兜底）返回 fallback_text；bind_tools 返回 _FakeReactLLM。"""
 
-    def invoke(self, prompt_value):
-        return self
+    def __init__(self, effective_query="", react_calls=None, fallback_text=""):
+        self._effective_query = effective_query
+        self._react = _FakeReactLLM(react_calls or [])
+        self._fallback_text = fallback_text
+        self._invoke_count = 0
+
+    def invoke(self, messages):
+        self._invoke_count += 1
+        if self._invoke_count == 1:
+            return AIMessage(content=self._effective_query)
+        return AIMessage(content=self._fallback_text)
 
     def bind_tools(self, tools):
-        return _FakeReactLLM(self._react_tool_calls)
-
-    def with_structured_output(self, model, **kwargs):
-        if model is SemanticKeywordsOutput:
-            return _FakeStructuredCallable(
-                SemanticKeywordsOutput(semantic_keywords=self._keyword_list)
-            )
-        return _FakeStructuredCallable(PlannerOutput(**self._planner_kwargs), self._seen_messages)
-
-
-class _FakeStructuredCallable:
-    def __init__(self, value, seen_messages=None):
-        self._value = value
-        self._seen_messages = seen_messages
-
-    def invoke(self, prompt_value):
-        if self._seen_messages is not None:
-            self._seen_messages.append(prompt_value)
-        return self._value
+        return self._react
 
 
 def _build_runtime():
     from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
     from agentTest.langgraph_app.tools.registry import ToolRegistry, ToolSpec
     registry = ToolRegistry()
-    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "probe_values", "search_semantic"):
+    for name in ("search_databases", "search_tables", "search_columns", "query_stored_result", "probe_values", "grep_semantic", "execute_query"):
         registry.register(ToolSpec(name=name, description="stub", tool=_FakeTool(name), groups=("planner",)))
     return {
         "table_vector_store": _FakeVectorStore(),
@@ -100,119 +87,52 @@ def _state(user_input, messages=None, **overrides):
         "current_user_input": user_input,
         "messages": messages or [],
         "confirmed_plan": {},
-        "analysis_spec": {},
         "request_id": "req-empty-routing",
     }
     base.update(overrides)
     return base
 
 
-def _planner_kwargs(**overrides):
-    base = {
-        "effective_query": "查询徐州大区今年同意返厂的返厂明细",
-        "route": "respond",
-        "respond_text": "",
-        "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
-        "fields": [],
-        "completeness": "full",
-        "complex": False,
-        "metric_mentions": ["返厂明细"],
-        "dimension_mentions": ["徐州大区"],
-        "analysis_type": "detail",
-        "reason": "0 行反馈后 probe_values 确认实际值，修正 filters 重跑",
-        "filters": "region_name='徐州大区' AND status='同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
-        "semantic_keywords": ["返厂", "明细"],
-        "semantic_metrics": [],
-    }
-    base.update(overrides)
-    return base
-
-
 class EmptyResultRoutingPolicyTest(unittest.TestCase):
-    """0 行自愈路由策略：事实问题由 Planner 探查，禁止 respond 向用户询问过滤值。"""
+    """0 行自愈路由策略：事实问题由 Planner 自主探查/重查/告知，不再由程序强转。"""
 
-    def test_prompt_requires_probe_values_on_zero_rows(self):
-        # 0 行规则强化：可用工具探查、禁止 route=respond 向用户询问、口径歧义才允许澄清
-        self.assertIn("可用 probe_values 探查实际取值", PLANNER_SYSTEM_PROMPT)
-        self.assertIn("调用 execute_query 工具重跑", PLANNER_SYSTEM_PROMPT)
-        self.assertIn("禁止 route=respond 向用户询问", PLANNER_SYSTEM_PROMPT)
-        self.assertIn("口径歧义", PLANNER_SYSTEM_PROMPT)
-
-    def test_zero_row_section_not_injected_in_single_agent(self):
-        # 单 Agent：0 行反馈由 execute_query 工具结果驱动，Planner 不再注入 0 行反馈 section
-        seen = []
+    def _run(self, react_calls, user_input="查询徐州大区今年同意返厂的返厂明细", fallback_text="", **state_overrides):
         from agentTest.langgraph_app.nodes import planner_node
-        fake_llm = _FakeStructuredLLM(["返厂", "明细"], _planner_kwargs(), seen_messages=seen)
+        fake_llm = _FakeLLM(effective_query="查询徐州大区今年同意返厂的返厂明细", react_calls=react_calls, fallback_text=fallback_text)
         with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
             node = planner_node.build_planner_node(_build_runtime())
-            node(_state(
-                "查询徐州大区今年同意返厂的返厂明细",
-                seeker_empty_result=True,
-                generated_sql="SELECT * FROM ads_trip.ads_gundam_device_return_detail_hour WHERE region_name='徐州'",
-            ))
-        user_content = "".join(str(m) for m in seen)
-        self.assertNotIn("SQL 执行成功但无数据", user_content)
-        self.assertNotIn("不要 route=respond 向用户询问", user_content)
+            return node(_state(user_input, **state_overrides)), fake_llm
 
-    def test_zero_row_section_not_injected_without_flag(self):
-        # 无 0 行标记时不注入 0 行反馈 section
-        seen = []
-        from agentTest.langgraph_app.nodes import planner_node
-        fake_llm = _FakeStructuredLLM(["返厂", "明细"], _planner_kwargs(), seen_messages=seen)
-        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
-            node = planner_node.build_planner_node(_build_runtime())
-            node(_state("查询徐州大区今年同意返厂的返厂明细"))
-        user_content = "".join(str(m) for m in seen)
-        self.assertNotIn("SQL 执行成功但无数据", user_content)
+    def test_prompt_guides_zero_row_self_heal(self):
+        # prompt 引导：0 行时用 probe_values 核实实际取值，或确认确属无数据后直接告知
+        self.assertIn("probe_values", PLANNER_SYSTEM_PROMPT)
+        self.assertIn("0 行", PLANNER_SYSTEM_PROMPT)
 
-    def test_zero_row_self_heal_probe_then_execute_query(self):
-        # 0 行自愈链路：react 先调 probe_values 探查，structured 仍 respond 空文本
-        # 循环提示补齐，重试耗尽后兜底 respond（不直接构建方案执行）
-        react_tool_calls = [
-            {
-                "name": "search_semantic",
-                "args": {"question": "返厂明细"},
-                "id": "call_semantic_1",
-                "type": "tool_call",
-            },
+    def test_zero_row_probe_then_execute(self):
+        """0 行自愈：react 先调 probe_values 探查，再调 execute_query 重查，最后自由文本回答。"""
+        react_calls = [
             {
                 "name": "probe_values",
-                "args": {
-                    "table": "ads_trip.ads_gundam_device_return_detail_hour",
-                    "column": "region_name",
-                    "keyword": "徐州",
-                    "limit": 10,
-                },
+                "args": {"table": "ads_trip.ads_gundam_device_return_detail_hour", "column": "region_name", "keyword": "徐州", "limit": 10},
                 "id": "call_probe_1",
-                "type": "tool_call",
-            }
+            },
+            {
+                "name": "execute_query",
+                "args": {"question": "查询徐州大区今年同意返厂的返厂明细", "filters": "region_name='徐州大区' AND status='同意返厂' AND create_time >= '2026-01-01' AND create_time <= '2026-12-31'"},
+                "id": "call_exec_1",
+            },
+            "探查确认实际存储为「徐州大区」后已按修正过滤条件重查。",
         ]
-        seen = []
-        from agentTest.langgraph_app.nodes import planner_node
-        fake_llm = _FakeStructuredLLM(
-            ["返厂", "明细"],
-            _planner_kwargs(semantic_metrics=[
-                SemanticMetricHit(
-                    id="device_return_detail",
-                    confidence=0.95,
-                    mention="返厂明细",
-                )
-            ]),
-            react_tool_calls=react_tool_calls,
-            seen_messages=seen,
-        )
-        with mock.patch.object(planner_node, "ThinkingStreamChatModel", return_value=fake_llm):
-            node = planner_node.build_planner_node(_build_runtime())
-            result = node(_state(
-                "查询徐州大区今年同意返厂的返厂明细",
-                seeker_empty_result=True,
-                generated_sql="SELECT * FROM ads_trip.ads_gundam_device_return_detail_hour WHERE region_name='徐州'",
-            ))
-        # 探查后仍需通过工具查数，Planner 不直接构建方案执行；
-        # respond 空文本直接兜底通用引导，不再循环重试
+        result, fake_llm = self._run(react_calls)
         self.assertEqual(result.get("route"), "respond")
         self.assertEqual(result.get("topic_status"), "clarifying")
-        self.assertEqual(result.get("final_answer"), "")
+        self.assertIn("已按修正过滤条件重查", result.get("final_answer", ""))
+
+    def test_zero_row_direct_answer(self):
+        """确认确属无数据：Planner 直接告知用户，不再反复重试。"""
+        result, _ = self._run(["核实后确认 2026 年徐州大区没有同意返厂的返厂记录。"])
+        self.assertEqual(result.get("route"), "respond")
+        self.assertIn("没有同意返厂的返厂记录", result.get("final_answer", ""))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@ from typing import Annotated, Literal, TypedDict
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from agentTest.langgraph_app.state.query_plan import QueryPlan
-from agentTest.langgraph_app.state.analysis_spec import AnalysisSpec
 
 # Topic 状态用于描述一次问数任务的生命周期
 TopicStatus = Literal[
@@ -55,16 +54,10 @@ class TopicState(IdentityState, total=False):
     current_user_input: str
 
     topic_status: TopicStatus
-    topic_summary: str
     topic_started_at: float
-
-    advisor_turns: int
 
     # 当前查询方案，后续会统一重命名为 query_plan
     confirmed_plan: QueryPlan
-
-    # 结构化业务分析意图，跨轮保留指标候选与解析证据，供指标歧义门禁使用
-    analysis_spec: AnalysisSpec
 
     # 上一轮查询结果快照（引用+预览+实体键），结果追问用
     last_query_result: QueryResultSnapshot
@@ -83,26 +76,8 @@ class BaseState(TopicState, total=False):
     # 已消费的执行失败修复轮次，用于限制回 Planner 次数
     plan_repair_rounds: int
 
-    # 已弃用（A1 Advisor 并入 Planner，字段保留兼容）：本轮是否推进了草稿
-    advisor_draft_updated: bool
-    # 已弃用（A1 后无 Advisor 回环）：连续自动回 Planner 的轮次
-    advisor_auto_rounds: int
     # Seeker 执行成功但 0 行时的自愈标记与轮次（回 Planner 用 probe_values 确认实际取值）
     seeker_empty_result: bool
     empty_result_rounds: int
     # 0 行自愈旁白：自然语言说明"发现空结果 → 返回修正"，供前端思考过程展示
     self_heal_note: str
-    # 已弃用（A1 后无 Advisor 收尾）：wait_user=等用户，return_to_planner=回 Planner
-    advisor_next_step: str
-
-    # ── M3/A1 新增：执行链回看 Planner 的状态字段 ──
-    # Planner 输出方案列表（单方案=长度1；多方案为 A2 并行查询入口）
-    plans: list[dict]
-    # 执行链回填结果（元素 {plan_index, sql, result_id, preview, row_count, error, status}）
-    plan_results: list[dict]
-    # 单次用户输入内 Planner 发起 execute 的轮次（capture 每轮重置，防死循环）
-    execution_rounds: int
-    # 执行完成且结果非空 → 回 Planner 评审撰写最终回答
-    execution_review: bool
-    # 执行链落盘后置位：Planner respond 后触发 Evaluator（澄清/直接回答不触发）
-    evaluator_pending: bool

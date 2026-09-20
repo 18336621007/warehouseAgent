@@ -22,8 +22,6 @@ class GraphOutput(TypedDict, total=False):
     final_answer: str
     generated_sql: str
     result_preview: list[Any]
-    evaluator_score: float
-    evaluator_dialogue_id: int
 
 class AgentState(PlannerState, SeekerState, total=False):
     pass

@@ -5,7 +5,6 @@ from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_gra
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 from agentTest.langgraph_app.runtime.graph_logger import log_round_separator
 from agentTest.langgraph_app.runtime.graph_logger import log_user_input
-from agentTest.config.advisor import MAX_DEMO_ADVISOR_TURNS
 
 
 def run_demo():
@@ -55,24 +54,6 @@ def run_demo():
         # A1：respond（含执行回看后的最终回答）统一为 clarifying，对话在同一上下文继续
         if topic_status == "clarifying":
             print(f"\nAI: {result.get('final_answer', '')}")
-
-            # Advisor轮次由Graph State自动累积
-            advisor_turns = result.get("advisor_turns", 0)
-
-            if advisor_turns >= MAX_DEMO_ADVISOR_TURNS:
-                print("\nAI: 抱歉，经过多轮沟通我仍无法确定您的需求，请尝试重新描述。")
-                current_question = input("\n你: ").strip()
-                if not current_question or current_question.lower() in ("exit", "quit"):
-                    print("结束对话。")
-                    break
-                # 超过追问上限后，新问题使用独立Topic和Checkpoint
-                topic_id = uuid.uuid4().hex
-                config = {
-                    "configurable": {
-                        "thread_id": f"{conversation_id}:{topic_id}"
-                    }
-                }
-                continue
 
             current_question = input("\n你: ").strip()
             if not current_question or current_question.lower() in ("exit", "quit"):

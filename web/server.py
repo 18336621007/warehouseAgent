@@ -45,10 +45,23 @@ NODE_LABELS = {
     "generate_sql": "正在生成 SQL...",
     "validate_sql": "正在校验 SQL...",
     "prepare_sql_fix": "SQL 需修正，正在重新生成...",
-    "execute_sql": "正在 Hive 中执行查询...",
+    "execute_sql": "正在执行查询...",
     "persist_result": "正在落盘查询结果...",
     "query_error_fallback": "查询未能完成，正在整理错误信息...",
     "evaluator": "正在评估对话质量...",
+}
+
+# execute_query 工具内部 Seeker 执行链节点：折叠为工具的单一事件，不作为主流程步骤展示
+_SEEKER_INTERNAL_NODES = {
+    "retrieve_schema",
+    "generate_sql",
+    "validate_sql",
+    "prepare_sql_fix",
+    "execute_sql",
+    "prepare_sql_exec_fix",
+    "persist_result",
+    "query_error_end",
+    "end_plan_error",
 }
 
 # 前端只展示安全错误信息，内部异常通过error_id在日志中定位
@@ -265,6 +278,11 @@ def chat():
 
                     if not node_name:
                         continue
+                    # 折叠 execute_query 工具内部的 Seeker 执行链节点：不作为主流程步骤展示，
+                    # 也不观察其内部 topic_status（避免子图内部状态污染前端阶段显示）
+                    if node_name in _SEEKER_INTERNAL_NODES:
+                        seen.add(node_name)
+                        continue
                     seen.add(node_name)
                     # 回环轮次计数：首轮用节点名，0 行自愈等二次出现用 node#2 区分
                     seq = node_seq.get(node_name, 0) + 1
@@ -300,14 +318,8 @@ def chat():
             topic_status = result.get("topic_status", "")
             final_answer = result.get("final_answer", "")
             generated_sql = result.get("generated_sql", "")
-            ev_score = result.get("evaluator_score", 0)
-            ev_self = result.get("evaluator_self_score", 0)
-            dialogue_id = result.get("evaluator_dialogue_id", 0)
-            # 评分只属于本轮真正执行过 Evaluator 的查询；Evaluator 输出持久化在
-            # AgentState 中会跨轮残留，必须按本轮执行节点判断，避免澄清/追问轮重复展示评分
-            has_evaluator = "evaluator" in seen
-            # generated_sql 同样持久化在 AgentState 中会跨轮残留，只有本轮真正
-            # 执行过 Seeker 查询链路时才透传，避免漄清/追问轮展示上一轮的旧 SQL
+            # generated_sql 持久化在 AgentState 中会跨轮残留，只有本轮真正
+            # 执行过 Seeker 查询链路时才透传，避免澄清/追问轮展示上一轮的旧 SQL
             sql_query_nodes = {
                 "retrieve_schema",
                 "generate_sql",
@@ -319,11 +331,9 @@ def chat():
             }
             has_sql_query = bool(seen & sql_query_nodes)
             display_sql = generated_sql if has_sql_query else ""
-            evaluator_payload = (
-                {"score": ev_score, "self_score": ev_self}
-                if (has_evaluator and ev_score)
-                else None
-            )
+            # Evaluator 已并入 Planner（单 Agent），评分功能移除：统一空值兼容前端
+            evaluator_payload = None
+            dialogue_id = 0
 
             # 请求级 LLM token 汇总（在 log_request_end 清理聚合器之前读取）
             llm_tokens = get_llm_token_usage()
@@ -331,7 +341,7 @@ def chat():
             session["messages"].append({
                 "role": "assistant", "content": final_answer, "sql": display_sql,
                 "thinking": "\n".join(thinking_parts),
-                "dialogue_id": dialogue_id if has_evaluator else 0,
+                "dialogue_id": dialogue_id,
                 "evaluator": evaluator_payload,
                 "llm_tokens": llm_tokens,
             })
@@ -356,7 +366,7 @@ def chat():
                 "topic_status": topic_status,
                 "thinking": "\n".join(thinking_parts),
                 "evaluator": evaluator_payload,
-                "dialogue_id": dialogue_id if has_evaluator else 0,
+                "dialogue_id": dialogue_id,
                 "llm_tokens": llm_tokens,
             })
         except Exception as error:

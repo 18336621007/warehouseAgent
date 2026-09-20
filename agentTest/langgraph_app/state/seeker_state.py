@@ -1,6 +1,6 @@
 # ── state/seeker.py ──
-# Seeker 子图字段 + Evaluator 字段（同属一条执行链路）
-from typing import List, Any, TypedDict
+# Seeker 子图字段
+from typing import List, Any
 from agentTest.langgraph_app.state.base_state import BaseState
 from agentTest.langgraph_app.state.query_plan import QueryPlan
 
@@ -35,12 +35,3 @@ class SeekerState(BaseState, total=False):
 
     # 一致性校验通过的 SQL 历史，exec_retry 时回灌给 LLM 参考，避免反复瞎试
     sql_pass_history: List[str]
-
-
-    # Evaluator 评估字段，advisor_turns从TopicState继承并由Graph自动累积
-    total_topic_time_ms: float   # 本次话题总耗时（demo 层传入）
-    evaluator_score: float       # 综合评分（Evaluator 写入）
-
-    # 补充被旧注释覆盖的Evaluator字段
-    evaluator_self_score: float  # LLM 自评分数（Evaluator 写入）
-    evaluator_dialogue_id: int   # MySQL evaluated_dialogues 主键，供用户打分更新
