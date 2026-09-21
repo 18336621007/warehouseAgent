@@ -54,6 +54,8 @@ async function loadConversation(conversationIdToLoad) {
         } catch (e) {}
         conv = conversations[conversationIdToLoad];
     }
+    // 等待拉取期间用户已切到其他会话：丢弃过期加载，避免用旧会话覆盖当前界面与上下文圆环
+    if (conversationId !== conversationIdToLoad) return;
     var area = $("chatArea");
     area.innerHTML = "";
     if (conv && conv.messages && conv.messages.length > 0) {

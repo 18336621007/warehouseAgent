@@ -1,4 +1,4 @@
-# 值探查工具：Planner 收到 0 行反馈时，用 LIKE 实时探查字段实际存储值，修正过滤条件。
+# 值探查工具：过滤值不确定或查询返回 0 行时，用 LIKE 实时探查字段实际存储值，确认/修正过滤条件。
 # 参考 Codex 做法：查不到数据时返回用 LIKE 确认具体值，而不是依赖元数据采样猜测。
 import re
 
@@ -40,8 +40,8 @@ def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_V
     def probe_values(table: str, column: str, keyword: str = "", limit: int = None) -> str:
         """实时探查某表某字段的实际存储值（LIKE 模糊匹配），用于确认过滤值是否与库中一致。
 
-        当查询结果为空、怀疑过滤值与实际存储值不一致（如名称被截断、格式不同）时调用；
-        返回库中真实取值，供修正 filters 使用。
+        当过滤值不确定（用户模糊表述的型号/名称/渠道，无法确定唯一对应库中取值）或查询结果为空时调用；
+        返回库中真实取值，供选择精确匹配 / LIKE / IN 合并或修正 filters 使用。
         参数：
         - table: 表全名，如 ads_trip.ads_gundam_device_return_detail_hour
         - column: 要探查的字段名，如 region_name

@@ -78,7 +78,11 @@ def _estimate_conversation_context(conversation_id):
     try:
         snapshot = APP.get_state({"configurable": {"thread_id": conversation_id}})
         values = (snapshot and snapshot.values) or {}
-        history = _build_history_context(values.get("messages") or [])
+        messages = values.get("messages") or []
+        # 空会话（用户尚未发起任何对话）：上下文占用视为 0，前端圆环显示空
+        if not messages:
+            return None
+        history = _build_history_context(messages)
         last_query = str(values.get("effective_query") or "")
         skill_manager = RUNTIME.get("skill_manager")
         skill_index = (
