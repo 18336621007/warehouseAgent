@@ -46,3 +46,4 @@ PLANNER_CONTEXT_KEEP_ROUNDS_MAX = 3
 PLANNER_CONTEXT_KEEP_ROUNDS_MIN = 1
 # 中文字符/每 token 换算系数（估算新增内容 token 占用，取偏保守值：1 token ≈ 1.5 中文字符）
 CHARS_PER_TOKEN_ESTIMATE = 1.5
+

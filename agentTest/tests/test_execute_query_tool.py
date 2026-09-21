@@ -197,3 +197,22 @@ class ExecuteQueryToolTest(unittest.TestCase):
         )
         trino = runtime["tool_registry"].get_by_name("sql_query_trino").tool
         self.assertIn("create_time", trino.calls[0]["partition_fields"])
+    def test_executed_sql_overwritten_by_latest_call(self):
+        """后一次 execute_query 覆盖前一次：前端只展示最终生效 SQL（不展示中间纠错 SQL）。"""
+        runtime = _runtime()
+        self._call(runtime, sql="SELECT company_name FROM ads_trip.tbl WHERE pt_dt = '20260919'")
+        self._call(runtime, sql="SELECT company_id, company_name FROM ads_trip.tbl WHERE pt_dt = '20260919' GROUP BY company_id, company_name")
+        records = take_executed_sqls("req-1")
+        self.assertEqual(len(records), 1)
+        self.assertIn("GROUP BY", records[0]["sql"])
+
+    def test_executed_sql_steps_keep_all_segments(self):
+        """steps 多段：同一次 execute_query 调用的全部段保留（不被覆盖）。"""
+        runtime = _runtime()
+        steps = json.dumps([
+            {"id": "s1", "sql": "SELECT COUNT(*) AS c FROM ads_trip.t1 WHERE pt_dt = '20260919'", "question": "指标1"},
+            {"id": "s2", "sql": "SELECT COUNT(*) AS c FROM ads_trip.t2 WHERE pt_dt = '20260919'", "question": "指标2"},
+        ])
+        self._call(runtime, steps=steps)
+        records = take_executed_sqls("req-1")
+        self.assertEqual(len(records), 2)

@@ -66,6 +66,21 @@ def take_executed_sqls(base_request_id: str) -> list:
         _EXECUTED_SQLS[:] = kept
         return taken
 
+def _reset_executed_sqls(request_id: str) -> None:
+    """清空某请求在缓冲里的历史 SQL 记录（调用级覆盖：前端只展示最后一次 execute_query 调用的结果）。
+    每次 execute_query 入口调用一次，中间探索/纠错的成功 SQL 不再残留展示；审计仍走日志不受影响。"""
+    base = str(request_id or "")
+    if not base:
+        return
+    with _EXECUTED_SQL_LOCK:
+        _EXECUTED_SQLS[:] = [
+            _e for _e in _EXECUTED_SQLS
+            if not (
+                str(_e.get("request_id") or "") == base
+                or str(_e.get("request_id") or "").startswith(base + "_")
+            )
+        ]
+
 
 def set_execute_query_context(request_id: str, conversation_id: str, topic_id: str) -> tuple:
     """设置当前请求上下文，返回 contextvar tokens（调用方需 finally reset）。"""
@@ -382,6 +397,8 @@ def build_execute_query_tool(runtime):
         安全校验/执行失败返回具体错误，据此修正 SQL 后重试。
         """
         base_request_id = _current_request_id.get()
+        # 调用级覆盖：清掉该 request 旧 SQL 记录，只保留本次 execute_query 的结果供前端展示
+        _reset_executed_sqls(base_request_id)
         if str(steps or "").strip():
             steps_list = _parse_steps(steps)
             if not steps_list:

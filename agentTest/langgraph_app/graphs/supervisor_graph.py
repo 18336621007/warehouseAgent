@@ -4,7 +4,12 @@
 from langgraph.graph import StateGraph, START, END
 from agentTest.langgraph_app.state.agent_state import AgentState
 from agentTest.langgraph_app.nodes.planner_node import build_planner_node
-from langgraph.checkpoint.memory import MemorySaver
+from pathlib import Path
+import sqlite3
+
+# checkpoint 落盘路径（与 example_faiss_index 同目录）：agentTest/langgraph_app/cache/checkpoints.db
+_CHECKPOINT_DB = str(Path(__file__).resolve().parents[1] / "cache" / "checkpoints.db")
+from langgraph.checkpoint.sqlite import SqliteSaver
 from agentTest.langgraph_app.nodes.capture_user_message_node import capture_user_message_node
 from agentTest.langgraph_app.tools.registry import ToolSpec, ToolSecurity
 
@@ -33,5 +38,7 @@ def build_supervisor_graph(runtime):
     supervisor.add_edge("capture_user_message", "planner")
     supervisor.add_edge("planner", END)
 
-    checkpointer = MemorySaver()
+    # checkpoint 落盘到本地 sqlite（check_same_thread=False：Flask 后台线程并发访问 checkpoint）
+    # 替代内存 MemorySaver：释放内存 + 跨重启保留会话历史
+    checkpointer = SqliteSaver(sqlite3.connect(_CHECKPOINT_DB, check_same_thread=False))
     return supervisor.compile(checkpointer=checkpointer)
