@@ -7,6 +7,8 @@ var conversations = {};
 var creator = localStorage.getItem("creator") || "";
 // 初始会话引导只执行一次：防止命名弹层被重复触发（连点/双击/回车+点击）创建多个会话
 var _bootstrapDone = false;
+// 是否为手动“设置称呼”入口打开的弹层（决定取消/留空行为）
+var _nameOverlayManual = false;
 // 每个会话的进行中请求状态（conversationId -> {thinking,status,content,...}），
 // 切换会话后占位消息与会话绑定，不共享同一个进度条
 var pendingRequests = {};
@@ -801,11 +803,34 @@ function formatContent(text) {
 }
 
 
-function _applyCreator(value) {
+function openNameOverlay() {
+    // 手动重新设置称呼：预填当前称呼（匿名的留空），显示弹层并聚焦
+    _nameOverlayManual = true;
+    var overlay = $("nameOverlay");
+    if (!overlay) return;
+    var input = $("nameInput");
+    if (input) {
+        input.value = (creator && creator.indexOf("匿名-") !== 0) ? creator : "";
+        input.focus();
+    }
+    overlay.style.display = "flex";
+    // 点击遮罩等同“取消”，关闭不改
+    overlay.onclick = function (e) { if (e.target === overlay) closeNameOverlay(); };
+}
+
+function closeNameOverlay() {
+    _nameOverlayManual = false;
+    var overlay = $("nameOverlay");
+    if (overlay) overlay.style.display = "none";
+}
+
+function _applyCreator(value, fromBootstrap) {
     // 设置创建人并持久化（命名或跳过共用）；不自动新建会话，由用户点击“新建对话”
-    // 已触发过则忽略，防止重复创建会话
-    if (_bootstrapDone) return;
-    _bootstrapDone = true;
+    // 首次进入弹层（fromBootstrap=true）受 _bootstrapDone 防重约束；手动“设置称呼”随时可改
+    if (fromBootstrap) {
+        if (_bootstrapDone) return;
+        _bootstrapDone = true;
+    }
     creator = value;
     localStorage.setItem("creator", creator);
     var overlay = $("nameOverlay");
@@ -814,15 +839,21 @@ function _applyCreator(value) {
 }
 
 function confirmName() {
-    // 用户点击“确定”：有输入则用输入值，留空则分配匿名标识
+    // 用户点击“确定”：有输入则用输入值；手动设置时留空=关闭不改，首次留空=分配匿名标识
     var input = $("nameInput");
     var name = (input && input.value) ? input.value.trim() : "";
-    _applyCreator(name || ("匿名-" + Math.random().toString(16).slice(2, 6)));
+    if (_nameOverlayManual) {
+        if (!name) { closeNameOverlay(); return; }
+        _applyCreator(name, false);
+    } else {
+        _applyCreator(name || ("匿名-" + Math.random().toString(16).slice(2, 6)), true);
+    }
 }
 
 function skipName() {
-    // 用户点击“跳过”：直接分配匿名标识，不打扰
-    _applyCreator("匿名-" + Math.random().toString(16).slice(2, 6));
+    // 用户点击“取消/跳过”：手动弹层=关闭不改；首次进入=分配匿名标识
+    if (_nameOverlayManual) { closeNameOverlay(); return; }
+    _applyCreator("匿名-" + Math.random().toString(16).slice(2, 6), true);
 }
 
 (function init() {
