@@ -54,6 +54,81 @@ except Exception as error:
     sessions = {}
 
 
+# 进行中请求注册表：conversation_id -> {request_id, status, thinking, content, ...}
+# 供前端刷新/切换会话后轮询恢复进行中状态（仿 codex 的进行中任务可见）
+ACTIVE_REQUESTS = {}
+
+
+def _make_active_sink(conversation_id):
+    """构造 StreamBus 镜像回调：把本请求的事件增量累积进 ACTIVE_REQUESTS 快照。
+
+    客户端断开（刷新/关闭）后 SSE 线程关闭了总线，但后台 worker 仍继续产出事件；
+    镜像在总线关闭判断之前记录，保证轮询端始终能拿到最新思考/回答进度。
+    """
+    def sink(event):
+        snap = ACTIVE_REQUESTS.setdefault(conversation_id, {
+            "request_id": "",
+            "status": "AI 正在思考...",
+            "thinking_parts": [],
+            "thinking": "",
+            "content": "",
+            "sql": "",
+            "llm_tokens": {},
+            "context": None,
+        })
+        etype = event.get("type")
+        parts = snap["thinking_parts"]
+        if etype in ("status", "thinking"):
+            text = event.get("text") or ""
+            if text:
+                first = text.split("\n")[0]
+                if first:
+                    snap["status"] = first
+                parts.append({"sid": None, "text": text})
+                snap["thinking"] = "\n".join(p["text"] for p in parts)
+        elif etype == "token":
+            if event.get("scope") == "answer":
+                snap["content"] += event.get("text") or ""
+            else:
+                sid = event.get("stream_id") or ""
+                text = event.get("text") or ""
+                if text:
+                    if sid:
+                        hit = None
+                        for p in reversed(parts):
+                            if p["sid"] == sid:
+                                hit = p
+                                break
+                        if hit:
+                            hit["text"] += text
+                        else:
+                            parts.append({"sid": sid, "text": text})
+                    else:
+                        parts.append({"sid": None, "text": text})
+                    snap["thinking"] = "\n".join(p["text"] for p in parts)
+        elif etype == "thinking_retract":
+            rsid = event.get("stream_id") or ""
+            snap["thinking_parts"] = [p for p in parts if p["sid"] != rsid]
+            snap["thinking"] = "\n".join(p["text"] for p in snap["thinking_parts"])
+        elif etype == "done":
+            snap["content"] = event.get("content") or snap["content"]
+            snap["status"] = "done"
+            snap["sql"] = event.get("sql") or ""
+            snap["llm_tokens"] = event.get("llm_tokens") or {}
+        elif etype == "error":
+            snap["status"] = "error"
+            snap["content"] = (event.get("text") or "") + (
+                ("\n错误编号：" + event.get("error_id", "")) if event.get("error_id") else ""
+            )
+        elif etype == "context_progress":
+            snap["context"] = {
+                "used_tokens": event.get("used_tokens"),
+                "window_tokens": event.get("window_tokens"),
+                "percent": event.get("percent"),
+            }
+    return sink
+
+
 def _persist_conversation(conversation_id):
     """落盘会话记录；MySQL 异常仅记日志，不阻塞聊天主流程。"""
     try:
@@ -238,6 +313,23 @@ def delete_conversation(conversation_id):
     _soft_delete_conversation(conversation_id)
     return jsonify({"success": True})
 
+@app.route("/api/chat/status/<conversation_id>")
+def chat_status(conversation_id):
+    """进行中请求状态（供刷新/切换会话后轮询恢复，仿 codex 的进行中任务可见）。"""
+    snap = ACTIVE_REQUESTS.get(conversation_id)
+    if not snap:
+        return jsonify({"active": False})
+    return jsonify({
+        "active": True,
+        "request_id": snap.get("request_id", ""),
+        "status": snap.get("status", ""),
+        "thinking": snap.get("thinking", ""),
+        "content": snap.get("content", ""),
+        "sql": snap.get("sql", ""),
+        "context": snap.get("context"),
+        "llm_tokens": snap.get("llm_tokens", {}),
+    })
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json()
@@ -316,9 +408,32 @@ def chat():
             # Topic业务记忆由Checkpoint自动恢复
         }
 
+        # 本轮先占位落盘：用户提问 + "处理中"占位回答立即写入 MySQL，
+        # 刷新/切换会话不丢失；查询完成后再更新同一轮（round_no 不变），保持"一问一答=一轮"
+        session["messages"].append({"role": "user", "content": message})
+        session["messages"].append({
+            "role": "assistant", "content": "", "sql": "", "thinking": "",
+            "dialogue_id": 0, "evaluator": None, "llm_tokens": {},
+            "request_id": request_id, "thinking_seconds": 0,
+            "status": "processing", "error_message": "",
+            "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        _persist_conversation(conversation_id)
+
+        # 注册为进行中请求：前端刷新/切回后通过 /api/chat/status 轮询恢复实时状态
+        ACTIVE_REQUESTS[conversation_id] = {
+            "request_id": request_id,
+            "status": "AI 正在思考...",
+            "thinking_parts": [],
+            "thinking": "",
+            "content": "",
+            "sql": "",
+            "llm_tokens": {},
+            "context": None,
+        }
         # 查询链路移到后台线程执行：LLM token 在节点内部实时推送到总线，
         # SSE 线程只负责转发，前端才能逐字展示思考过程与最终回答
-        bus = StreamBus()
+        bus = StreamBus(sink=_make_active_sink(conversation_id))
         worker = threading.Thread(
             target=_run_query_worker,
             args=(bus, state_input, observed_topic_status, request_timer, request_started_at),
@@ -448,8 +563,8 @@ def chat():
 
             # 请求级 LLM token 汇总（在 log_request_end 清理聚合器之前读取）
             llm_tokens = get_llm_token_usage()
-            session["messages"].append({"role": "user", "content": message})
-            session["messages"].append({
+            # 覆盖本轮开头的"处理中"占位回答（round_no 不变），不新增轮次
+            session["messages"][-1] = {
                 "role": "assistant", "content": final_answer, "sql": display_sql,
                 "thinking": "\n".join(thinking_parts),
                 "dialogue_id": dialogue_id,
@@ -460,7 +575,7 @@ def chat():
                 "status": "success",
                 "error_message": "",
                 "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            }
             _persist_conversation(conversation_id)
 
             # ── 去 Topic 化：不再按 new_query / 异常终态切换 Topic，
@@ -530,8 +645,8 @@ def chat():
                 ms=elapsed_ms(request_timer),
             )
             # 失败轮也落盘审计记录：报错信息/执行时间/用户名称随明细存储
-            session["messages"].append({"role": "user", "content": message})
-            session["messages"].append({
+            # 覆盖本轮开头的"处理中"占位回答（round_no 不变），不新增轮次
+            session["messages"][-1] = {
                 "role": "assistant",
                 "content": "",
                 "thinking": "\n".join(thinking_parts),
@@ -544,7 +659,7 @@ def chat():
                 "status": "failed",
                 "error_message": f"{QUERY_ERROR_CODE}:{error_id}",
                 "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            }
             _persist_conversation(conversation_id)
             bus.emit({
                 "type": "error",
@@ -555,6 +670,8 @@ def chat():
         finally:
             reset_log_context(worker_token)
             bus.close()
+            # 查询结束：从进行中注册表移除，前端轮询据此判定完成并重新加载
+            ACTIVE_REQUESTS.pop(conversation_id, None)
 
 
     def generate_with_log_context():
@@ -646,6 +763,23 @@ def chat():
                 topic_status="failed",
                 ms=elapsed_ms(request_timer),
             )
+
+            # 外层异常兜底：若本轮已写入"处理中"占位回答（worker 未启动等场景），
+            # 更新为 failed，避免前端长期显示处理中
+            _last = session["messages"][-1] if session["messages"] else {}
+            if (isinstance(_last, dict)
+                    and _last.get("role") == "assistant"
+                    and _last.get("status") == "processing"
+                    and _last.get("request_id") == request_id):
+                _last.update({
+                    "status": "failed",
+                    "error_message": f"{QUERY_ERROR_CODE}:{error_id}",
+                    "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
+                })
+                _persist_conversation(conversation_id)
+
+            # 进行中注册表同步清理（worker 未启动/被中断时避免残留）
+            ACTIVE_REQUESTS.pop(conversation_id, None)
 
             yield _sse_req({
                 "type": "error",

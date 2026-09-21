@@ -112,6 +112,13 @@ def init_db():
                         _alter_add_audit_columns(cursor, missing)
             cursor.execute(_SCHEMA_CONVERSATIONS)
             cursor.execute(_SCHEMA_MESSAGES)
+            # 清理上次进程中断残留的"处理中"占位轮：进程重启后不会有后台线程补写，
+            # 标记为 failed 并保留用户提问，前端可恢复看到（未完成）
+            cursor.execute(
+                "UPDATE conversation_messages SET status = %s, "
+                "error_message = %s WHERE status = %s",
+                ("failed", "interrupted: server restarted", "processing"),
+            )
         conn.commit()
     finally:
         conn.close()

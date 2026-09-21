@@ -12,6 +12,9 @@ var _nameOverlayManual = false;
 // 每个会话的进行中请求状态（conversationId -> {thinking,status,content,...}），
 // 切换会话后占位消息与会话绑定，不共享同一个进度条
 var pendingRequests = {};
+// 刷新/切回后的进行中请求恢复：轮询定时器与重入保护（conversationId -> 标志）
+var activePollers = {};
+var resuming = {};
 
 function $(id) { return document.getElementById(id); }
 function hideEmpty() { var el = $("emptyState"); if (el) el.style.display = "none"; }
@@ -35,7 +38,7 @@ async function newChat() {
     } catch (e) { return false; }
 }
 
-async function loadConversation(conversationIdToLoad) {
+async function loadConversation(conversationIdToLoad, opts) {
     conversationId = conversationIdToLoad;
     var conv = conversations[conversationIdToLoad];
     // 内存缓存为空（刷新/重启后）时从服务端拉取完整对话（含他人创建的历史）
@@ -71,6 +74,14 @@ async function loadConversation(conversationIdToLoad) {
     updateInputLock();
     // 上下文圆环用服务端从 Checkpoint 实时估算的占用恢复（不同会话各自独立，不依赖落盘快照）
     updateContextRing(conv && conv._context, null);
+    // 最新轮次为"处理中"（刷新/重启后从 MySQL 恢复）时，尝试从后台恢复实时状态（仿 codex）
+    if (!(opts && opts.skipResume)) {
+        var _msgs = conv && conv.messages;
+        var _last = _msgs && _msgs[_msgs.length - 1];
+        if (_last && _last.role === "assistant" && _last.status === "processing") {
+            maybeResumeActiveRequest(conversationIdToLoad);
+        }
+    }
 }
 
 async function renameConv(conversationIdToRename, event) {
@@ -173,6 +184,111 @@ function updateInputLock() {
     lockInput(!!(pend && !pend.doneReceived));
 }
 
+function createPendingRequest() {
+    // 占位消息状态：思考文本/状态/最终回复字段，切走再切回也能恢复
+    return {
+        thinking: "", status: "AI 正在思考...",
+        content: "", sql: "", evaluator: null, dialogue_id: 0, request_id: "",
+        thinkingOpen: true,  // 思考面板默认展开，用户折叠/展开后保持
+        thinkingParts: [],  // 思考按流式段落存储（sid -> 文本），支持最终回复回收
+        answerQueue: [],  // 最终回答重放 token 的打字机队列
+        answerTimer: null,  // 打字机定时器句柄
+        answerStartAt: 0,  // 打字机启动时间，用于动态调速
+        answerHardTimer: null,  // 硬上限兜底定时器，避免输入框长期锁定
+        pendingFinalContent: null,  // done 提前到达时暂存的最终内容
+        finalizeAfterTypewriter: false,  // 请求结束后等待打字机播完再保存消息
+        doneReceived: false,  // 本轮业务已结束（收到 done/error），输入框可解锁
+        thinkStartAt: 0,  // 思考计时起点（ms）
+        thinkTimer: null,  // 思考计时器句柄
+        thinkingSeconds: 0,  // 思考总耗时（秒），固化时保存
+        llmTokens: null,  // 本轮 LLM token 消耗汇总（输入/输出/缓存命中/未命中）
+        contextProgress: null,  // 上下文使用进度（used/window/percent），供进度条展示
+        contextCompacted: null,  // 上下文压缩提示（saved_chars 等），压缩发生时展示
+    };
+}
+
+async function maybeResumeActiveRequest(convId) {
+    // 刷新/切回后检测后台是否仍有进行中请求：有则立即展示快照并轮询，无则重载一次拿最终结果
+    if (resuming[convId]) return;
+    resuming[convId] = true;
+    try {
+        var res = await fetch(API + "/chat/status/" + convId);
+        var data = await res.json();
+        if (data && data.active && data.request_id) {
+            var pend = pendingRequests[convId] || (pendingRequests[convId] = createPendingRequest());
+            pend.request_id = data.request_id;
+            pend.thinking = data.thinking || "";
+            pend.status = data.status || pend.status;
+            pend.content = data.content || "";
+            pend.contextProgress = data.context || null;
+            if (conversationId === convId) {
+                appendPendingMessage(convId);
+                updatePendingMessage(convId);
+                updateContextRing(data.context || null, null);
+            }
+            startPollingActive(convId);
+            // 恢复进行中请求后锁定输入，避免该会话并发二次请求
+            updateInputLock();
+        } else {
+            // 后台已无进行中请求：重新加载一次（worker 可能已完成落盘）
+            await loadConversation(convId, { skipResume: true });
+        }
+    } catch (e) {}
+    finally { resuming[convId] = false; }
+}
+
+function startPollingActive(convId) {
+    // 启动对后台进行中请求的轮询（已存在则跳过）
+    if (activePollers[convId]) return;
+    activePollers[convId] = 1;
+    setTimeout(function () { pollActive(convId); }, 1200);
+}
+
+function stopPollingActive(convId) {
+    // 停止轮询
+    delete activePollers[convId];
+}
+
+async function pollActive(convId) {
+    // 轮询后台进行中快照：更新占位内容；完成/结束时重载拿最终结果
+    if (!activePollers[convId]) return;
+    var data;
+    try {
+        var res = await fetch(API + "/chat/status/" + convId);
+        data = await res.json();
+    } catch (e) {
+        stopPollingActive(convId);
+        return;
+    }
+    if (!data || !data.active) {
+        // 后台已完成/结束：停止轮询，重新加载拿最终结果
+        stopPollingActive(convId);
+        delete pendingRequests[convId];
+        await loadConversation(convId, { skipResume: true });
+        return;
+    }
+    var pend = pendingRequests[convId] || (pendingRequests[convId] = createPendingRequest());
+    pend.request_id = data.request_id || pend.request_id;
+    pend.thinking = data.thinking || "";
+    pend.status = data.status || pend.status;
+    pend.content = data.content || "";
+    pend.contextProgress = data.context || pend.contextProgress;
+    // 完成态：停止轮询并重载（拿到落盘的最终答案）
+    if (data.status === "done" || data.status === "error") {
+        stopPollingActive(convId);
+        delete pendingRequests[convId];
+        await loadConversation(convId, { skipResume: true });
+        return;
+    }
+    if (conversationId === convId) {
+        updatePendingMessage(convId);
+        updateContextRing(data.context || null, null);
+    }
+    // 进行中保持输入锁定（占位可能刚由轮询创建）
+    updateInputLock();
+    setTimeout(function () { pollActive(convId); }, 1200);
+}
+
 async function sendMsg() {
     var input = $("msgInput"); if (!input) return;
     var msg = input.value.trim(); if (!msg) return;
@@ -197,25 +313,7 @@ async function sendMsg() {
 
     input.value = "";
     // 占位消息状态：思考文本/状态/最终回复字段，切走再切回也能恢复
-    pendingRequests[reqConv] = {
-        thinking: "", status: "AI 正在思考...",
-        content: "", sql: "", evaluator: null, dialogue_id: 0, request_id: "",
-        thinkingOpen: true,  // 思考面板默认展开，用户折叠/展开后保持
-        thinkingParts: [],  // 思考按流式段落存储（sid -> 文本），支持最终回复回收
-        answerQueue: [],  // 最终回答重放 token 的打字机队列
-        answerTimer: null,  // 打字机定时器句柄
-        answerStartAt: 0,  // 打字机启动时间，用于动态调速
-        answerHardTimer: null,  // 硬上限兜底定时器，避免输入框长期锁定
-        pendingFinalContent: null,  // done 提前到达时暂存的最终内容
-        finalizeAfterTypewriter: false,  // 请求结束后等待打字机播完再保存消息
-        doneReceived: false,  // 本轮业务已结束（收到 done/error），输入框可解锁
-        thinkStartAt: 0,  // 思考计时起点（ms）
-        thinkTimer: null,  // 思考计时器句柄
-        thinkingSeconds: 0,  // 思考总耗时（秒），固化时保存
-        llmTokens: null,  // 本轮 LLM token 消耗汇总（输入/输出/缓存命中/未命中）
-        contextProgress: null,  // 上下文使用进度（used/window/percent），供进度条展示
-        contextCompacted: null,  // 上下文压缩提示（saved_chars 等），压缩发生时展示
-    };
+    pendingRequests[reqConv] = createPendingRequest();
     lockInput(true);
     hideEmpty();
     appendMessage("user", msg);
@@ -482,6 +580,7 @@ function stopThinkTimer(pend) {
 function appendPendingMessage(convId) {
     // 在当前会话消息流内追加“AI 正在思考”占位消息（ChatGPT 形式）
     var area = $("chatArea"); if (!area) return;
+    if (document.getElementById("pending-msg-" + convId)) return;  // 已存在则不重复追加
     var pend = pendingRequests[convId]; if (!pend) return;
 
     var wrapper = document.createElement("div"); wrapper.className = "msg assistant";
@@ -633,9 +732,12 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
     avatar.textContent = role === "user" ? "你" : "AI";
 
     var bubble = document.createElement("div"); bubble.className = "bubble";
-    // 失败轮无回复时显示占位，避免空气泡（审计信息在数据库中）
-    bubble.innerHTML = (role === "assistant" && (!content || !content.trim()))
-        ? "<p style=\"color:#888\">本轮未返回回复</p>"
+    // 失败/处理中轮无回复时显示占位，避免空气泡（审计信息在数据库中）
+    var emptyReply = (role === "assistant" && (!content || !content.trim()));
+    bubble.innerHTML = emptyReply
+        ? (msgObj && msgObj.status === "processing")
+            ? "<p style=\"color:#888\">处理中...（若一直未完成，可能是服务重启导致）</p>"
+            : "<p style=\"color:#888\">本轮未返回回复</p>"
         : formatContent(content);
 
     // 思考过程面板：置于回复内容上方，默认展开，用户折叠/展开状态回写消息记录

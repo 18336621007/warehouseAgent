@@ -9,13 +9,21 @@ _STREAM_BUS: ContextVar = ContextVar("stream_bus", default=None)
 class StreamBus:
     """每个 /api/chat 请求一个实例：graph 线程 emit，SSE 线程 iter_events。"""
 
-    def __init__(self):
+    def __init__(self, sink=None):
         self._queue: "queue.Queue[dict | None]" = queue.Queue()
         self._closed = False
         # 请求内是否已发过 Advisor 节点标签（token handler 为全局复用，标志必须按请求隔离）
         self.advisor_label_sent = False
+        # 可选镜像回调：每个事件先写镜像（客户端断开后仍记录），供刷新/切回后轮询恢复
+        self._sink = sink
 
     def emit(self, event: dict):
+        # 镜像回调在丢弃判断之前执行：客户端断开后仍持续记录增量，供前端轮询恢复
+        if self._sink is not None:
+            try:
+                self._sink(event)
+            except Exception:
+                pass
         # 请求结束后丢弃新事件，避免客户端断开后无限堆积
         if not self._closed:
             self._queue.put(event)
