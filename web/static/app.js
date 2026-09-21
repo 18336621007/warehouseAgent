@@ -64,7 +64,18 @@ async function loadConversation(conversationIdToLoad, opts) {
     var area = $("chatArea");
     area.innerHTML = "";
     if (conv && conv.messages && conv.messages.length > 0) {
-        conv.messages.forEach(function (m) { appendMessage(m.role, m.content, m.sql, m.thinking, m.evaluator, m.dialogue_id, m.request_id, m.thinkingOpen, m); });
+        // 刷新/重启后恢复的"处理中"占位轮：非 skipResume 时跳过其静态渲染（可能被恢复逻辑改成动态占位），
+        // 避免"处理中...（若一直未完成）"静态提示与动态占位同时出现
+        var _lastMsg = conv.messages[conv.messages.length - 1];
+        var _skipStub = false;
+        if (!(opts && opts.skipResume) && _lastMsg
+                && _lastMsg.role === "assistant" && _lastMsg.status === "processing") {
+            _skipStub = true;
+        }
+        conv.messages.forEach(function (m, idx) {
+            if (_skipStub && idx === conv.messages.length - 1) return;
+            appendMessage(m.role, m.content, m.sql, m.thinking, m.evaluator, m.dialogue_id, m.request_id, m.thinkingOpen, m);
+        });
     } else {
         area.innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
     }
