@@ -4,6 +4,7 @@ ChatGPT UI backend - Flask API (streaming + scoring + rename/delete)
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 import uuid, os, sys, json, threading
+from datetime import datetime
 
 # 强制 stdout/stderr 行缓冲，让启动日志与请求日志实时显示（避免块缓冲憋住，进程结束才刷出）
 sys.stdout.reconfigure(line_buffering=True, encoding="utf-8")
@@ -23,8 +24,16 @@ from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 from agentTest.langgraph_app.runtime.stream_bus import StreamBus, bind_stream_bus
+from agentTest.langgraph_app.nodes.planner_node import PLANNER_SYSTEM_PROMPT
+from agentTest.langgraph_app.nodes.planner_node import _build_history_context
+from agentTest.langgraph_app.nodes.planner_node import _estimate_tokens
 from agentTest.config.settings import get_stream_output_enabled
+from agentTest.config.settings import get_model_context_window
 from web.intent_classifier import classify_intent
+from web.conversation_store import init_db as init_conv_db
+from web.conversation_store import load_all as load_conv_all
+from web.conversation_store import upsert as upsert_conv
+from web.conversation_store import soft_delete as soft_delete_conv
 from agentTest.metadata.mysql_store import update_user_score
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -35,7 +44,63 @@ RUNTIME = build_graph_runtime()
 APP = build_supervisor_graph(RUNTIME)
 print("[server] runtime ready")
 
-sessions = {}
+# 对话记录落盘（MySQL）：启动时恢复全部历史会话，会话变更同步写库（方案 A：共享全部会话）
+init_conv_db()
+try:
+    sessions = load_conv_all()
+except Exception as error:
+    # MySQL 不可用时以空缓存启动，不影响服务运行（落盘是辅助能力）
+    print(f"[server] load conversations failed: {error}")
+    sessions = {}
+
+
+def _persist_conversation(conversation_id):
+    """落盘会话记录；MySQL 异常仅记日志，不阻塞聊天主流程。"""
+    try:
+        upsert_conv(conversation_id, sessions[conversation_id])
+    except Exception as error:
+        print(f"[server] persist conversation failed: {error}")
+
+
+def _soft_delete_conversation(conversation_id):
+    """软删除会话：仅打 deleted_at 标记保留 MySQL 记录；异常仅记日志。"""
+    try:
+        soft_delete_conv(conversation_id)
+    except Exception as error:
+        print(f"[server] soft delete conversation failed: {error}")
+
+def _estimate_conversation_context(conversation_id):
+    """按会话实时估算上下文占用：从持久化 Checkpoint 现算（不落库），反映当前真实状态。
+
+    口径与 Planner 组装一致：系统提示 + 技能索引 + 对话历史 + 最近 effective_query；
+    工具原文是每轮内存态、不持久化，故稳态占用不含它（在线执行时仍由真实 input_tokens 实时推）。
+    """
+    try:
+        snapshot = APP.get_state({"configurable": {"thread_id": conversation_id}})
+        values = (snapshot and snapshot.values) or {}
+        history = _build_history_context(values.get("messages") or [])
+        last_query = str(values.get("effective_query") or "")
+        skill_manager = RUNTIME.get("skill_manager")
+        skill_index = (
+            skill_manager.list_skills_index(scope="planner", max_chars=4000)
+            if skill_manager else ""
+        )
+        used = (
+            _estimate_tokens(PLANNER_SYSTEM_PROMPT)
+            + _estimate_tokens(skill_index)
+            + _estimate_tokens(history)
+            + _estimate_tokens(last_query)
+        )
+        if not used:
+            return None
+        window = get_model_context_window()
+        return {
+            "used_tokens": used,
+            "window_tokens": window,
+            "percent": round(min(100.0, used * 100.0 / window), 1),
+        }
+    except Exception:
+        return None
 
 NODE_LABELS = {
     "capture_user_message": "正在记录本轮问题...",
@@ -116,13 +181,18 @@ def create_conversation():
     # 去 Topic 化：conversation 级固定 topic_id（仅作日志/状态标识，不再按问数切换）
     topic_id = uuid.uuid4().hex
 
+    data = request.get_json(silent=True) or {}
+    creator = (data.get("creator") or "").strip() or "未命名"
     sessions[conversation_id] = {
         "topic_id": topic_id,
+        "creator": creator,
         "messages": [],
     }
+    _persist_conversation(conversation_id)
     # 产品接口统一使用conversation_id，避免与LangGraph内部thread_id混淆
     return jsonify({
-        "conversation_id": conversation_id
+        "conversation_id": conversation_id,
+        "creator": creator,
     })
 
 @app.route("/api/conversations", methods=["GET"])
@@ -130,8 +200,22 @@ def list_conversations():
     convs = []
     for conversation_id, sess in sessions.items():
         first = sess.get("title_override") or (sess["messages"][0]["content"] if sess["messages"] else "New Chat")
-        convs.append({"conversation_id": conversation_id, "title": first[:50], "message_count": len(sess["messages"])})
+        convs.append({"conversation_id": conversation_id, "title": first[:50], "message_count": len(sess["messages"]), "creator": sess.get("creator", "")})
     return jsonify({"conversations": convs})
+
+@app.route("/api/conversations/<conversation_id>", methods=["GET"])
+def get_conversation(conversation_id):
+    """返回单个会话的完整消息，供前端加载（含他人创建的历史）时拉取。"""
+    if conversation_id not in sessions: return jsonify({"error": "invalid"}), 400
+    sess = sessions[conversation_id]
+    return jsonify({
+        "conversation_id": conversation_id,
+        "creator": sess.get("creator", ""),
+        "title": sess.get("title_override") or (sess["messages"][0]["content"] if sess["messages"] else "New Chat"),
+        "messages": sess["messages"],
+        # 上下文占用实时从 Checkpoint 现算（不同会话各自独立），供前端恢复圆环
+        "context": _estimate_conversation_context(conversation_id),
+    })
 
 @app.route("/api/conversations/<conversation_id>", methods=["PUT"])
 def rename_conversation(conversation_id):
@@ -139,11 +223,15 @@ def rename_conversation(conversation_id):
     title = (data.get("title") or "").strip()
     if conversation_id not in sessions: return jsonify({"error": "invalid"}), 400
     if title: sessions[conversation_id]["title_override"] = title
+    _persist_conversation(conversation_id)
     return jsonify({"success": True})
 
 @app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
 def delete_conversation(conversation_id):
-    if conversation_id in sessions: del sessions[conversation_id]
+    # 软删除：仅前端不可见，MySQL 记录保留并打 deleted_at 标记（供审计）
+    if conversation_id in sessions:
+        del sessions[conversation_id]
+    _soft_delete_conversation(conversation_id)
     return jsonify({"success": True})
 
 @app.route("/api/chat", methods=["POST"])
@@ -173,7 +261,7 @@ def chat():
         }
     }
 
-    def generate(request_timer, topic_state):
+    def generate(request_timer, topic_state, request_started_at):
         # ── query: LangGraph pipeline ──
         # 去 Topic 化：是否本对话首轮（Checkpoint 尚无消息），首轮才做意图识别
         is_first_topic_turn = not bool(topic_state.get("messages"))
@@ -201,7 +289,8 @@ def chat():
             if intent_result.intent == "chat":
                 reply = intent_result.quick_reply or "你好！有什么可以帮你的吗？"
                 session["messages"].append({"role": "user", "content": message})
-                session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None})
+                session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "request_id": request_id, "thinking_seconds": round(elapsed_ms(request_timer) / 1000), "status": "chat", "error_message": "", "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S")})
+                _persist_conversation(conversation_id)
                 log_request_end(
                     result_type="chat",
                     summary={"nodes": 0, "intent": "chat"},
@@ -228,7 +317,7 @@ def chat():
         bus = StreamBus()
         worker = threading.Thread(
             target=_run_query_worker,
-            args=(bus, state_input, observed_topic_status, request_timer),
+            args=(bus, state_input, observed_topic_status, request_timer, request_started_at),
             daemon=True,
         )
         worker.start()
@@ -239,7 +328,7 @@ def chat():
             # 客户端断开或异常时通知后台线程停止推送，避免事件堆积
             bus.close()
 
-    def _run_query_worker(bus, state_input, observed_topic_status, request_timer):
+    def _run_query_worker(bus, state_input, observed_topic_status, request_timer, request_started_at):
         """后台执行查询链路：节点事件与 LLM token 写入总线，由 SSE 线程转发。"""
         # 后台线程重新绑定日志上下文与流式总线，节点日志与 token 回调才能正确工作
         worker_token = bind_log_context(
@@ -362,7 +451,13 @@ def chat():
                 "dialogue_id": dialogue_id,
                 "evaluator": evaluator_payload,
                 "llm_tokens": llm_tokens,
+                "request_id": request_id,
+                "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
+                "status": "success",
+                "error_message": "",
+                "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
             })
+            _persist_conversation(conversation_id)
 
             # ── 去 Topic 化：不再按 new_query / 异常终态切换 Topic，
             #    整个对话共享历史与状态，新问数由 Planner 每轮重新改写 effective_query ──
@@ -430,6 +525,23 @@ def chat():
                 topic_status="failed",
                 ms=elapsed_ms(request_timer),
             )
+            # 失败轮也落盘审计记录：报错信息/执行时间/用户名称随明细存储
+            session["messages"].append({"role": "user", "content": message})
+            session["messages"].append({
+                "role": "assistant",
+                "content": "",
+                "thinking": "\n".join(thinking_parts),
+                "sql": "",
+                "dialogue_id": 0,
+                "evaluator": None,
+                "llm_tokens": {},
+                "request_id": request_id,
+                "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
+                "status": "failed",
+                "error_message": f"{QUERY_ERROR_CODE}:{error_id}",
+                "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            _persist_conversation(conversation_id)
             bus.emit({
                 "type": "error",
                 "text": QUERY_SAFE_ERROR_MESSAGE,
@@ -450,6 +562,8 @@ def chat():
             graph_thread_id=graph_thread_id,
         )
         request_timer = start_timer()
+        # 记录本轮请求开始时间，随明细落盘用于审计“执行时间”
+        request_started_at = datetime.now()
         topic_state = {}
 
         try:
@@ -468,6 +582,7 @@ def chat():
             yield from generate(
                 request_timer,
                 topic_state,
+                request_started_at,
             )
 
         except Exception as error:
@@ -557,6 +672,7 @@ def submit_score():
             if msg.get("evaluator") is None: msg["evaluator"] = {}
             msg["evaluator"]["user_score"] = score
             break
+    _persist_conversation(conversation_id)
     if dialogue_id:
         try:
             result = update_user_score(dialogue_id, score * 20)

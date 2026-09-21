@@ -3,6 +3,10 @@ var API = "/api";
 // 当前选中的完整前端对话标识
 var conversationId = null;
 var conversations = {};
+// 创建人（仅用于区分不同用户的对话，测试用），localStorage 持久化
+var creator = localStorage.getItem("creator") || "";
+// 初始会话引导只执行一次：防止命名弹层被重复触发（连点/双击/回车+点击）创建多个会话
+var _bootstrapDone = false;
 // 每个会话的进行中请求状态（conversationId -> {thinking,status,content,...}），
 // 切换会话后占位消息与会话绑定，不共享同一个进度条
 var pendingRequests = {};
@@ -12,10 +16,15 @@ function hideEmpty() { var el = $("emptyState"); if (el) el.style.display = "non
 
 async function newChat() {
     try {
-        var res = await fetch(API + "/conversations", { method: "POST" });
+        var res = await fetch(API + "/conversations", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ creator: creator }),
+        });
         var data = await res.json();
+        if (data.creator) creator = data.creator;
         conversationId = data.conversation_id;
-        conversations[conversationId] = { title: "新对话", messages: [] };
+        conversations[conversationId] = { title: "新对话", creator: creator, messages: [], _loadedFromServer: true };
         $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         refreshConvList();
         updateInputLock();
@@ -24,9 +33,27 @@ async function newChat() {
     } catch (e) { return false; }
 }
 
-function loadConversation(conversationIdToLoad) {
+async function loadConversation(conversationIdToLoad) {
     conversationId = conversationIdToLoad;
     var conv = conversations[conversationIdToLoad];
+    // 内存缓存为空（刷新/重启后）时从服务端拉取完整对话（含他人创建的历史）
+    if (!conv || !conv.messages || conv.messages.length === 0) {
+        try {
+            var res = await fetch(API + "/conversations/" + conversationIdToLoad);
+            if (res.ok) {
+                var data = await res.json();
+                conversations[conversationIdToLoad] = {
+                    title: data.title || "新对话",
+                    creator: data.creator || "",
+                    messages: data.messages || [],
+                    // 会话级上下文占用：服务端从 Checkpoint 实时估算，不随消息落库
+                    _context: data.context || null,
+                    _loadedFromServer: true,
+                };
+            }
+        } catch (e) {}
+        conv = conversations[conversationIdToLoad];
+    }
     var area = $("chatArea");
     area.innerHTML = "";
     if (conv && conv.messages && conv.messages.length > 0) {
@@ -38,19 +65,8 @@ function loadConversation(conversationIdToLoad) {
     if (pendingRequests[conversationIdToLoad]) appendPendingMessage(conversationIdToLoad);
     refreshConvList();
     updateInputLock();
-    // 恢复该会话最后一次的上下文使用进度（取最后一条含 context_progress/compacted 的助手消息）
-    var lastProgress = null, lastCompacted = null;
-    if (conv && conv.messages) {
-        for (var mi = conv.messages.length - 1; mi >= 0; mi--) {
-            var mm = conv.messages[mi];
-            if (mm.role === "assistant" && (mm.context_progress || mm.context_compacted)) {
-                lastProgress = mm.context_progress || null;
-                lastCompacted = mm.context_compacted || null;
-                break;
-            }
-        }
-    }
-    updateContextRing(lastProgress, lastCompacted);
+    // 上下文圆环用服务端从 Checkpoint 实时估算的占用恢复（不同会话各自独立，不依赖落盘快照）
+    updateContextRing(conv && conv._context, null);
 }
 
 async function renameConv(conversationIdToRename, event) {
@@ -93,17 +109,30 @@ async function refreshConvList() {
         var data = await res.json();
         list.innerHTML = "";
         data.conversations.forEach(function (c) {
-            conversations[c.conversation_id] = conversations[c.conversation_id] || { title: c.title, messages: [] };
+            conversations[c.conversation_id] = conversations[c.conversation_id] || { title: c.title, creator: c.creator, messages: [] };
+            conversations[c.conversation_id].creator = c.creator || "";
             var div = document.createElement("div");
             div.className = "conv-item" + (c.conversation_id === conversationId ? " active" : "");
             div.onclick = function () { loadConversation(c.conversation_id); };
 
+            // 标题 + 创建人（小字）放在同一列，创建人用于区分不同用户的对话
+            var mainCol = document.createElement("div");
+            mainCol.style.flex = "1";
+            mainCol.style.overflow = "hidden";
             var span = document.createElement("span");
             span.textContent = c.title || "新对话";
-            span.style.flex = "1";
+            span.style.display = "block";
             span.style.overflow = "hidden";
             span.style.textOverflow = "ellipsis";
-            div.appendChild(span);
+            span.style.whiteSpace = "nowrap";
+            mainCol.appendChild(span);
+            if (c.creator) {
+                var cr = document.createElement("span");
+                cr.className = "conv-creator";
+                cr.textContent = "by " + c.creator;
+                mainCol.appendChild(cr);
+            }
+            div.appendChild(mainCol);
 
             var actions = document.createElement("span");
             actions.className = "conv-actions";
@@ -271,6 +300,8 @@ async function sendMsg() {
                             window_tokens: event.window_tokens,
                             percent: event.percent,
                         };
+                        // 同步到会话内存对象：同一会话内切走再切回仍能恢复圆环（不依赖服务端拉取）
+                        if (conversations[reqConv]) conversations[reqConv]._context = pend.contextProgress;
                         updatePendingMessage(reqConv);
                         // 输入框左侧圆环实时更新（仅当前显示会话）
                         if (reqConv === conversationId) updateContextRing(pend.contextProgress, pend.contextCompacted);
@@ -348,8 +379,6 @@ function finalizePendingRequest(convId, pend) {
         request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
         thinkingSeconds: pend.thinkingSeconds || 0,
         llm_tokens: pend.llmTokens || null,
-        context_progress: pend.contextProgress || null,
-        context_compacted: pend.contextCompacted || null,
     };
     if (conv) conv.messages.push(savedMsg);
     delete pendingRequests[convId];
@@ -600,7 +629,10 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
     avatar.textContent = role === "user" ? "你" : "AI";
 
     var bubble = document.createElement("div"); bubble.className = "bubble";
-    bubble.innerHTML = formatContent(content);
+    // 失败轮无回复时显示占位，避免空气泡（审计信息在数据库中）
+    bubble.innerHTML = (role === "assistant" && (!content || !content.trim()))
+        ? "<p style=\"color:#888\">本轮未返回回复</p>"
+        : formatContent(content);
 
     // 思考过程面板：置于回复内容上方，默认展开，用户折叠/展开状态回写消息记录
     if (thinking && thinking.trim()) {
@@ -610,8 +642,9 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         var open1 = thinkingOpen !== false;
         cc1.classList.toggle("show", open1);
         btn1.classList.toggle("open", open1);
+        var secs = (msgObj && (msgObj.thinking_seconds != null ? msgObj.thinking_seconds : msgObj.thinkingSeconds)) || 0;
         var thinkLabel = "查看思考过程"
-            + (msgObj && msgObj.thinkingSeconds ? "（" + msgObj.thinkingSeconds + "s）" : "");
+            + (secs ? "（" + secs + "s）" : "");
         btn1.innerHTML = '<span class="arrow">' + (open1 ? "▼" : "▶") + '</span> ' + thinkLabel;
         btn1.onclick = function () {
             var wasOpen = cc1.classList.contains("show"); cc1.classList.toggle("show");
@@ -766,8 +799,47 @@ function formatContent(text) {
 }
 
 
+function _applyCreator(value) {
+    // 设置创建人并持久化（命名或跳过共用）；不自动新建会话，由用户点击“新建对话”
+    // 已触发过则忽略，防止重复创建会话
+    if (_bootstrapDone) return;
+    _bootstrapDone = true;
+    creator = value;
+    localStorage.setItem("creator", creator);
+    var overlay = $("nameOverlay");
+    if (overlay) overlay.style.display = "none";
+    refreshConvList();
+}
+
+function confirmName() {
+    // 用户点击“确定”：有输入则用输入值，留空则分配匿名标识
+    var input = $("nameInput");
+    var name = (input && input.value) ? input.value.trim() : "";
+    _applyCreator(name || ("匿名-" + Math.random().toString(16).slice(2, 6)));
+}
+
+function skipName() {
+    // 用户点击“跳过”：直接分配匿名标识，不打扰
+    _applyCreator("匿名-" + Math.random().toString(16).slice(2, 6));
+}
+
 (function init() {
-    newChat().then(function (ok) {
-        if (!ok) { var el = $("emptyState"); if (el) el.textContent = "无法连接服务器，请启动: python web/server.py"; }
-    });
+    // 创建人：首次进入在页面内弹层让用户自行选择“确定”或“跳过”（不用 prompt，切窗口不消失）
+    creator = localStorage.getItem("creator") || "";
+    // 旧逻辑残留的“未命名”也视为未设置，让用户重新选择一次
+    // 打开页面先初始化上下文圆环为 0（避免空白页 SVG 未设 dashoffset 显示成满环）
+    updateContextRing(null, null);
+    if (creator && creator !== "未命名") {
+        // 打开页面只加载会话列表，不自动新建会话（由用户点“新建对话”或已有会话）
+        refreshConvList();
+    } else {
+        var overlay = $("nameOverlay");
+        if (overlay) {
+            overlay.style.display = "flex";
+            // 点击遮罩视为“跳过”（匿名关闭），_bootstrapDone 保证只创建一次
+            overlay.onclick = function (e) { if (e.target === overlay) skipName(); };
+        }
+        var input = $("nameInput");
+        if (input) input.focus();
+    }
 })();
