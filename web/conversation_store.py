@@ -149,7 +149,7 @@ def _pair_to_messages(row):
     else:
         request_at_str = str(request_at or "")
     return [
-        {"role": "user", "content": user_message},
+        {"role": "user", "content": user_message, "request_at": request_at_str},
         {
             "role": "assistant",
             "content": assistant_message,

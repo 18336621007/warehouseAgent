@@ -28,6 +28,11 @@ def reset_result_conversation(token):
     _current_conversation_id.reset(token)
 
 
+def get_result_conversation() -> str:
+    """读取当前会话 id（供需要读取落盘结果的其它工具复用）。"""
+    return _current_conversation_id.get()
+
+
 def _normalize_group_by(group_by) -> list:
     """把 LLM 传入的分组字段归一化为 list。
 

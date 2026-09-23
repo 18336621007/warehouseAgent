@@ -265,6 +265,7 @@ def list_result_index(conversation_id: str, limit: int = 8) -> list:
             "preview_rows": entry.get("preview_rows"),
             "entity_keys": entry.get("entity_keys"),
             "result_id": entry.get("result_id"),
+            "source_request_id": entry.get("source_request_id"),
             "full_csv": entry.get("full_csv"),
             # 绝对路径，供 prompt 展示历史轮次 CSV 的完整保存位置
             "full_csv_path": str(conv_dir / entry.get("full_csv")) if entry.get("full_csv") else "",
@@ -273,15 +274,28 @@ def list_result_index(conversation_id: str, limit: int = 8) -> list:
 
 
 def resolve_result(conversation_id: str, ref: str):
-    """按 round_no 或 result_id 解析到索引条目；解析不到返回 None。"""
+    """按 round_no / result_id / source_request_id 解析到索引条目；解析不到返回 None。
+
+    LLM 常从『结果已落盘：xxx:result』只截取 xxx（丢掉 :result 后缀），
+    这里做容错：除精确匹配外，允许 source_request_id 精确匹配与 result_id 前缀匹配。
+    """
     if not RESULT_STORE_ENABLED or not conversation_id:
         return None
     conv_dir = _conversation_dir(conversation_id)
     index = _read_index(conv_dir)
     ref = str(ref or "").strip().lower()
     entries = index.get("results") or []
+    # 第一遍：精确匹配 round_no / result_id（含 :result 后缀）/ source_request_id
     for entry in reversed(entries):
-        if ref == str(entry.get("round_no")) or ref == str(entry.get("result_id") or "").lower():
+        rid = str(entry.get("result_id") or "").lower()
+        sid = str(entry.get("source_request_id") or "").lower()
+        if ref == str(entry.get("round_no")) or ref == rid or ref == sid:
+            return entry
+    # 第二遍：无 :result 后缀 / 分段 _pN 容错（LLM 截断传参场景）
+    for entry in reversed(entries):
+        rid = str(entry.get("result_id") or "").lower()
+        sid = str(entry.get("source_request_id") or "").lower()
+        if rid.startswith(ref + ":") or sid.startswith(ref + "_"):
             return entry
     if ref.isdigit():
         for entry in reversed(entries):

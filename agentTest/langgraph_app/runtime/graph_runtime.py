@@ -131,6 +131,19 @@ def build_graph_runtime():
         security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
     ))
 
+    # 统一工具注册表：Planner 专属图表工具（程序从落盘结果取数，格式由程序保证）
+    # 仿 Codex：LLM 不手写 chart JSON，调用 make_chart 选 类型/字段/标题，
+    # 程序读 execute_query 落盘结果生成规范 ```chart 块，LLM 原样粘贴
+    from agentTest.langgraph_app.tools.chart_tool import build_make_chart_tool
+    make_chart_tool = build_make_chart_tool()
+    tool_registry.register(ToolSpec(
+        name="make_chart",
+        description=make_chart_tool.description,
+        tool=make_chart_tool,
+        groups=("planner",),
+        security=ToolSecurity(read_only=True, row_limit=0, whitelist_only=True),
+    ))
+
     # 从 MySQL 加载字段类型映射（度量/维度）与字段枚举值映射，供 generate_sql/Resolver 使用
     import re as _re
     _date_like = _re.compile(r"^\d{6,14}$|^\d{4}-\d{2}-\d{2}$|^\d{4}/\d{1,2}/\d{1,2}$")

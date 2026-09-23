@@ -331,6 +331,36 @@ def chat_status(conversation_id):
         "llm_tokens": snap.get("llm_tokens", {}),
     })
 
+@app.route("/api/chart", methods=["POST"])
+def generate_chart():
+    """按回答对应的落盘结果生成图表 spec（前端『生成图表』按钮，仿豆包）。
+
+    输入 conversation_id + 该回答的 request_id（含 _pN 分段时按前缀匹配全部落盘结果），
+    程序从落盘结果取真实数据并自动探测 x/y 字段，返回规范 chart spec 列表。
+    复用 chart_tool 的 build_charts_for_request，与 make_chart 工具同一套取数与格式逻辑。
+    """
+    data = request.get_json() or {}
+    conversation_id = str(data.get("conversation_id") or "")
+    request_id = str(data.get("request_id") or "")
+    if conversation_id not in sessions:
+        return jsonify({"error": "invalid conversation_id"}), 400
+    try:
+        from agentTest.langgraph_app.tools.chart_tool import build_charts_for_request
+        specs, err = build_charts_for_request(
+            conversation_id,
+            request_id,
+            type=str(data.get("type") or "line"),
+            x_field=str(data.get("x_field") or ""),
+            y_fields=data.get("y_fields") or [],
+            title=str(data.get("title") or ""),
+        )
+    except Exception as error:
+        return jsonify({"success": False, "error": f"图表生成失败：{error}"}), 200
+    if err:
+        return jsonify({"success": False, "error": err}), 200
+    return jsonify({"success": True, "charts": specs})
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json()
@@ -385,7 +415,7 @@ def chat():
 
             if intent_result.intent == "chat":
                 reply = intent_result.quick_reply or "你好！有什么可以帮你的吗？"
-                session["messages"].append({"role": "user", "content": message})
+                session["messages"].append({"role": "user", "content": message, "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S")})
                 session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "request_id": request_id, "thinking_seconds": round(elapsed_ms(request_timer) / 1000), "status": "chat", "error_message": "", "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S")})
                 _persist_conversation(conversation_id)
                 log_request_end(
@@ -411,7 +441,7 @@ def chat():
 
         # 本轮先占位落盘：用户提问 + "处理中"占位回答立即写入 MySQL，
         # 刷新/切换会话不丢失；查询完成后再更新同一轮（round_no 不变），保持"一问一答=一轮"
-        session["messages"].append({"role": "user", "content": message})
+        session["messages"].append({"role": "user", "content": message, "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S")})
         session["messages"].append({
             "role": "assistant", "content": "", "sql": "", "thinking": "",
             "dialogue_id": 0, "evaluator": None, "llm_tokens": {},
@@ -601,6 +631,7 @@ def chat():
                 "evaluator": evaluator_payload,
                 "dialogue_id": dialogue_id,
                 "llm_tokens": llm_tokens,
+                "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
             })
         except Exception as error:
             error_id = uuid.uuid4().hex
@@ -667,6 +698,7 @@ def chat():
                 "text": QUERY_SAFE_ERROR_MESSAGE,
                 "error_code": QUERY_ERROR_CODE,
                 "error_id": error_id,
+                "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
             })
         finally:
             reset_log_context(worker_token)

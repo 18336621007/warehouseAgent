@@ -220,6 +220,7 @@ function createPendingRequest() {
     return {
         thinking: "", status: "AI 正在思考...",
         content: "", sql: "", evaluator: null, dialogue_id: 0, request_id: "",
+        request_at: "",  // 本轮消息发送时间（随 MySQL 落盘）
         thinkingOpen: true,  // 思考面板默认展开，用户折叠/展开后保持
         thinkingParts: [],  // 思考按流式段落存储（sid -> 文本），支持最终回复回收
         answerQueue: [],  // 最终回答重放 token 的打字机队列
@@ -304,6 +305,8 @@ async function pollActive(convId) {
     pend.status = data.status || pend.status;
     pend.content = data.content || "";
     pend.contextProgress = data.context || pend.contextProgress;
+    // 恢复进行中请求时补消息时间（只补一次，避免轮询反复刷新）
+    if (!pend.request_at) pend.request_at = data.request_at || fmtNow();
     // 完成态：停止轮询并重载（拿到落盘的最终答案）
     if (data.status === "done" || data.status === "error") {
         stopPollingActive(convId);
@@ -347,8 +350,10 @@ async function sendMsg() {
     pendingRequests[reqConv] = createPendingRequest();
     lockInput(true);
     hideEmpty();
-    appendMessage("user", msg);
-    if (conv) conv.messages.push({ role: "user", content: msg });
+    var userMsgObj = { role: "user", content: msg, request_at: fmtNow() };
+    appendMessage("user", msg, "", "", null, 0, "", undefined, userMsgObj);
+    if (conv) conv.messages.push(userMsgObj);
+    pendingRequests[reqConv].request_at = userMsgObj.request_at;
     appendPendingMessage(reqConv);
 
     console.log("[sendMsg] user=" + msg.slice(0, 60) + " conversation=" + reqConv);
@@ -465,6 +470,7 @@ async function sendMsg() {
                         pend.evaluator = event.evaluator;
                         pend.dialogue_id = event.dialogue_id || 0;
                         pend.llmTokens = event.llm_tokens || null;
+                        if (event.request_at) pend.request_at = event.request_at;
                     } else if (event.type === "error") {
                         pend.doneReceived = true;
                         if (pend.thinkTimer) stopThinkTimer(pend);
@@ -473,6 +479,7 @@ async function sendMsg() {
                             ? "\n错误编号：" + event.error_id
                             : "";
                         pend.content = event.text + errorIdText;
+                        if (event.request_at) pend.request_at = event.request_at;
                         console.log(
                             "[sendMsg] request failed, error_id="
                             + (event.error_id || "")
@@ -512,6 +519,7 @@ function finalizePendingRequest(convId, pend) {
         request_id: pend.request_id, thinkingOpen: pend.thinkingOpen,
         thinkingSeconds: pend.thinkingSeconds || 0,
         llm_tokens: pend.llmTokens || null,
+        request_at: pend.request_at || "",
     };
     if (conv) conv.messages.push(savedMsg);
     delete pendingRequests[convId];
@@ -690,7 +698,7 @@ function updatePendingMessage(convId) {
     }
     var answerEl = wrapper.querySelector(".pending-answer");
     if (answerEl) {
-        answerEl.innerHTML = formatContent(pend.content);
+        answerEl.innerHTML = formatContent(pend.content, true);
         answerEl.style.display = pend.content ? "block" : "none";
     }
     // 思考按钮：计时中显示"思考中 Xs"，结束后定格"查看思考过程（Xs）"
@@ -756,6 +764,31 @@ function fmtNum(n) {
     var v = Number(n);
     if (isNaN(v)) return String(n == null ? "0" : n);
     return v.toLocaleString("en-US");
+}
+
+function fmtNow() {
+    // 本地当前时间字符串 YYYY-MM-DD HH:MM:SS，用于消息气泡时间显示
+    var d = new Date();
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+        + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function fmtMsgTime(ts) {
+    // 消息时间显示：兼容 "YYYY-MM-DD HH:MM:SS" / ISO 格式，无则返回空
+    if (!ts) return "";
+    var s = String(ts).replace("T", " ").replace(/\.\d+Z?$/, "").replace("Z", "");
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(s)) return s.slice(0, 16);
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return "";
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+        + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+function hasChartBlock(content) {
+    // 判断回答中是否已包含 ```chart 图表指令块（有则不再显示生成按钮）
+    return /```\s*chart/i.test(String(content || ""));
 }
 
 function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requestId, thinkingOpen, msgObj) {
@@ -860,11 +893,77 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         bubble.appendChild(scoreArea);
     }
 
+    // 生成图表按钮（仿豆包）：回答未含图表且该轮有可用落盘结果时展示，
+    // 点击后由后端按落盘结果自动生成图表，格式与 make_chart 工具完全一致
+    // 纯闲聊（chat）/失败（failed）无查询结果，不显示生成按钮
+    if (role === "assistant" && requestId && !emptyReply
+            && !hasChartBlock(content)
+            && (!msgObj || (msgObj.status !== "failed" && msgObj.status !== "chat"))) {
+        var genBtn = document.createElement("button");
+        genBtn.className = "chart-gen-btn";
+        genBtn.type = "button";
+        genBtn.textContent = "📊 生成图表";
+        genBtn.title = "基于本次查询结果生成图表";
+        genBtn.onclick = async function () {
+            if (genBtn.disabled) return;
+            genBtn.disabled = true;
+            genBtn.textContent = "⏳ 图表生成中…";
+            try {
+                var resp = await fetch(API + "/chart", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        conversation_id: conversationId,
+                        request_id: requestId,
+                        type: "line",
+                    }),
+                });
+                var data = await resp.json();
+                if (!data.success || !data.charts || !data.charts.length) {
+                    genBtn.disabled = false;
+                    genBtn.textContent = "📊 生成图表";
+                    var errEl = document.createElement("div");
+                    errEl.className = "chart-gen-error";
+                    errEl.textContent = data.error || "暂无可用数据生成图表";
+                    bubble.appendChild(errEl);
+                    return;
+                }
+                // 生成成功：按钮替换为图表，渲染后可点类型切换折线/柱状/饼图
+                genBtn.remove();
+                data.charts.forEach(function (spec) {
+                    var box = document.createElement("div");
+                    box.className = "chart-box";
+                    // 用 DOM 属性设置原始 JSON：不能再做 &quot; 实体替换，
+                    // 否则 dataset 读到的是字面 &quot;，JSON.parse 失败回退成原始 JSON 文本
+                    box.setAttribute("data-chart", JSON.stringify(spec));
+                    bubble.appendChild(box);
+                });
+                renderCharts(bubble);
+                // 把新图表滚动到视野内（不跳转到最新消息，保持用户所在位置）
+                var firstChart = bubble.querySelector(".chart-box");
+                if (firstChart) firstChart.scrollIntoView({ behavior: "smooth", block: "nearest" });
+            } catch (e) {
+                genBtn.disabled = false;
+                genBtn.textContent = "📊 生成图表";
+            }
+        };
+        bubble.appendChild(genBtn);
+    }
+
+    // 消息发送时间：从消息记录读取 request_at（随 MySQL 落盘），无则省略
+    if (msgObj && msgObj.request_at) {
+        var tEl = document.createElement("div");
+        tEl.className = "msg-time";
+        tEl.textContent = fmtMsgTime(msgObj.request_at);
+        bubble.appendChild(tEl);
+    }
+
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
     area.appendChild(wrapper); scrollToBottom(area, true);
+    renderCharts(bubble);
 }
 
-function formatContent(text) {
+function formatContent(text, streaming) {
     // 极简 Markdown 渲染（安全：先转义 HTML 防注入，再按块解析）
     // 支持：代码块 / 标题 / 引用 / 列表 / 表格 / 段落 + 行内粗体斜体代码
     if (!text) return "";
@@ -883,11 +982,28 @@ function formatContent(text) {
     function flushTable() { if (inTable) { html += "</table>"; inTable = false; } }
     while (i < lines.length) {
         var line = lines[i];
-        if (/^```/.test(line)) { // 代码块
+        if (/^```/.test(line)) { // 代码块（含 ```chart 图表指令块）
             flushPara(); flushList(); flushTable();
+            var lang = line.replace(/^```\s*/, "").trim(); // 提取语言标记，如 chart
             var buf = []; i++;
             while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
             i++;
+            if (lang === "chart") {
+                // 图表指令块：数据必须来自 execute_query 真实结果，流式中先显示占位，完成后由 renderCharts 渲染
+                var chartRaw = buf.join("\n");
+                if (streaming) {
+                    html += '<div class="chart-box chart-pending"><span>📊 图表生成中…</span></div>';
+                } else {
+                    var chartJson = null;
+                    try { chartJson = JSON.stringify(JSON.parse(chartRaw.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">"))); } catch (e2) { chartJson = null; }
+                    if (chartJson) {
+                        html += '<div class="chart-box" data-chart="' + chartJson.replace(/"/g, "&quot;") + '"></div>';
+                    } else {
+                        html += "<pre><code>" + buf.join("\n") + "</code></pre>";
+                    }
+                }
+                continue;
+            }
             html += "<pre><code>" + buf.join("\n") + "</code></pre>";
             continue;
         }
@@ -937,6 +1053,171 @@ function formatContent(text) {
     flushPara(); flushList(); flushTable();
     return html;
 }
+
+function renderCharts(root) {
+    // 扫描并渲染图表块：数据来自 execute_query 真实结果，仅渲染一次，避免流式反复重建
+    if (!root || typeof window.echarts === "undefined") {
+        // ECharts 未加载时回退展示原始 JSON，保证内容可见
+        if (root) root.querySelectorAll(".chart-box[data-chart]").forEach(function (el) {
+            var txt = el.dataset.chart || "";
+            try { txt = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {}
+            el.innerHTML = "<pre style=\"margin:0;white-space:pre-wrap;font-size:12px;color:#ACACBE\">" + txt.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</pre>";
+        });
+        return;
+    }
+    root.querySelectorAll(".chart-box[data-chart]").forEach(function (el) {
+        if (el._chartRendered) return;
+        try {
+            var spec = JSON.parse(el.dataset.chart || "null");
+            if (!spec || !spec.type) throw new Error("bad chart spec");
+            var opt = buildChartOption(spec);
+            // 数据为空兜底：不渲染空白图，回退展示原始 JSON，避免"看不到图表"
+            var hasData = (opt.series || []).some(function (s) { return s.data && s.data.length; });
+            if (!hasData) throw new Error("empty chart data");
+            ensureChartToolbar(el, spec);
+            var chart = echarts.init(el);
+            chart.setOption(opt);
+            el._chart = chart;
+            el._chartSpec = spec;
+            el._chartRendered = true;
+        } catch (e) {
+            // 解析/渲染失败或数据为空：回退展示原始 JSON，不显示空白图表框
+            el.innerHTML = "<pre style=\"margin:0;white-space:pre-wrap;font-size:12px;color:#ACACBE\">" + (el.dataset.chart || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</pre>";
+        }
+    });
+}
+
+function ensureChartToolbar(el, spec) {
+    // 图表上方类型切换工具栏：折线/柱状/面积/饼图，用户点击后按原 spec 重新渲染
+    var prev = el.previousElementSibling;
+    if (prev && prev.classList && prev.classList.contains("chart-toolbar")) return;
+    var bar = document.createElement("div");
+    bar.className = "chart-toolbar";
+    var types = [["line", "折线图"], ["bar", "柱状图"], ["area", "面积图"], ["pie", "饼图"]];
+    types.forEach(function (t) {
+        var b = document.createElement("button");
+        b.className = "chart-type-btn";
+        b.dataset.type = t[0];
+        b.textContent = t[1];
+        b.onclick = function () {
+            if (!el._chart) return;
+            bar.querySelectorAll(".chart-type-btn").forEach(function (x) { x.classList.toggle("active", x === b); });
+            // notMerge 全量替换，line/bar/area/pie 结构差异由 buildChartOption 统一处理
+            el._chart.setOption(buildChartOption(spec, t[0]), true);
+        };
+        bar.appendChild(b);
+    });
+    el.parentNode.insertBefore(bar, el);
+    var def = spec.type || "bar";
+    bar.querySelectorAll(".chart-type-btn").forEach(function (b) { b.classList.toggle("active", b.dataset.type === def); });
+}
+
+function normalizeChartData(spec) {
+    // 统一各输入格式为 { categories, seriesList:[{name,values}], xName, yName }
+    // 支持：xAxis(数组)+series / xField+yField / xField+yFields / pie(nameField,valueField)
+    // 兼容 xAxis/yAxis 为对象（{field,name}）或字符串 的写法，避免 LLM 输出差异导致空白图
+    var xField = spec.xField;
+    var yField = spec.yField;
+    var xName = spec.xName || spec.xAxisName || "";
+    var yName = spec.yName || spec.yAxisName || "";
+    if (spec.xAxis && typeof spec.xAxis === "object" && !Array.isArray(spec.xAxis)) {
+        xField = spec.xAxis.field || xField;
+        xName = spec.xAxis.name || xName;
+    } else if (typeof spec.xAxis === "string") {
+        xField = spec.xAxis;
+    }
+    if (spec.yAxis && typeof spec.yAxis === "object" && !Array.isArray(spec.yAxis)) {
+        yField = spec.yAxis.field || yField;
+        yName = spec.yAxis.name || yName;
+    } else if (typeof spec.yAxis === "string") {
+        yField = spec.yAxis;
+    }
+    var categories = Array.isArray(spec.xAxis) ? spec.xAxis.slice() : [];
+    var seriesList = (spec.series || []).map(function (s) {
+        return { name: s.name || "", values: s.data || [] };
+    });
+    if (!seriesList.length && Array.isArray(spec.data) && spec.data.length) {
+        // 多序列：yField/yFields 均可能为数组（兼容 LLM 两种写法）
+        var yFieldList = Array.isArray(spec.yField) ? spec.yField : (Array.isArray(spec.yFields) ? spec.yFields : null);
+        if (xField && yFieldList) {
+            categories = spec.data.map(function (d) { return d[xField]; });
+            seriesList = yFieldList.map(function (f) { return { name: f, values: spec.data.map(function (d) { return d[f]; }) }; });
+        } else if (xField && yField) {
+            categories = spec.data.map(function (d) { return d[xField]; });
+            seriesList = [{ name: spec.seriesName || yName || yField, values: spec.data.map(function (d) { return d[yField]; }) }];
+        } else if (spec.nameField && spec.valueField) {
+            // 扁平饼图：nameField/valueField
+            categories = spec.data.map(function (d) { return d[spec.nameField]; });
+            seriesList = [{ name: spec.seriesName || spec.name || "占比", values: spec.data.map(function (d) { return d[spec.valueField]; }) }];
+        }
+    }
+    // series 数据为 {name,value} 对象数组（标准饼图）时归一化为 categories + values
+    if (!categories.length && seriesList.length === 1 && seriesList[0].values.length && typeof seriesList[0].values[0] === "object") {
+        categories = seriesList[0].values.map(function (v) { return v.name; });
+        seriesList[0].values = seriesList[0].values.map(function (v) { return v.value; });
+    }
+    return {
+        categories: categories,
+        seriesList: seriesList,
+        xName: xName || xField || "",
+        yName: yName || yField || "",
+    };
+}
+
+function buildChartOption(spec, type) {
+    // 把 LLM 输出的简单图表描述转成 ECharts option（深色主题适配当前界面）
+    // type 可覆盖 spec.type，用于类型切换工具栏实时换图
+    var dark = { text: "#ECECF1", sub: "#9A9AAC", line: "#7A7A8A", split: "#3A3A44" };
+    type = type || spec.type || "bar";
+    var norm = normalizeChartData(spec);
+    var categories = norm.categories;
+    var seriesList = norm.seriesList;
+    if (!seriesList.length) seriesList = [{ name: "", values: [] }];
+    var opt = {
+        backgroundColor: "transparent",
+        color: ["#10A37F", "#4E8CF0", "#F0C040", "#E46C6C", "#8A6CF0", "#3EC6E0"],
+        title: spec.title ? { text: spec.title, left: "center", top: 4, textStyle: { color: dark.text, fontSize: 14 } } : undefined,
+        tooltip: { trigger: type === "pie" ? "item" : "axis" },
+        textStyle: { color: dark.text },
+        grid: { left: norm.yName ? 64 : 48, right: 24, top: spec.title ? 44 : 24, bottom: norm.xName ? 44 : 36 },
+    };
+    if (type === "pie") {
+        opt.series = seriesList.map(function (s) {
+            return {
+                name: s.name, type: "pie", radius: ["0%", "60%"], center: ["42%", "50%"],
+                data: categories.map(function (c, i) { return { name: c, value: s.values[i] }; }),
+                avoidLabelOverlap: true,
+                label: { color: dark.text, fontSize: 11, formatter: "{b}: {d}%" },
+                labelLine: { length: 10, length2: 8, lineStyle: { color: dark.sub } },
+                itemStyle: { borderColor: "#212121", borderWidth: 1 }
+            };
+        });
+        // 图例放右侧避免遮挡饼图底部与标签
+        opt.legend = { orient: "vertical", right: 4, top: "middle", itemWidth: 10, itemHeight: 10, textStyle: { color: dark.sub, fontSize: 11 } };
+    } else {
+        opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
+        opt.yAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+        opt.series = seriesList.map(function (s) {
+            var item = { name: s.name, type: type === "area" ? "line" : type, data: s.values };
+            if (type === "line" || type === "area") { item.smooth = true; item.lineStyle = { width: 2 }; }
+            if (type === "area") { item.areaStyle = {}; }
+            if (type === "bar") { item.barMaxWidth = 40; }
+            return item;
+        });
+        // 0 参考线：数据存在负值时在 y=0 画一条醒目的横线，便于观测正负
+        var hasNegative = seriesList.some(function (s) {
+            return (s.values || []).some(function (v) { return typeof v === "number" && v < 0; });
+        });
+        if (hasNegative) {
+            opt.series.forEach(function (item) {
+                item.markLine = { silent: true, symbol: "none", lineStyle: { color: "#F0C040", width: 1.2 }, label: { show: false }, data: [{ yAxis: 0 }] };
+            });
+        }
+        opt.legend = { top: 0, right: 8, textStyle: { color: dark.sub } };
+    }
+    return opt;
+}
+
 
 
 function openNameOverlay() {
