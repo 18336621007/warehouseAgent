@@ -19,6 +19,26 @@ var resuming = {};
 function $(id) { return document.getElementById(id); }
 function hideEmpty() { var el = $("emptyState"); if (el) el.style.display = "none"; }
 
+function scrollToBottom(el, force) {
+    // 高频滚动合并：逐字流式一帧只滚一次，避免 smooth 动画反复打断造成抖动/滞后
+    if (!el) return;
+    if (!force && el._userScrolledUp) return;
+    if (el._scrollRafId) return;
+    el._scrollRafId = requestAnimationFrame(function () {
+        el._scrollRafId = null;
+        el.scrollTop = el.scrollHeight;
+    });
+}
+
+
+function stickBottom(el, prevScrollHeight) {
+    // 流式内容增长时增量跟随：视口原本贴底时，让 scrollTop 随内容高度同步增长，避免换行时先上移再跳回的生硬感
+    if (!el) return;
+    if (el._userScrolledUp) return;
+    var delta = el.scrollHeight - (prevScrollHeight != null ? prevScrollHeight : el.scrollHeight);
+    if (delta > 0) el.scrollTop += delta;
+}
+
 async function newChat() {
     try {
         var res = await fetch(API + "/conversations", {
@@ -645,7 +665,7 @@ function appendPendingMessage(convId) {
         });
     }
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
-    area.appendChild(wrapper); area.scrollTop = area.scrollHeight;
+    area.appendChild(wrapper); scrollToBottom(area, true);
     // 请求未结束且未定格耗时前，启动思考计时
     if (!pend.doneReceived && !pend.thinkingSeconds) startThinkTimer(pend);
 }
@@ -657,13 +677,16 @@ function updatePendingMessage(convId) {
     var wrapper = document.getElementById("pending-msg-" + convId);
     if (!wrapper) return;
     var area = $("chatArea");
+    // 在思考面板与答案更新前记录消息区高度，更新后统一增量跟随，覆盖全部高度增长源
+    var prevAreaH = area.scrollHeight;
     var statusEl = wrapper.querySelector(".pending-status");
     if (statusEl) statusEl.textContent = pend.status;
     var thinkEl = wrapper.querySelector(".pending-thinking");
     if (thinkEl) {
+        var prevThinkH = thinkEl.scrollHeight;
         thinkEl.textContent = pend.thinking;
         // 思考面板：用户未主动上翻时自动滚动到底部，保证始终看到最新内容
-        if (!thinkEl._userScrolledUp) thinkEl.scrollTop = thinkEl.scrollHeight;
+        stickBottom(thinkEl, prevThinkH);
     }
     var answerEl = wrapper.querySelector(".pending-answer");
     if (answerEl) {
@@ -682,7 +705,7 @@ function updatePendingMessage(convId) {
     }
     // 上下文使用进度改由输入框左侧圆环展示（updateContextRing），不再在消息气泡内渲染
     // 消息区：随内容增长自动滚动，用户上翻历史时保持不动
-    if (area && !area._userScrolledUp) area.scrollTop = area.scrollHeight;
+    stickBottom(area, prevAreaH);
 }
 
 function setRing(pct) {
@@ -838,7 +861,7 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
     }
 
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
-    area.appendChild(wrapper); area.scrollTop = area.scrollHeight;
+    area.appendChild(wrapper); scrollToBottom(area, true);
 }
 
 function formatContent(text) {

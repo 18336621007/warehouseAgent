@@ -38,6 +38,7 @@ from agentTest.metadata.mysql_store import update_user_score
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app)
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # 前端静态文件禁用长缓存，改代码后刷新即可生效
 
 print("[server] loading LangGraph runtime...")
 RUNTIME = build_graph_runtime()
