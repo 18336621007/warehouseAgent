@@ -915,7 +915,8 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
                     body: JSON.stringify({
                         conversation_id: conversationId,
                         request_id: requestId,
-                        type: "line",
+                        // auto：由后端按数据形态+查询意图自动挑选图表类型（占比→pie/趋势→line/对比→bar）
+                        type: "auto",
                     }),
                 });
                 var data = await resp.json();
@@ -1074,7 +1075,6 @@ function renderCharts(root) {
             // 数据为空兜底：不渲染空白图，回退展示原始 JSON，避免"看不到图表"
             var hasData = (opt.series || []).some(function (s) { return s.data && s.data.length; });
             if (!hasData) throw new Error("empty chart data");
-            ensureChartToolbar(el, spec);
             var chart = echarts.init(el);
             chart.setOption(opt);
             el._chart = chart;
@@ -1085,31 +1085,6 @@ function renderCharts(root) {
             el.innerHTML = "<pre style=\"margin:0;white-space:pre-wrap;font-size:12px;color:#ACACBE\">" + (el.dataset.chart || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</pre>";
         }
     });
-}
-
-function ensureChartToolbar(el, spec) {
-    // 图表上方类型切换工具栏：折线/柱状/面积/饼图，用户点击后按原 spec 重新渲染
-    var prev = el.previousElementSibling;
-    if (prev && prev.classList && prev.classList.contains("chart-toolbar")) return;
-    var bar = document.createElement("div");
-    bar.className = "chart-toolbar";
-    var types = [["line", "折线图"], ["bar", "柱状图"], ["area", "面积图"], ["pie", "饼图"]];
-    types.forEach(function (t) {
-        var b = document.createElement("button");
-        b.className = "chart-type-btn";
-        b.dataset.type = t[0];
-        b.textContent = t[1];
-        b.onclick = function () {
-            if (!el._chart) return;
-            bar.querySelectorAll(".chart-type-btn").forEach(function (x) { x.classList.toggle("active", x === b); });
-            // notMerge 全量替换，line/bar/area/pie 结构差异由 buildChartOption 统一处理
-            el._chart.setOption(buildChartOption(spec, t[0]), true);
-        };
-        bar.appendChild(b);
-    });
-    el.parentNode.insertBefore(bar, el);
-    var def = spec.type || "bar";
-    bar.querySelectorAll(".chart-type-btn").forEach(function (b) { b.classList.toggle("active", b.dataset.type === def); });
 }
 
 function normalizeChartData(spec) {
@@ -1164,9 +1139,29 @@ function normalizeChartData(spec) {
     };
 }
 
+function buildPieData(categories, values) {
+    // 饼图数据预处理：数值化并过滤非正值；扇区过多时只保留最大的前 N-1 个，
+    // 其余合并为“其他”，避免几十个扇区导致标签相互重叠（沿用业界常见做法）
+    var items = [];
+    categories.forEach(function (c, i) {
+        var v = Number(values[i]);
+        if (!isNaN(v) && v > 0) items.push({ name: c, value: v });
+    });
+    items.sort(function (a, b) { return b.value - a.value; });
+    var MAX_SLICES = 8;
+    if (items.length > MAX_SLICES) {
+        var keep = items.slice(0, MAX_SLICES - 1);
+        var rest = items.slice(MAX_SLICES - 1);
+        var restSum = rest.reduce(function (acc, x) { return acc + x.value; }, 0);
+        keep.push({ name: "其他", value: restSum });
+        items = keep;
+    }
+    return items;
+}
+
 function buildChartOption(spec, type) {
     // 把 LLM 输出的简单图表描述转成 ECharts option（深色主题适配当前界面）
-    // type 可覆盖 spec.type，用于类型切换工具栏实时换图
+    // type 缺省时用 spec.type（图表类型已由 AI 决定，不再提供用户切换）
     var dark = { text: "#ECECF1", sub: "#9A9AAC", line: "#7A7A8A", split: "#3A3A44" };
     type = type || spec.type || "bar";
     var norm = normalizeChartData(spec);
@@ -1185,15 +1180,16 @@ function buildChartOption(spec, type) {
         opt.series = seriesList.map(function (s) {
             return {
                 name: s.name, type: "pie", radius: ["0%", "60%"], center: ["42%", "50%"],
-                data: categories.map(function (c, i) { return { name: c, value: s.values[i] }; }),
+                data: buildPieData(categories, s.values),
+                minAngle: 2,
                 avoidLabelOverlap: true,
                 label: { color: dark.text, fontSize: 11, formatter: "{b}: {d}%" },
                 labelLine: { length: 10, length2: 8, lineStyle: { color: dark.sub } },
                 itemStyle: { borderColor: "#212121", borderWidth: 1 }
             };
         });
-        // 图例放右侧避免遮挡饼图底部与标签
-        opt.legend = { orient: "vertical", right: 4, top: "middle", itemWidth: 10, itemHeight: 10, textStyle: { color: dark.sub, fontSize: 11 } };
+        // 图例放右侧避免遮挡饼图底部与标签，扇区多时可滚动
+        opt.legend = { orient: "vertical", right: 4, top: "middle", type: "scroll", itemWidth: 10, itemHeight: 10, textStyle: { color: dark.sub, fontSize: 11 } };
     } else {
         opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
         opt.yAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };

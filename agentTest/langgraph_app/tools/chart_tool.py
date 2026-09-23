@@ -63,6 +63,22 @@ def _is_date_like(columns, rows, col):
     return False
 
 
+def _auto_chart_type(columns: list, rows: list, effective_query: str = "") -> str:
+    """按数据形态与查询意图自动挑选图表类型（前端『生成图表』按钮用）。
+
+    时间序列 → line（趋势）；问题含占比/构成 → pie；对比/排行 → bar；
+    其余：类别数少用 bar，类别多/连续用 line。返回 _ALLOWED_TYPES 之一。
+    """
+    x, _ = detect_chart_fields(columns, rows)
+    if x and _is_date_like(columns, rows, x):
+        return "line"
+    q = str(effective_query or "")
+    if any(k in q for k in ("占比", "比例", "份额", "构成", "分布", "结构")):
+        return "pie"
+    # 非时间序列（分类维度）默认柱状图即可（对比/排行/多类别都适合）
+    return "bar"
+
+
 def detect_chart_fields(columns: list, rows: list) -> tuple:
     """自动挑选 x 轴（优先日期列，其次首个非数值列）与 y 轴（数值列）。
 
@@ -161,10 +177,14 @@ def build_charts_for_request(conversation_id: str, request_id: str, type: str = 
         if not data:
             continue
         rows = list(data.get("rows") or [])
+        # type 缺省或 "auto" 时按数据形态/查询意图自动挑选（占比→pie、趋势→line、对比→bar）
+        per_type = type if type and type != "auto" else _auto_chart_type(
+            [str(c) for c in (e.get("columns") or [])], rows, e.get("effective_query") or "",
+        )
         per_title = title
         if multiple:
             per_title = (title + " · " if title else "") + f"第{e.get('round_no')}段"
-        spec, err = build_chart_spec(e, rows, type, x_field, y_fields or [], per_title, "", "")
+        spec, err = build_chart_spec(e, rows, per_type, x_field, y_fields or [], per_title, "", "")
         if spec:
             specs.append(spec)
     if not specs:
