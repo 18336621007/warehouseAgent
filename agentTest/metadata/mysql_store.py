@@ -349,13 +349,10 @@ def load_enriched_databases():
             )
             rows = cursor.fetchall()
 
-        allowed_dbs = set(get_allowed_databases())
+        # 白名单已取消：底层数据库账号（Doris/Trino/Hive）能访问即可，这里不再按库过滤
         result = {}
         for row in rows:
             db_name = row[0]
-            # 白名单过滤：已移出接入范围的库不进入运行时与索引
-            if db_name not in allowed_dbs:
-                continue
             result[db_name] = {
                 "domain": row[1] or "",
                 "full_table_list": json.loads(row[2]) if row[2] else [],

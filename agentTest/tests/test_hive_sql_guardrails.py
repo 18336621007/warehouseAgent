@@ -16,9 +16,9 @@ hive_sql_guardrail_cases = {
         "sql": "select * from test.agent_order_demo",
         "expected_valid": False,
     },
-    "非白名单库": {
+    "非白名单库（白名单已取消）": {
         "sql": "select * from prod.order_info limit 10",
-        "expected_valid": False,
+        "expected_valid": True,
     },
     "包含 JOIN": {
         "sql": "select * from test.agent_order_demo a join test.user_demo b on a.user_id = b.user_id limit 10",

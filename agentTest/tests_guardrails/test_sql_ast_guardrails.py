@@ -1,5 +1,5 @@
 ﻿# 该文件用于测试基于 SQL AST 的 Hive Guardrails 规则，确保白名单、LIMIT、分区条件等限制真实生效。
-from agentTest.db.hive_guardrails import ALLOWED_TABLES
+from agentTest.db.hive_guardrails import is_table_allowed
 from agentTest.db.hive_guardrails import PARTITION_FIELDS
 from agentTest.db.sql_ast_guardrails import validate_sql_ast_guardrails
 
@@ -36,7 +36,7 @@ sql_ast_guardrails_cases = {
         "expected_valid": False,
         "expected_message_keyword": "select *",
     },
-    "非白名单表": {
+    "非白名单表（白名单已取消，缺分区仍失败）": {
         "sql": """
         select order_id
         from some_other_table
@@ -44,7 +44,7 @@ sql_ast_guardrails_cases = {
         limit 10
         """,
         "expected_valid": False,
-        "expected_message_keyword": "白名单",
+        "expected_message_keyword": "时间",
     },
     "缺少时间分区条件": {
         "sql": """
@@ -78,7 +78,7 @@ def run_sql_ast_guardrails_tests():
 
         actual_valid, message = validate_sql_ast_guardrails(
             sql=sql,
-            allowed_tables=ALLOWED_TABLES,
+            allow_table_fn=is_table_allowed,
             partition_fields=PARTITION_FIELDS,
         )
         print(f"校验结果: valid={actual_valid}, message={message}")

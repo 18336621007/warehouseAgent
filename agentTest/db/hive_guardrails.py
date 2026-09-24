@@ -38,10 +38,9 @@ QUERY_TIMEOUT_SECONDS = 30
 from agentTest.db.sql_ast_guardrails import validate_sql_ast_guardrails
 
 def is_table_allowed(table_name: str, database_name: str = "") -> bool:
-    # 统一接入范围判定：配置白名单（metadata_scope）
-    if not database_name:
-        return _scope_is_allowed_table(table_name, "")
-    return _scope_is_allowed_table(table_name, database_name)
+    # 取消白名单：SQL 访问权限交由底层数据库账号控制（Doris/Trino/Hive 账号能访问即可）
+    # 仍保留只读 / LIMIT / select* / 分区过滤等安全规则；白名单判定统一放行
+    return True
 
 
 def validate_sql_with_guardrails(sql: str, partition_fields: list[str] | None = None):

@@ -7,6 +7,7 @@ import json
 import shutil
 import threading
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from agentTest.config.advisor import (
@@ -39,12 +40,23 @@ def _load_json(path: Path):
     return None
 
 
+def _to_jsonable(obj):
+    """把非 JSON 原生类型（Decimal/日期等）转成可序列化对象，避免 json.dump 半路失败留下截断文件。"""
+    if isinstance(obj, Decimal):
+        # 金额类 Decimal 转 float 足够展示；如后续需要更高精度可改字符串
+        return float(obj)
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
+
 def _dump_json(path: Path, data) -> bool:
     """写 JSON，失败返回 False（落盘不影响主流程）。"""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
+            # default 兜底：Decimal/日期等先转可序列化，避免写一半抛异常导致 JSON 截断
+            json.dump(data, f, ensure_ascii=False, indent=1, default=_to_jsonable)
         return True
     except Exception:
         return False

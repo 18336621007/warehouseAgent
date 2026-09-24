@@ -53,7 +53,7 @@ tool_guardrails_cases = {
         "expected_success": False,
         "expected_message_keyword": "select *",
     },
-    "非白名单表会被拦截": {
+    "非白名单表不再被拦截（缺分区仍失败）": {
         "sql": """
         select order_id
         from some_other_table
@@ -61,7 +61,7 @@ tool_guardrails_cases = {
         limit 10
         """,
         "expected_success": False,
-        "expected_message_keyword": "白名单",
+        "expected_message_keyword": "时间",
     },
     "缺少时间条件会被拦截": {
         "sql": """

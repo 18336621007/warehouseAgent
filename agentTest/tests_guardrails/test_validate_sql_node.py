@@ -38,7 +38,7 @@ validate_sql_node_cases = {
         "expected_sql_valid": False,
         "expected_error_keyword": "select *",
     },
-    "非白名单表会失败": {
+    "非白名单表不再被拦截（缺分区仍失败）": {
         "state": {
             "generated_sql": """
             select order_id
@@ -48,7 +48,7 @@ validate_sql_node_cases = {
             """
         },
         "expected_sql_valid": False,
-        "expected_error_keyword": "白名单",
+        "expected_error_keyword": "时间",
     },
     "缺少时间条件会失败": {
         "state": {

@@ -15,6 +15,16 @@ var pendingRequests = {};
 // 刷新/切回后的进行中请求恢复：轮询定时器与重入保护（conversationId -> 标志）
 var activePollers = {};
 var resuming = {};
+// 左侧会话列表的进行中状态：conversation_id -> { active, last_status, pendingDone }
+// pendingDone 表示该会话已完成但用户尚未点击查看，用绿色小圆点提示
+var convActivity = {};
+var _convPolling = false; // 会话状态轮询是否正在执行，避免并发重叠
+
+function persistCurrentConversation() {
+    // 切换/新建/删除会话时记录当前会话到 localStorage，刷新后恢复用户原本所在会话
+    if (conversationId) localStorage.setItem("currentConvId", conversationId);
+    else localStorage.removeItem("currentConvId");
+}
 
 function $(id) { return document.getElementById(id); }
 function hideEmpty() { var el = $("emptyState"); if (el) el.style.display = "none"; }
@@ -49,6 +59,7 @@ async function newChat() {
         var data = await res.json();
         if (data.creator) creator = data.creator;
         conversationId = data.conversation_id;
+        persistCurrentConversation();
         conversations[conversationId] = { title: "新对话", creator: creator, messages: [], _loadedFromServer: true };
         $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         refreshConvList();
@@ -60,25 +71,28 @@ async function newChat() {
 
 async function loadConversation(conversationIdToLoad, opts) {
     conversationId = conversationIdToLoad;
+    persistCurrentConversation();
+    // 点击进入会话 → 取消“完成待查看”绿色标记
+    clearConversationDone(conversationIdToLoad);
     var conv = conversations[conversationIdToLoad];
-    // 内存缓存为空（刷新/重启后）时从服务端拉取完整对话（含他人创建的历史）
-    if (!conv || !conv.messages || conv.messages.length === 0) {
-        try {
-            var res = await fetch(API + "/conversations/" + conversationIdToLoad);
-            if (res.ok) {
-                var data = await res.json();
-                conversations[conversationIdToLoad] = {
-                    title: data.title || "新对话",
-                    creator: data.creator || "",
-                    messages: data.messages || [],
-                    // 会话级上下文占用：服务端从 Checkpoint 实时估算，不随消息落库
-                    _context: data.context || null,
-                    _loadedFromServer: true,
-                };
-            }
-        } catch (e) {}
-        conv = conversations[conversationIdToLoad];
-    }
+    // 总是从服务端拉取最新对话：飞书/后台会话可能在当前页面之外追加了新的
+    // 进行中或最终消息，仅命中本地缓存会导致必须手动刷新才能看到新内容。
+    try {
+        var res = await fetch(API + "/conversations/" + conversationIdToLoad);
+        if (res.ok) {
+            var data = await res.json();
+            conversations[conversationIdToLoad] = {
+                title: data.title || "新对话",
+                creator: data.creator || "",
+                messages: data.messages || [],
+                // 会话级上下文占用：服务端从 Checkpoint 实时估算，不随消息落库
+                _context: data.context || null,
+                _loadedFromServer: true,
+            };
+        }
+    } catch (e) {}
+    // 服务端拉取失败时退回本地缓存，避免整个页面不可用
+    conv = conversations[conversationIdToLoad];
     // 等待拉取期间用户已切到其他会话：丢弃过期加载，避免用旧会话覆盖当前界面与上下文圆环
     if (conversationId !== conversationIdToLoad) return;
     var area = $("chatArea");
@@ -141,11 +155,71 @@ async function deleteConv(conversationIdToDelete, event) {
         delete conversations[conversationIdToDelete];
         if (conversationId === conversationIdToDelete) {
             conversationId = null;
+            persistCurrentConversation();
             $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
         }
         refreshConvList();
         updateInputLock();
     } catch (e) {}
+}
+
+function computeConvStatus(c) {
+    // 合并服务端 active/last_status 与本地的 pendingDone 标记
+    var prev = convActivity[c.conversation_id] || { active: false, last_status: "", pendingDone: false };
+    var activeNow = !!c.active;
+    var lastStatusNow = c.last_status || "";
+    var pendingDone = prev.pendingDone || false;
+    if (!activeNow && prev.active && (lastStatusNow === "success" || lastStatusNow === "chat")) {
+        // 上一轮还在处理、这一轮已完成且是成功/普通聊天 → 显示绿色待查看标记
+        pendingDone = true;
+    }
+    if (activeNow) pendingDone = false; // 仍在处理中：保留加载图标，不显示绿色
+    if (!prev.active && activeNow) pendingDone = false; // 刚开始处理：也不显示绿色
+    convActivity[c.conversation_id] = { active: activeNow, last_status: lastStatusNow, pendingDone: pendingDone };
+    return { active: activeNow, pendingDone: pendingDone };
+}
+
+function renderConvStatus(div, status) {
+    // 更新某个会话条目的状态标记：处理中=加载圈，完成未点击=绿色圆点
+    var old = div.querySelector(".conv-status");
+    if (old) old.remove();
+    var el = document.createElement("span");
+    el.className = "conv-status";
+    if (status.active) {
+        el.classList.add("spinner");
+        el.title = "处理中...";
+    } else if (status.pendingDone) {
+        el.classList.add("done");
+        el.title = "查询已完成，点击查看";
+    } else {
+        return;
+    }
+    div.insertBefore(el, div.firstChild);
+}
+
+function clearConversationDone(convId) {
+    // 用户点击进入某会话（或该会话在当前页内已完成自动刷新）时，取消绿色待查看标记
+    if (convActivity[convId]) {
+        convActivity[convId].pendingDone = false;
+        var div = document.querySelector(".conv-item[data-conv-id=\"" + convId + "\"]");
+        if (div) renderConvStatus(div, { active: !!convActivity[convId].active, pendingDone: false });
+    }
+}
+
+async function pollConvActivity() {
+    // 定时轮询会话列表：动态刷新左侧状态图标（处理中/完成待查看），不整表重建避免打断操作
+    if (_convPolling) return;
+    _convPolling = true;
+    try {
+        var res = await fetch(API + "/conversations");
+        var data = await res.json();
+        data.conversations.forEach(function (c) {
+            var status = computeConvStatus(c);
+            var div = document.querySelector(".conv-item[data-conv-id=\"" + c.conversation_id + "\"]");
+            if (div) renderConvStatus(div, status);
+        });
+    } catch (e) {}
+    finally { _convPolling = false; }
 }
 
 async function refreshConvList() {
@@ -158,6 +232,7 @@ async function refreshConvList() {
             conversations[c.conversation_id] = conversations[c.conversation_id] || { title: c.title, creator: c.creator, messages: [] };
             conversations[c.conversation_id].creator = c.creator || "";
             var div = document.createElement("div");
+            div.setAttribute("data-conv-id", c.conversation_id);
             div.className = "conv-item" + (c.conversation_id === conversationId ? " active" : "");
             div.onclick = function () { loadConversation(c.conversation_id); };
 
@@ -198,6 +273,8 @@ async function refreshConvList() {
             actions.appendChild(delBtn);
 
             div.appendChild(actions);
+            // 渲染会话状态图标（处理中/完成待查看），后续由 pollConvActivity 增量更新
+            renderConvStatus(div, computeConvStatus(c));
             list.appendChild(div);
         });
     } catch (e) {}
@@ -526,6 +603,8 @@ function finalizePendingRequest(convId, pend) {
     // 只有当前仍显示发起请求的会话时才更新 DOM 与焦点
     if (conversationId === convId) {
         removePendingMessage(convId);
+        // 当前会话内已完成：取消该会话的绿色待查看标记（用户已看到结果）
+        clearConversationDone(convId);
         console.log("[sendMsg] finalContent=" + (pend.content || "(empty)").slice(0, 100));
         appendMessage("assistant", pend.content || "(无响应)", pend.sql, pend.thinking, pend.evaluator, pend.dialogue_id, pend.request_id, pend.thinkingOpen, savedMsg);
         var inputEl = $("msgInput");
@@ -743,12 +822,12 @@ function updateContextRing(progress, compacted) {
         fg.classList.toggle("warn", pct >= 70 && pct < 90);
         fg.classList.toggle("danger", pct >= 90);
     }
-    var base = "上下文使用 " + pct + "%（" + fmtNum(progress.used_tokens) + " / " + fmtNum(progress.window_tokens) + " tokens）";
+    var base = "上下文使用 " + pct + "%（" + fmtK(progress.used_tokens) + " / " + fmtK(progress.window_tokens) + " tokens）";
     var extra = "";
     if (compacted && compacted.saved_chars) extra = "\n🧹 已压缩，释放 " + fmtNum(compacted.saved_chars) + " 字符";
     wrap.title = base + extra;
     if (tip) {
-        tip.innerHTML = "上下文 " + pct + "%<br>" + fmtNum(progress.used_tokens) + " / " + fmtNum(progress.window_tokens) + " tokens"
+        tip.innerHTML = "上下文 " + pct + "%<br>" + fmtK(progress.used_tokens) + " / " + fmtK(progress.window_tokens) + " tokens"
             + (compacted && compacted.saved_chars ? "<br><span class=\"tip-compacted\">🧹 已压缩，释放 " + fmtNum(compacted.saved_chars) + " 字符</span>" : "");
     }
 }
@@ -764,6 +843,14 @@ function fmtNum(n) {
     var v = Number(n);
     if (isNaN(v)) return String(n == null ? "0" : n);
     return v.toLocaleString("en-US");
+}
+
+function fmtK(n) {
+    // token 数字压缩为 k 单位：>=1000 显示 x.xk（保留 1 位小数），小于 1000 显示原值
+    var v = Number(n);
+    if (isNaN(v)) return String(n == null ? "0" : n);
+    if (Math.abs(v) >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+    return String(Math.round(v));
 }
 
 function fmtNow() {
@@ -847,13 +934,16 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         bubble.appendChild(rid);
     }
 
-    // token 消耗展示：输入/输出/缓存命中/未命中（历史消息从 msgObj 读取）
+    // token 消耗展示：输入/输出/缓存命中率（历史消息从 msgObj 读取）
     if (role === "assistant" && msgObj && msgObj.llm_tokens) {
         var tu = msgObj.llm_tokens;
         var tEl = document.createElement("div");
         tEl.className = "token-usage";
-        tEl.textContent = "⚡️ 输入总Token：" + fmtNum(tu.input_tokens) + " | 输出总Token: " + fmtNum(tu.output_tokens)
-            + " | 缓存命中：" + fmtNum(tu.cache_hit) + " | 缓存未命中：" + fmtNum(tu.cache_miss);
+        // hitRate 用命中/（命中+未命中）计算百分比；无缓存统计时显示占位符
+        var _hitTotal = Number(tu.cache_hit || 0) + Number(tu.cache_miss || 0);
+        var hitRate = _hitTotal > 0 ? Math.round(Number(tu.cache_hit || 0) * 100 / _hitTotal) + "%" : "--";
+        tEl.textContent = "⚡️ 输入总Token：" + fmtK(tu.input_tokens) + " | 输出总Token: " + fmtK(tu.output_tokens)
+            + " | 缓存命中率：" + hitRate;
         bubble.appendChild(tEl);
     }
 
@@ -1055,6 +1145,15 @@ function formatContent(text, streaming) {
     return html;
 }
 
+function chartResizeAll() {
+    // 容器尺寸变化（窗口缩放/侧栏展开收起）后让已渲染图表重新适配，避免 canvas 遮挡或裁切
+    document.querySelectorAll(".chart-box[data-chart]").forEach(function (el) {
+        if (el._chart && typeof el._chart.resize === "function") {
+            try { el._chart.resize(); } catch (e) {}
+        }
+    });
+}
+
 function renderCharts(root) {
     // 扫描并渲染图表块：数据来自 execute_query 真实结果，仅渲染一次，避免流式反复重建
     if (!root || typeof window.echarts === "undefined") {
@@ -1174,22 +1273,22 @@ function buildChartOption(spec, type) {
         title: spec.title ? { text: spec.title, left: "center", top: 4, textStyle: { color: dark.text, fontSize: 14 } } : undefined,
         tooltip: { trigger: type === "pie" ? "item" : "axis" },
         textStyle: { color: dark.text },
-        grid: { left: norm.yName ? 64 : 48, right: 24, top: spec.title ? 44 : 24, bottom: norm.xName ? 44 : 36 },
+        grid: { left: norm.yName ? 64 : 48, right: 24, top: spec.title ? 44 : 24, bottom: norm.xName ? 44 : 36, containLabel: true },
     };
     if (type === "pie") {
         opt.series = seriesList.map(function (s) {
             return {
-                name: s.name, type: "pie", radius: ["0%", "60%"], center: ["42%", "50%"],
+                name: s.name, type: "pie", radius: ["0%", "52%"], center: ["36%", "50%"],
                 data: buildPieData(categories, s.values),
                 minAngle: 2,
                 avoidLabelOverlap: true,
-                label: { color: dark.text, fontSize: 11, formatter: "{b}: {d}%" },
+                label: { color: dark.text, fontSize: 11, formatter: "{b}: {d}%", overflow: "truncate", width: 70 },
                 labelLine: { length: 10, length2: 8, lineStyle: { color: dark.sub } },
                 itemStyle: { borderColor: "#212121", borderWidth: 1 }
             };
         });
-        // 图例放右侧避免遮挡饼图底部与标签，扇区多时可滚动
-        opt.legend = { orient: "vertical", right: 4, top: "middle", type: "scroll", itemWidth: 10, itemHeight: 10, textStyle: { color: dark.sub, fontSize: 11 } };
+        // 图例放右侧避免遮挡饼图底部与标签，扇区多时可滚动；给图例固定宽度，避免窄屏下遮挡饼图
+        opt.legend = { orient: "vertical", right: 4, top: "middle", width: 86, type: "scroll", itemWidth: 9, itemHeight: 9, itemGap: 3, textStyle: { color: dark.sub, fontSize: 11 } };
     } else {
         opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
         opt.yAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
@@ -1200,6 +1299,15 @@ function buildChartOption(spec, type) {
             if (type === "bar") { item.barMaxWidth = 40; }
             return item;
         });
+        // 底部可拖拽滑块调整横轴显示范围（常见于按日期查看区间），同时支持滚轮/拖拽缩放
+        opt.grid.bottom = 58;
+        opt.dataZoom = [
+            { type: "slider", xAxisIndex: 0, height: 16, bottom: 6, showDataShadow: false,
+              borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
+              fillerColor: "rgba(16,163,127,0.16)", handleStyle: { color: dark.text } },
+            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true },
+            { type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true }
+        ];
         // 0 参考线：数据存在负值时在 y=0 画一条醒目的横线，便于观测正负
         var hasNegative = seriesList.some(function (s) {
             return (s.values || []).some(function (v) { return typeof v === "number" && v < 0; });
@@ -1270,14 +1378,23 @@ function skipName() {
 }
 
 (function init() {
+    // 图表随窗口/侧栏尺寸变化自适应，避免容器大小改变后出现遮挡
+    window.addEventListener("resize", function () { chartResizeAll(); });
+    // 准实时刷新左侧会话状态：处理中显示加载圈，完成后变绿色待点击
+    setInterval(pollConvActivity, 2500);
+    pollConvActivity();
     // 创建人：首次进入在页面内弹层让用户自行选择“确定”或“跳过”（不用 prompt，切窗口不消失）
     creator = localStorage.getItem("creator") || "";
     // 旧逻辑残留的“未命名”也视为未设置，让用户重新选择一次
     // 打开页面先初始化上下文圆环为 0（避免空白页 SVG 未设 dashoffset 显示成满环）
     updateContextRing(null, null);
     if (creator && creator !== "未命名") {
-        // 打开页面只加载会话列表，不自动新建会话（由用户点“新建对话”或已有会话）
-        refreshConvList();
+        // 打开页面只加载会话列表（由用户点“新建对话”或已有会话），
+        // 刷新后恢复用户原本查看的会话（若仍存在）
+        refreshConvList().then(function () {
+            var saved = localStorage.getItem("currentConvId");
+            if (saved && conversations[saved]) loadConversation(saved);
+        });
     } else {
         var overlay = $("nameOverlay");
         if (overlay) {

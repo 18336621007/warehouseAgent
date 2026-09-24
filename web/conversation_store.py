@@ -220,7 +220,9 @@ def upsert(conversation_id, session):
                 "VALUES (%s, %s, %s, %s) "
                 "ON DUPLICATE KEY UPDATE "
                 "topic_id = VALUES(topic_id), creator = VALUES(creator), "
-                "title_override = VALUES(title_override)",
+                # 会话重新活跃（如飞书再次发言）时恢复可见，避免软删标记导致刷新后消失
+                "title_override = VALUES(title_override), "
+                "deleted_at = NULL",
                 (conversation_id, topic_id, creator, title_override),
             )
             # 按对拆行：一问一答为一轮，各信息点写入独立字段（含审计字段）

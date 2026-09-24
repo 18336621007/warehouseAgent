@@ -20,19 +20,8 @@ class WhitelistFilteredVectorStore:
         return None
 
     def _is_allowed_identifier(self, identifier: str) -> bool:
-        """判断表/库标识是否在当前接入范围内，直接按 metadata_scope 配置判定。"""
-        identifier = str(identifier or "").strip()
-        if not identifier:
-            return True
-        if self._key == "database":
-            return identifier.lower() in set(
-                str(db).lower() for db in get_allowed_databases()
-            )
-        db, _, table = identifier.rpartition(".")
-        if not db or not table:
-            # 无库名标识（历史数据/裸表名）：按裸表名配置判定
-            return is_allowed_table(table, "")
-        return is_allowed_table(table, db)
+        """白名单已取消：底层数据库账号（Doris/Trino/Hive）能访问即可，这里统一放行。"""
+        return True
 
     def _filter_docs(self, docs):
         return [

@@ -24,6 +24,7 @@ from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 from agentTest.langgraph_app.runtime.stream_bus import StreamBus, bind_stream_bus
+from web.active_requests import ACTIVE_REQUESTS, NODE_LABELS, _SEEKER_INTERNAL_NODES, _extract_node_detail, make_active_sink
 from agentTest.langgraph_app.nodes.planner_node import PLANNER_SYSTEM_PROMPT
 from agentTest.langgraph_app.nodes.planner_node import _build_history_context
 from agentTest.langgraph_app.nodes.planner_node import _estimate_tokens
@@ -55,79 +56,16 @@ except Exception as error:
     sessions = {}
 
 
-# 进行中请求注册表：conversation_id -> {request_id, status, thinking, content, ...}
-# 供前端刷新/切换会话后轮询恢复进行中状态（仿 codex 的进行中任务可见）
-ACTIVE_REQUESTS = {}
+# 飞书机器人：长连接接收私有/群@消息，复用同一 RUNTIME/APP/sessions；启动失败不阻塞 Web 服务
+def _start_feishu_bot():
+    try:
+        from web.feishu_bot import start_feishu_bot as _start_feishu
+        _start_feishu(RUNTIME, APP, sessions, ACTIVE_REQUESTS)
+    except Exception as error:
+        print(f"[server] 飞书机器人启动失败（不影响 Web 服务）: {error}")
 
 
-def _make_active_sink(conversation_id):
-    """构造 StreamBus 镜像回调：把本请求的事件增量累积进 ACTIVE_REQUESTS 快照。
-
-    客户端断开（刷新/关闭）后 SSE 线程关闭了总线，但后台 worker 仍继续产出事件；
-    镜像在总线关闭判断之前记录，保证轮询端始终能拿到最新思考/回答进度。
-    """
-    def sink(event):
-        snap = ACTIVE_REQUESTS.setdefault(conversation_id, {
-            "request_id": "",
-            "status": "AI 正在思考...",
-            "thinking_parts": [],
-            "thinking": "",
-            "content": "",
-            "sql": "",
-            "llm_tokens": {},
-            "context": None,
-        })
-        etype = event.get("type")
-        parts = snap["thinking_parts"]
-        if etype in ("status", "thinking"):
-            text = event.get("text") or ""
-            if text:
-                first = text.split("\n")[0]
-                if first:
-                    snap["status"] = first
-                parts.append({"sid": None, "text": text})
-                snap["thinking"] = "\n".join(p["text"] for p in parts)
-        elif etype == "token":
-            if event.get("scope") == "answer":
-                snap["content"] += event.get("text") or ""
-            else:
-                sid = event.get("stream_id") or ""
-                text = event.get("text") or ""
-                if text:
-                    if sid:
-                        hit = None
-                        for p in reversed(parts):
-                            if p["sid"] == sid:
-                                hit = p
-                                break
-                        if hit:
-                            hit["text"] += text
-                        else:
-                            parts.append({"sid": sid, "text": text})
-                    else:
-                        parts.append({"sid": None, "text": text})
-                    snap["thinking"] = "\n".join(p["text"] for p in parts)
-        elif etype == "thinking_retract":
-            rsid = event.get("stream_id") or ""
-            snap["thinking_parts"] = [p for p in parts if p["sid"] != rsid]
-            snap["thinking"] = "\n".join(p["text"] for p in snap["thinking_parts"])
-        elif etype == "done":
-            snap["content"] = event.get("content") or snap["content"]
-            snap["status"] = "done"
-            snap["sql"] = event.get("sql") or ""
-            snap["llm_tokens"] = event.get("llm_tokens") or {}
-        elif etype == "error":
-            snap["status"] = "error"
-            snap["content"] = (event.get("text") or "") + (
-                ("\n错误编号：" + event.get("error_id", "")) if event.get("error_id") else ""
-            )
-        elif etype == "context_progress":
-            snap["context"] = {
-                "used_tokens": event.get("used_tokens"),
-                "window_tokens": event.get("window_tokens"),
-                "percent": event.get("percent"),
-            }
-    return sink
+_start_feishu_bot()
 
 
 def _persist_conversation(conversation_id):
@@ -182,63 +120,12 @@ def _estimate_conversation_context(conversation_id):
     except Exception:
         return None
 
-NODE_LABELS = {
-    "capture_user_message": "正在记录本轮问题...",
-    "planner": "正在分析查询需求...",
-    "retrieve_schema": "正在检索数据表结构...",
-    "enrich_schema_context": "正在补充字段信息...",
-    "generate_sql": "正在生成 SQL...",
-    "validate_sql": "正在校验 SQL...",
-    "prepare_sql_fix": "SQL 需修正，正在重新生成...",
-    "execute_sql": "正在执行查询...",
-    "persist_result": "正在落盘查询结果...",
-    "query_error_fallback": "查询未能完成，正在整理错误信息...",
-    "evaluator": "正在评估对话质量...",
-}
-
-# execute_query 工具内部 Seeker 执行链节点：折叠为工具的单一事件，不作为主流程步骤展示
-_SEEKER_INTERNAL_NODES = {
-    "retrieve_schema",
-    "generate_sql",
-    "validate_sql",
-    "prepare_sql_fix",
-    "execute_sql",
-    "prepare_sql_exec_fix",
-    "persist_result",
-    "query_error_end",
-    "end_plan_error",
-}
-
 # 前端只展示安全错误信息，内部异常通过error_id在日志中定位
 QUERY_ERROR_CODE = "QUERY_EXECUTION_FAILED"
 QUERY_SAFE_ERROR_MESSAGE = "系统暂时无法完成本次查询，请稍后重试。"
 
 def _sse(data_dict):
     return "data: " + json.dumps(data_dict, ensure_ascii=False) + "\n\n"
-
-def _extract_node_detail(node_name, node_update):
-    """从节点写入 State 的增量中提取可展示的 LLM 输出，作为前端思考过程内容。
-
-    只取确定性的结构化输出字段，避免把整个 State 塞给前端。
-    """
-    if not isinstance(node_update, dict):
-        return ""
-    parts = []
-    if node_name == "planner":
-        if node_update.get("planner_reason"):
-            parts.append("决策理由: " + str(node_update.get("planner_reason")))
-        if node_update.get("route"):
-            parts.append("路由: " + str(node_update.get("route")))
-        if node_update.get("effective_query"):
-            parts.append("有效需求: " + str(node_update.get("effective_query")))
-    elif node_name == "generate_sql":
-        if node_update.get("generated_sql"):
-            parts.append("SQL: " + str(node_update.get("generated_sql")))
-    elif node_name == "persist_result":
-        # 0 行自愈等旁白：向用户展示"发现空结果 → 返回修正"的思考过程
-        if node_update.get("self_heal_note"):
-            parts.append(str(node_update.get("self_heal_note")))
-    return "\n".join(parts)
 
 @app.before_request
 def log_request():
@@ -280,7 +167,16 @@ def list_conversations():
     convs = []
     for conversation_id, sess in sessions.items():
         first = sess.get("title_override") or (sess["messages"][0]["content"] if sess["messages"] else "New Chat")
-        convs.append({"conversation_id": conversation_id, "title": first[:50], "message_count": len(sess["messages"]), "creator": sess.get("creator", "")})
+        last_msg = sess["messages"][-1] if sess["messages"] else None
+        convs.append({
+            "conversation_id": conversation_id,
+            "title": first[:50],
+            "message_count": len(sess["messages"]),
+            "creator": sess.get("creator", ""),
+            # 进行中状态供左侧会话列表显示加载图标；last_status 用于完成态变绿标记
+            "active": conversation_id in ACTIVE_REQUESTS,
+            "last_status": (last_msg or {}).get("status", ""),
+        })
     return jsonify({"conversations": convs})
 
 @app.route("/api/conversations/<conversation_id>", methods=["GET"])
@@ -464,7 +360,7 @@ def chat():
         }
         # 查询链路移到后台线程执行：LLM token 在节点内部实时推送到总线，
         # SSE 线程只负责转发，前端才能逐字展示思考过程与最终回答
-        bus = StreamBus(sink=_make_active_sink(conversation_id))
+        bus = StreamBus(sink=make_active_sink(ACTIVE_REQUESTS, conversation_id))
         worker = threading.Thread(
             target=_run_query_worker,
             args=(bus, state_input, observed_topic_status, request_timer, request_started_at),

@@ -108,40 +108,6 @@ def _split_table_entries(entries) -> tuple[set, set]:
 
 def is_allowed_table(table_name: str, database_name: str = "", table_name_occurrences: dict | None = None) -> bool:
     """统一接入范围判定：库级白名单 + include/exclude 表 + 可选正则。
-    - db.table 条目精确匹配指定库表，优先级最高；
-    - 裸表名条目仅在该表名于白名单库中唯一时生效（避免跨库同名表全部被加入）；
-    - table_name_occurrences: {表名: 出现库数}，由 list_tables 提供用于唯一性判断。"""
-    scope = load_metadata_scope()
-    db = (database_name or "").strip().lower()
-    table = (table_name or "").strip().lower()
-    if not table:
-        return False
-    if db and db not in scope["databases"]:
-        return False
-
-    # 排除表优先（db.table 精确；裸表名唯一性约束）
-    excl_qualified, excl_bare = _split_table_entries(scope["exclude_tables"])
-    if db and f"{db}.{table}" in excl_qualified:
-        return False
-    if table in excl_bare:
-        if table_name_occurrences is None or table_name_occurrences.get(table, 1) <= 1:
-            return False
-
-    # include 精确条目优先
-    include_qualified, include_bare = _split_table_entries(scope["include_tables"])
-    if db and f"{db}.{table}" in include_qualified:
-        return True
-    if table in include_bare:
-        # 裸表名：同名表跨库时存在歧义，不允许加入
-        if table_name_occurrences is None or table_name_occurrences.get(table, 1) <= 1:
-            return True
-        return False
-
-    if include_qualified or include_bare:
-        # include 有明确条目但未命中：不允许（避免 db.table 配置时无库名误放行）
-        return False
-
-    patterns = scope["include_patterns"]
-    if patterns:
-        return any(re.search(pattern, table) for pattern in patterns)
-    return True  # include 为空且无正则：库下全部
+    已取消白名单功能：只要底层数据库账号（Doris/Trino/Hive）能访问即可执行，
+    这里统一放行；库级枚举范围仍由 config/metadata.yaml 的 databases 决定。"""
+    return True
