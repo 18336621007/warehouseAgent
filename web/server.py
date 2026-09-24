@@ -3,7 +3,7 @@ ChatGPT UI backend - Flask API (streaming + scoring + rename/delete)
 """
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
-import uuid, os, sys, json, threading, queue, time
+import uuid, os, sys, json, threading, queue, time, socket, re
 from datetime import datetime
 
 # 强制 stdout/stderr 行缓冲，让启动日志与请求日志实时显示（避免块缓冲憋住，进程结束才刷出）
@@ -1053,6 +1053,43 @@ def submit_score():
             print(f"[server] update score failed: {e}")
     return jsonify({"success": True})
 
+def _lan_access_urls():
+    """查找本机内网可访问的 IPv4 地址，供启动时提示同事访问。"""
+    candidates = []
+    def _add(ip):
+        ip = str(ip or "")
+        if ip and ip not in candidates:
+            candidates.append(ip)
+    try:
+        _, _, ips = socket.gethostbyname_ex(socket.gethostname())
+        for ip in ips:
+            _add(ip)
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        _add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    results = []
+    for ip in candidates:
+        if ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("198.18."):
+            continue
+        if re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", ip):
+            results.append(ip)
+    # 无私网地址时回退展示所有非回环地址，便于同事尝试
+    if not results:
+        results = [ip for ip in candidates if not ip.startswith("127.")]
+    return results
+
+
 if __name__ == "__main__":
     print("[server] starting at http://localhost:5000")
+    lan_ips = _lan_access_urls()
+    if lan_ips:
+        print("[server] 同一局域网打开以下地址：")
+        for _ip in lan_ips:
+            print(f"[server]    http://{_ip}:5000")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
