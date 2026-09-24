@@ -77,7 +77,9 @@ def _upsert_and_persist(sessions: Dict[str, Any], cid: str):
     """把会话元信息写入 MySQL（会话创建/迁移后调用，异常只打印不影响主流程）。"""
     try:
         from web.conversation_store import upsert
+        from web.conversation_events import broadcast_conversations
         upsert(cid, sessions[cid])
+        broadcast_conversations()
     except Exception as error:
         print(f"[feishu] persist conversation failed: {error}")
 
@@ -103,7 +105,9 @@ def _persist(sessions: Dict[str, Any], cid: str):
     """写回 MySQL 会话记录，异常只打印不阻断飞书主流程。"""
     try:
         from web.conversation_store import upsert
+        from web.conversation_events import broadcast_conversations
         upsert(cid, sessions[cid])
+        broadcast_conversations()
     except Exception as error:
         print(f"[feishu] persist conversation failed: {error}")
 
@@ -318,7 +322,7 @@ class FeishuBot:
                 "llm_tokens": {},
                 "context": None,
             }
-            bus = StreamBus(sink=make_active_sink(self.active_requests, cid))
+            bus = StreamBus(sink=make_active_sink(self.active_requests, cid, request_id))
             # 后台线程绑定流式总线，LLM 层的 thinking/answer token 才会实时镜像到注册表
             bind_stream_bus(bus)
             thinking_parts = ["[intent] query"]
@@ -420,6 +424,11 @@ class FeishuBot:
             reset_log_context(context_token)
             # 查询结束：从进行中注册表移除，前端轮询据此判定完成并重新加载
             self.active_requests.pop(cid, None)
+            try:
+                from web.conversation_events import broadcast_conversations
+                broadcast_conversations()
+            except Exception:
+                pass
             # bus 已完成镜像，最后关闭只影响队列，active_requests 快照已保留
             if "bus" in locals():
                 bus.close()

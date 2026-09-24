@@ -20,6 +20,15 @@ from agentTest.config.settings import (
     get_stream_output_enabled,
 )
 from agentTest.langgraph_app.runtime.stream_bus import get_stream_bus
+from agentTest.langgraph_app.tools.sql_query_tool import QueryCancelledError, _sql_should_cancel
+
+
+def _llm_should_cancel() -> bool:
+    """判断当前会话是否已被用户要求停止（流式生成每个 chunk 间检查，对齐 Codex 取消整个任务树）。"""
+    try:
+        return _sql_should_cancel()
+    except Exception:
+        return False
 
 
 def _lc_msg_to_oai(message: BaseMessage) -> dict:
@@ -287,8 +296,13 @@ class ThinkingStreamChatModel(BaseChatModel):
         # 流式工具调用增量按 index 累积（function calling / structured output）
         tool_calls_acc = {}
         usage = None
+        # 流内取消：请求发出前与每个 chunk 间检查停止标志，命中即中断本轮生成
+        if _llm_should_cancel():
+            raise QueryCancelledError("流式生成已停止：用户已终止本轮生成")
         response = self._client.chat.completions.create(**request)
         for chunk in response:
+            if _llm_should_cancel():
+                raise QueryCancelledError("流式生成已停止：用户已终止本轮生成")
             if getattr(chunk, "usage", None) is not None:
                 # 流式 usage 仅在末尾 chunk 返回（需 stream_options.include_usage），保存最后一个
                 usage = chunk.usage

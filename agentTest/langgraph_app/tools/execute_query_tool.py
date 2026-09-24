@@ -12,6 +12,7 @@ from langchain.tools import tool
 
 from agentTest.langchain_app.utils.sql_cleaner import clear_sql
 from agentTest.datasource.registry import resolve_engine_candidates
+from agentTest.langgraph_app.tools.sql_query_tool import QueryCancelledError
 from agentTest.langgraph_app.runtime.graph_logger import log_sub_info
 
 # 当前请求上下文：由 planner 循环入口设置，工具内部据此组装落盘 state（日志/落盘归属）
@@ -181,6 +182,48 @@ def _build_result_summary(sql, sql_result, stored) -> str:
     return "\n".join(lines)
 
 
+def _query_cancelled() -> bool:
+    """判断当前会话是否已被用户要求停止（跨线程安全读取取消标志）。"""
+    try:
+        # 延迟导入避免 web 包与 agentTest 工具包之间的循环依赖
+        from web.active_requests import ACTIVE_REQUESTS, is_cancel_requested
+        conv = _current_conversation_id.get()
+        req = _current_request_id.get()
+        if conv and is_cancel_requested(ACTIVE_REQUESTS, conv, req):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _invoke_one_cancellable(spec, sql, partition_fields):
+    """在后台线程执行单条 SQL，主线程轮询取消标志；取消时立即返回 (None, True)。
+
+    数据库连接本身是阻塞调用，无法从外部安全中断；这里采用"放弃等待"策略，
+    一旦用户点停止，立即返回取消标记，让上层停止推进本轮生成（残留线程不再等待）。
+    """
+    result = {}
+    def _run():
+        try:
+            result["value"] = spec.tool.invoke({
+                "sql": sql,
+                "partition_fields": partition_fields,
+            })
+        except Exception as error:
+            result["error"] = error
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    while t.is_alive():
+        # 每 0.2s 检查一次取消请求，命中后立即放弃等待，不等 SQL 返回
+        if _query_cancelled():
+            return None, True
+        t.join(0.2)
+    if "error" in result:
+        # 原异常继续抛给上层原有降级/报错逻辑处理（线程内已捕获，这里重新抛出）
+        raise result["error"]
+    return result.get("value"), False
+
+
 def _exec_one_sql(runtime, sql, question, request_id, step_id="", result_limit=0):
     """执行单条 SQL：路由引擎 → 安全校验（sql_query 工具内置）→ 执行 → 落盘。
 
@@ -227,9 +270,21 @@ def _exec_one_sql(runtime, sql, question, request_id, step_id="", result_limit=0
             errors.append(f"[{engine}] 引擎未注册")
             continue
         try:
-            sql_result = spec.tool.invoke({"sql": sql, "partition_fields": partition_fields})
+            sql_result, _cancelled = _invoke_one_cancellable(spec, sql, partition_fields)
+            if _cancelled:
+                # 用户已停止生成：不再尝试其他引擎，直接把结果标记为已取消
+                return (
+                    {"sql_exec_failed": True, "sql_exec_error": "查询已停止", "sql_result": None},
+                    "查询已停止：用户已终止本轮生成，未返回数据。",
+                )
             exec_engine = engine
             break
+        except QueryCancelledError:
+            # 用户在 SQL 执行期间点了停止：不再降级尝试其他引擎，直接按取消处理
+            return (
+                {"sql_exec_failed": True, "sql_exec_error": "查询已停止", "sql_result": None},
+                "查询已停止：用户已终止本轮生成，未返回数据。",
+            )
         except ValueError as error:
             # 校验失败：引擎无关，不降级（换引擎大概率同样拒绝）
             return (

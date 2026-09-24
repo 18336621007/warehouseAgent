@@ -3,7 +3,7 @@ ChatGPT UI backend - Flask API (streaming + scoring + rename/delete)
 """
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
-import uuid, os, sys, json, threading
+import uuid, os, sys, json, threading, queue, time
 from datetime import datetime
 
 # 强制 stdout/stderr 行缓冲，让启动日志与请求日志实时显示（避免块缓冲憋住，进程结束才刷出）
@@ -24,7 +24,8 @@ from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.graphs.supervisor_graph import build_supervisor_graph
 from agentTest.langgraph_app.runtime.graph_runtime import build_graph_runtime
 from agentTest.langgraph_app.runtime.stream_bus import StreamBus, bind_stream_bus
-from web.active_requests import ACTIVE_REQUESTS, NODE_LABELS, _SEEKER_INTERNAL_NODES, _extract_node_detail, make_active_sink
+from web.active_requests import ACTIVE_REQUESTS, CANCEL_FLAGS, NODE_LABELS, _SEEKER_INTERNAL_NODES, _extract_node_detail, clear_cancel_flag, is_cancel_requested, make_active_sink, set_cancel_flag
+from web.conversation_events import broadcast_conversations, build_conversation_snapshot, initial_sse_payload, set_sessions, subscribe, unsubscribe
 from agentTest.langgraph_app.nodes.planner_node import PLANNER_SYSTEM_PROMPT
 from agentTest.langgraph_app.nodes.planner_node import _build_history_context
 from agentTest.langgraph_app.nodes.planner_node import _estimate_tokens
@@ -36,6 +37,7 @@ from web.conversation_store import load_all as load_conv_all
 from web.conversation_store import upsert as upsert_conv
 from web.conversation_store import soft_delete as soft_delete_conv
 from agentTest.metadata.mysql_store import update_user_score
+from langchain_core.messages import RemoveMessage
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app)
@@ -54,6 +56,13 @@ except Exception as error:
     # MySQL 不可用时以空缓存启动，不影响服务运行（落盘是辅助能力）
     print(f"[server] load conversations failed: {error}")
     sessions = {}
+
+set_sessions(sessions)
+
+
+# 当前请求的流式总线注册表：用户点停止时由 cancel_chat 立即 close，
+# 让 SSE 通道与前端快速收尾，不必等后台 LLM 自然生成完
+ACTIVE_BUSES = {}
 
 
 # 飞书机器人：长连接接收私有/群@消息，复用同一 RUNTIME/APP/sessions；启动失败不阻塞 Web 服务
@@ -75,6 +84,113 @@ def _persist_conversation(conversation_id):
     except Exception as error:
         print(f"[server] persist conversation failed: {error}")
 
+
+def _cancel_partial_content(conversation_id, fallback="已停止生成") -> str:
+    """停止后读取已流出的部分回答：ACTIVE_REQUESTS 可能已被 cancel_chat 清除，从 CANCEL_FLAGS 兜底。"""
+    snap = ACTIVE_REQUESTS.get(conversation_id) or {}
+    content = str(snap.get("content") or "").strip()
+    if not content:
+        flag = CANCEL_FLAGS.get(conversation_id) or {}
+        content = str(flag.get("content") or "").strip()
+    return content or fallback
+
+
+def _cancel_and_wait_old_request(conversation_id: str, timeout_seconds: float = 5) -> bool:
+    """若该会话仍有旧请求在进行，先请求取消并等待其后台线程收尾。
+
+    避免出现 "conversation busy"：新消息到来时自动停掉旧请求（对齐 Codex 取消整个任务树），
+    并且只有等旧 worker 清理完 ACTIVE_REQUESTS 才继续，防止旧 worker 覆盖新一轮消息。
+    """
+    snap = ACTIVE_REQUESTS.get(conversation_id)
+    if not snap:
+        return True
+    old_rid = str(snap.get("request_id") or "")
+    snap["cancel_requested"] = True
+    if old_rid:
+        set_cancel_flag(conversation_id, old_rid, _cancel_partial_content(conversation_id))
+        # 立即把旧轮占位写成 aborted，用户刷新/切回即可看到已停止
+        _message_list = sessions.get(conversation_id, {}).get("messages") or []
+        _last = _message_list[-1] if _message_list else {}
+        if (_last.get("role") == "assistant" and _last.get("status") == "processing"
+                and _last.get("request_id") == old_rid):
+            _message_list[-1] = {
+                "role": "assistant",
+                "content": _cancel_partial_content(conversation_id),
+                "thinking": str(_last.get("thinking") or ""),
+                "sql": "", "dialogue_id": 0, "evaluator": None, "llm_tokens": {},
+                "request_id": old_rid, "thinking_seconds": 0,
+                "status": "aborted", "error_message": "", "can_chart": False,
+                "request_at": _last.get("request_at", ""),
+            }
+            _persist_conversation(conversation_id)
+    # 取消已生效（LLM 流内/SQL 轮询都会很快退出），等旧 worker finally 清掉进行中注册表
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if conversation_id not in ACTIVE_REQUESTS:
+            return True
+        time.sleep(0.05)
+    # 兜底：旧 worker 若因尾部事件重建注册表而未清理，这里按 request_id 强制清掉，
+    # 避免后续发消息被 "conversation busy" 拒绝；真正归属由各写回路径 request_id 守卫保护
+    if ((ACTIVE_REQUESTS.get(conversation_id) or {}).get("request_id") or "") == old_rid:
+        ACTIVE_REQUESTS.pop(conversation_id, None)
+        print(f"[server] force cleared stale ACTIVE_REQUESTS for {conversation_id} (rid={old_rid})")
+    return True
+
+
+def _is_current_request(conversation_id: str, request_id: str) -> bool:
+    """判断消息末尾是否仍归属指定请求：防止旧 worker 收尾时覆盖最新一轮。"""
+    if not request_id:
+        return False
+    _msg_list = sessions.get(conversation_id, {}).get("messages") or []
+    _last = _msg_list[-1] if _msg_list else {}
+    return str(_last.get("request_id") or "") == str(request_id)
+
+
+def _rollback_checkpoint_last_round(app, config, request_id):
+    """重新生成时回滚 LangGraph Checkpoint 最近一轮：删除该轮消息并清空本轮残留状态。"""
+    if not request_id:
+        return
+    try:
+        snap = app.get_state(config)
+        state = (snap and snap.values) or {}
+        messages = state.get("messages") or []
+        mark = f"{request_id}:user"
+        idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            mid = str(getattr(messages[i], "id", "") or "")
+            if mid == mark:
+                idx = i
+                break
+        if idx is None:
+            return
+        # 用 RemoveMessage 经 add_messages reducer 删除该轮全部消息（user/assistant/ReAct 工具轮）
+        removes = [RemoveMessage(id=str(m.id)) for m in messages[idx:] if getattr(m, "id", None)]
+        # 重新生成不保留旧轮：相关派生态位一并复位，避免旧方案/旧结果引用泄漏到新查询
+        state_updates = {
+            "messages": removes,
+            "topic_status": "new",
+            "effective_query": "",
+            "confirmed_plan": {},
+            "last_query_result": None,
+            "executed_sql": [],
+            "planner_reason": "",
+            "respond_text": "",
+            "route": "execute",
+            "seeker_plan_error": None,
+            "seeker_error_unresolvable": None,
+            "seeker_empty_result": False,
+            "empty_result_rounds": 0,
+            "self_heal_note": "",
+        }
+        app.update_state(config, state_updates)
+    except Exception as error:
+        # 回滚失败不阻塞主流程，但要记录，便于审计重新生成是否真正隔离了旧记忆
+        log_node_degraded(
+            "regenerate_rollback",
+            error,
+            error_code="REGENERATE_CHECKPOINT_ROLLBACK_DEGRADED",
+            stage="checkpoint_rollback",
+        )
 
 def _soft_delete_conversation(conversation_id):
     """软删除会话：仅打 deleted_at 标记保留 MySQL 记录；异常仅记日志。"""
@@ -156,6 +272,7 @@ def create_conversation():
         "messages": [],
     }
     _persist_conversation(conversation_id)
+    broadcast_conversations()
     # 产品接口统一使用conversation_id，避免与LangGraph内部thread_id混淆
     return jsonify({
         "conversation_id": conversation_id,
@@ -164,20 +281,33 @@ def create_conversation():
 
 @app.route("/api/conversations", methods=["GET"])
 def list_conversations():
-    convs = []
-    for conversation_id, sess in sessions.items():
-        first = sess.get("title_override") or (sess["messages"][0]["content"] if sess["messages"] else "New Chat")
-        last_msg = sess["messages"][-1] if sess["messages"] else None
-        convs.append({
-            "conversation_id": conversation_id,
-            "title": first[:50],
-            "message_count": len(sess["messages"]),
-            "creator": sess.get("creator", ""),
-            # 进行中状态供左侧会话列表显示加载图标；last_status 用于完成态变绿标记
-            "active": conversation_id in ACTIVE_REQUESTS,
-            "last_status": (last_msg or {}).get("status", ""),
-        })
-    return jsonify({"conversations": convs})
+    # 首屏只读一次全量；后续变更由 SSE（/api/conversations/events）推送
+    return jsonify({"conversations": build_conversation_snapshot()})
+
+
+@app.route("/api/conversations/events")
+def conversation_events():
+    """SSE 推送会话列表变更：前端首次只读一次全量，之后订阅本端点接收变更，替代 2.5s 轮询。"""
+    q = subscribe()
+
+    def _gen():
+        try:
+            yield initial_sse_payload()
+            while True:
+                try:
+                    payload = q.get(timeout=30)
+                    yield payload
+                except queue.Empty:
+                    # 心跳保活，避免开发服务器/代理空闲超时断开
+                    yield ": keep-alive\n\n"
+        finally:
+            unsubscribe(q)
+
+    return Response(
+        stream_with_context(_gen()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @app.route("/api/conversations/<conversation_id>", methods=["GET"])
 def get_conversation(conversation_id):
@@ -200,6 +330,7 @@ def rename_conversation(conversation_id):
     if conversation_id not in sessions: return jsonify({"error": "invalid"}), 400
     if title: sessions[conversation_id]["title_override"] = title
     _persist_conversation(conversation_id)
+    broadcast_conversations()
     return jsonify({"success": True})
 
 @app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
@@ -208,6 +339,7 @@ def delete_conversation(conversation_id):
     if conversation_id in sessions:
         del sessions[conversation_id]
     _soft_delete_conversation(conversation_id)
+    broadcast_conversations()
     return jsonify({"success": True})
 
 @app.route("/api/chat/status/<conversation_id>")
@@ -225,7 +357,61 @@ def chat_status(conversation_id):
         "sql": snap.get("sql", ""),
         "context": snap.get("context"),
         "llm_tokens": snap.get("llm_tokens", {}),
+        "cancel_requested": bool(snap.get("cancel_requested")),
     })
+
+
+
+@app.route("/api/chat/cancel", methods=["POST"])
+def cancel_chat():
+    """终止指定会话当前正在进行的查询（只服务网页端生成中停止按钮）。
+
+    后台 graph 线程在流式迭代每个 chunk 间检查 cancel_requested，
+    命中后中断循环并把本轮消息标记为 aborted（保留已流出的部分回答）。
+    """
+    data = request.get_json() or {}
+    conversation_id = str(data.get("conversation_id") or "")
+    request_id = str(data.get("request_id") or "")
+    snap = ACTIVE_REQUESTS.get(conversation_id)
+    if not snap:
+        return jsonify({"success": False, "error": "no active request"}), 200
+    if request_id and snap.get("request_id") and request_id != snap.get("request_id"):
+        return jsonify({"success": False, "error": "request mismatch"}), 200
+    snap["cancel_requested"] = True
+    # 先取当前已流出内容再设置标记（ACTIVE_REQUESTS 随后立即清除，供 worker 兜底）
+    _partial = _cancel_partial_content(conversation_id)
+    set_cancel_flag(conversation_id, request_id, _partial)
+    # 立即关闭当前请求的 SSE 总线：前端 abort 后服务器端也马上收尾，不再继续推事件
+    _active_bus = ACTIVE_BUSES.get(conversation_id)
+    if _active_bus is not None:
+        try:
+            _active_bus.close()
+        except Exception:
+            pass
+    # 停止立即落盘 aborted 终态：用户刷新/切回会话即可看到，不再等待后台 worker 自然结束
+    _cancel_snap = ACTIVE_REQUESTS.get(conversation_id) or {}
+    _message_list = sessions.get(conversation_id, {}).get("messages") or []
+    _last = _message_list[-1] if _message_list else {}
+    if (_last.get("role") == "assistant"
+            and _last.get("status") == "processing"
+            and _last.get("request_id") == request_id):
+        _message_list[-1] = {
+            "role": "assistant",
+            "content": _partial,
+            "thinking": str(_cancel_snap.get("thinking") or ""),
+            "sql": "", "dialogue_id": 0, "evaluator": None, "llm_tokens": {},
+            "request_id": request_id,
+            "thinking_seconds": 0,
+            "status": "aborted", "error_message": "", "can_chart": False,
+            "request_at": _last.get("request_at", ""),
+        }
+        _persist_conversation(conversation_id)
+    # 从进行中注册表移除：前端停止轮询并立即加载已落盘的 aborted 终态
+    if (ACTIVE_REQUESTS.get(conversation_id) or {}).get("request_id") == request_id:
+        ACTIVE_REQUESTS.pop(conversation_id, None)
+    broadcast_conversations()
+    return jsonify({"success": True})
+
 
 @app.route("/api/chart", methods=["POST"])
 def generate_chart():
@@ -264,8 +450,29 @@ def chat():
     message = data.get("message", "").strip()
     if not conversation_id or conversation_id not in sessions: return jsonify({"error": "invalid conversation_id"}), 400
     if not message: return jsonify({"error": "empty message"}), 400
+    # 有旧请求仍在进行时不再直接拒绝：先取消旧请求并等待其收尾，再开启新请求
+    if conversation_id in ACTIVE_REQUESTS:
+        if not _cancel_and_wait_old_request(conversation_id):
+            return jsonify({"error": "conversation busy, please try again later"}), 400
 
     session = sessions[conversation_id]
+
+    # 重新生成最近一轮：前端编辑最近一条消息后发送，先删除旧 user+assistant 再重建，
+    # 不做审计保留（已按需求确认）。正在生成中禁止触发。
+    regenerate_old_request_id = ""
+    if data.get("regenerate_last"):
+        if conversation_id in ACTIVE_REQUESTS:
+            if not _cancel_and_wait_old_request(conversation_id):
+                return jsonify({"error": "conversation busy, please try again later"}), 400
+        latest = session["messages"]
+        if (len(latest) >= 2 and latest[-1].get("role") == "assistant"
+                and latest[-2].get("role") == "user"
+                and latest[-1].get("status") not in ("processing", "chat")):
+            # 先记录被编辑轮的 request_id，供 Checkpoint 回滚定位旧轮消息
+            regenerate_old_request_id = latest[-1].get("request_id", "")
+            del latest[-2:]
+            _persist_conversation(conversation_id)
+
     # 去 Topic 化：整个对话共享一个 Checkpoint，topic_id 固定不再切换
     topic_id = session["topic_id"]
 
@@ -283,6 +490,9 @@ def chat():
             "thread_id": graph_thread_id,
         }
     }
+    # 重新生成最近一轮：同步回滚 Checkpoint 旧轮消息与残留状态，避免旧对话污染新查询
+    if data.get("regenerate_last"):
+        _rollback_checkpoint_last_round(APP, config, regenerate_old_request_id)
 
     def generate(request_timer, topic_state, request_started_at):
         # ── query: LangGraph pipeline ──
@@ -357,10 +567,14 @@ def chat():
             "sql": "",
             "llm_tokens": {},
             "context": None,
+            "cancel_requested": False,
         }
+        broadcast_conversations()
         # 查询链路移到后台线程执行：LLM token 在节点内部实时推送到总线，
         # SSE 线程只负责转发，前端才能逐字展示思考过程与最终回答
-        bus = StreamBus(sink=make_active_sink(ACTIVE_REQUESTS, conversation_id))
+        bus = StreamBus(sink=make_active_sink(ACTIVE_REQUESTS, conversation_id, request_id))
+        # 注册当前请求的流式总线：用户点停止时可立即关闭 SSE 通道，让前后台快速收尾
+        ACTIVE_BUSES[conversation_id] = bus
         worker = threading.Thread(
             target=_run_query_worker,
             args=(bus, state_input, observed_topic_status, request_timer, request_started_at),
@@ -373,6 +587,9 @@ def chat():
         finally:
             # 客户端断开或异常时通知后台线程停止推送，避免事件堆积
             bus.close()
+            # 仅当注册表仍指到本请求的总线时才移除，避免误删并发新请求的总线
+            if ACTIVE_BUSES.get(conversation_id) is bus:
+                ACTIVE_BUSES.pop(conversation_id, None)
 
     def _run_query_worker(bus, state_input, observed_topic_status, request_timer, request_started_at):
         """后台执行查询链路：节点事件与 LLM token 写入总线，由 SSE 线程转发。"""
@@ -388,8 +605,22 @@ def chat():
         seen = set()          # 出现过哪些节点（用于 evaluator/sql 判断）
         node_seq = {}         # 节点出现次数：0 行自愈等回环时展示为 node#2 区分轮次
         advisor_history_recorded = False
+        cancelled = False
+        def _full_thinking():
+            # 最终落盘时合并流式推理内容：thinking_parts 只含节点摘要，
+            # 流式期间推送的 reasoning token 已由镜像累积在 ACTIVE_REQUESTS.thinking
+            _base = "\n".join(thinking_parts)
+            _stream = str((ACTIVE_REQUESTS.get(conversation_id) or {}).get("thinking") or "")
+            _stream = _stream.strip()
+            if _stream and _stream not in _base:
+                return _base + "\n" + _stream
+            return _base
         try:
             for chunk in APP.stream(state_input, config, subgraphs=True):
+                # 用户点击停止生成：每个 chunk 间检查取消标志，命中则不再消费后续节点
+                if is_cancel_requested(ACTIVE_REQUESTS, conversation_id, request_id):
+                    cancelled = True
+                    break
                 node_dict = chunk[1] if isinstance(chunk, tuple) else chunk
                 for node_name, node_update in node_dict.items():
                     # 从LangGraph节点增量更新中统一观察Topic状态变化
@@ -453,6 +684,14 @@ def chat():
             topic_status = result.get("topic_status", "")
             final_answer = result.get("final_answer", "")
             generated_sql = result.get("generated_sql", "")
+            # 停止可能在最后一个 chunk 消费完后、落盘前才到达：落盘前再校验一次取消标志
+            if is_cancel_requested(ACTIVE_REQUESTS, conversation_id, request_id):
+                cancelled = True
+            if cancelled:
+                # 已停止生成：使用已流出的部分回答作为最终内容，标记 aborted 状态
+                final_answer = _cancel_partial_content(conversation_id)
+                generated_sql = ""
+            final_status = "aborted" if cancelled else "success"
             # 优先展示本轮实际执行过的 SQL（execute_query 工具收集 → Planner 写入 executed_sql）：
             # 单条直接展示，多条（多段/并行）按代码块分开展示，每条带步骤/表名/行数标题。
             # executed_sql 由 Planner 每轮重新写入，本轮未查数为空列表，天然不残留上一轮 SQL。
@@ -490,24 +729,31 @@ def chat():
 
             # 请求级 LLM token 汇总（在 log_request_end 清理聚合器之前读取）
             llm_tokens = get_llm_token_usage()
+            # 落盘前再校验一次取消标志：防止最后时刻用户点停止但 success 分支已进入而覆盖 aborted
+            if is_cancel_requested(ACTIVE_REQUESTS, conversation_id, request_id):
+                cancelled = True
+                final_status = "aborted"
+                final_answer = _cancel_partial_content(conversation_id)
+                display_sql = ""
             # 覆盖本轮开头的"处理中"占位回答（round_no 不变），不新增轮次
             # 成功轮回填 can_chart：仅当该请求存在可自动成图的落盘结果时为 True，
             # 前端据此决定是否显示『生成图表』按钮（无法生成就不展示）
-            from agentTest.langgraph_app.tools.chart_tool import has_chartable_result
-            session["messages"][-1] = {
-                "role": "assistant", "content": final_answer, "sql": display_sql,
-                "thinking": "\n".join(thinking_parts),
-                "dialogue_id": dialogue_id,
-                "evaluator": evaluator_payload,
-                "llm_tokens": llm_tokens,
-                "request_id": request_id,
-                "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
-                "status": "success",
-                "error_message": "",
-                "can_chart": has_chartable_result(conversation_id, request_id),
-                "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            _persist_conversation(conversation_id)
+            if _is_current_request(conversation_id, request_id):
+                from agentTest.langgraph_app.tools.chart_tool import has_chartable_result
+                session["messages"][-1] = {
+                    "role": "assistant", "content": final_answer, "sql": display_sql,
+                    "thinking": _full_thinking(),
+                    "dialogue_id": dialogue_id,
+                    "evaluator": evaluator_payload,
+                    "llm_tokens": llm_tokens,
+                    "request_id": request_id,
+                    "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
+                    "status": final_status,
+                    "error_message": "",
+                    "can_chart": False if cancelled else has_chartable_result(conversation_id, request_id),
+                    "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                _persist_conversation(conversation_id)
 
             # ── 去 Topic 化：不再按 new_query / 异常终态切换 Topic，
             #    整个对话共享历史与状态，新问数由 Planner 每轮重新改写 effective_query ──
@@ -531,9 +777,37 @@ def chat():
                 "evaluator": evaluator_payload,
                 "dialogue_id": dialogue_id,
                 "llm_tokens": llm_tokens,
+                "status": final_status,
                 "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
             })
         except Exception as error:
+            # 用户点停止导致的 SQL 中断：一律按 aborted 处理，不暴露错误编号
+            if is_cancel_requested(ACTIVE_REQUESTS, conversation_id, request_id):
+                _partial = _cancel_partial_content(conversation_id)
+                if _is_current_request(conversation_id, request_id):
+                    session["messages"][-1] = {
+                        "role": "assistant", "content": _partial,
+                        "thinking": _full_thinking(), "sql": "", "dialogue_id": 0,
+                        "evaluator": None, "llm_tokens": {}, "request_id": request_id,
+                        "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
+                        "status": "aborted", "error_message": "", "can_chart": False,
+                        "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    _persist_conversation(conversation_id)
+                log_request_end(
+                    result_type="aborted",
+                    route="execute",
+                    topic_status=observed_topic_status,
+                    summary={"aborted": True},
+                    ms=elapsed_ms(request_timer),
+                )
+                bus.emit({
+                    "type": "done", "content": _partial, "sql": "",
+                    "thinking": "\n".join(thinking_parts), "evaluator": None,
+                    "dialogue_id": 0, "llm_tokens": {}, "status": "aborted",
+                    "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                return
             error_id = uuid.uuid4().hex
             previous_topic_status = observed_topic_status
             try:
@@ -578,22 +852,23 @@ def chat():
             )
             # 失败轮也落盘审计记录：报错信息/执行时间/用户名称随明细存储
             # 覆盖本轮开头的"处理中"占位回答（round_no 不变），不新增轮次
-            session["messages"][-1] = {
-                "role": "assistant",
-                "content": "",
-                "thinking": "\n".join(thinking_parts),
-                "sql": "",
-                "dialogue_id": 0,
-                "evaluator": None,
-                "llm_tokens": {},
-                "request_id": request_id,
-                "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
-                "status": "failed",
-                "error_message": f"{QUERY_ERROR_CODE}:{error_id}",
-                "can_chart": False,
-                "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            _persist_conversation(conversation_id)
+            if _is_current_request(conversation_id, request_id):
+                session["messages"][-1] = {
+                    "role": "assistant",
+                    "content": "",
+                    "thinking": _full_thinking(),
+                    "sql": "",
+                    "dialogue_id": 0,
+                    "evaluator": None,
+                    "llm_tokens": {},
+                    "request_id": request_id,
+                    "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
+                    "status": "failed",
+                    "error_message": f"{QUERY_ERROR_CODE}:{error_id}",
+                    "can_chart": False,
+                    "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                _persist_conversation(conversation_id)
             bus.emit({
                 "type": "error",
                 "text": QUERY_SAFE_ERROR_MESSAGE,
@@ -604,8 +879,12 @@ def chat():
         finally:
             reset_log_context(worker_token)
             bus.close()
-            # 查询结束：从进行中注册表移除，前端轮询据此判定完成并重新加载
-            ACTIVE_REQUESTS.pop(conversation_id, None)
+            clear_cancel_flag(conversation_id, request_id)
+            # 查询结束：从进行中注册表移除，前端轮询据此判定完成并重新加载。
+            # 仅当记录仍归属本请求时才移除，避免旧 worker 误删用户停止后立即发起的新请求
+            if (ACTIVE_REQUESTS.get(conversation_id) or {}).get("request_id") == request_id:
+                ACTIVE_REQUESTS.pop(conversation_id, None)
+            broadcast_conversations()
 
 
     def generate_with_log_context():
@@ -712,8 +991,11 @@ def chat():
                 })
                 _persist_conversation(conversation_id)
 
-            # 进行中注册表同步清理（worker 未启动/被中断时避免残留）
-            ACTIVE_REQUESTS.pop(conversation_id, None)
+            # 进行中注册表同步清理（worker 未启动/被中断时避免残留）。
+            # 仅当记录仍归属本请求时才移除，避免旧 SSE 线程误删停止后立即发起的新请求
+            if (ACTIVE_REQUESTS.get(conversation_id) or {}).get("request_id") == request_id:
+                ACTIVE_REQUESTS.pop(conversation_id, None)
+            broadcast_conversations()
 
             yield _sse_req({
                 "type": "error",

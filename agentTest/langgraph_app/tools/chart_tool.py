@@ -218,32 +218,41 @@ def build_charts_for_request(conversation_id: str, request_id: str, type: str = 
 
 
 def has_chartable_result(conversation_id: str, request_id: str) -> bool:
-    """轻量判断该请求是否有可用于自动生成图表的数据（供前端『生成图表』按钮显隐）。
+    """判断该请求是否真的能生成图表（供前端『生成图表』按钮显隐）。
 
-    复用落盘索引的 columns + preview_rows 用 detect_chart_fields 探测 x/y，
-    不读全量 CSV，避免大结果在每轮完成时造成额外 IO。
+    先用落盘索引的预览行做轻量探测，明显不可成图直接返回 False，避免读全量 CSV；
+    预览可成图时再用 build_charts_for_request 同一套逻辑核验成功，保证按钮可见
+    与点击后能成功生成完全一致，不会出现点完才报无法生成。
     """
     from agentTest.langgraph_app.services.result_store import list_result_index
     if not conversation_id or not request_id:
         return False
     request_id = str(request_id or "").strip()
-    entries = list_result_index(conversation_id, limit=20)
-    matched = [
-        e for e in entries
-        if str(e.get("source_request_id") or "").startswith(request_id)
-        or str(e.get("result_id") or "").startswith(request_id)
-    ]
-    if not matched:
+    try:
+        entries = list_result_index(conversation_id, limit=20)
+        matched = [
+            e for e in entries
+            if str(e.get("source_request_id") or "").startswith(request_id)
+            or str(e.get("result_id") or "").startswith(request_id)
+        ]
+        if not matched:
+            return False
+        for e in matched:
+            columns = list(e.get("columns") or [])
+            rows = list(e.get("preview_rows") or [])
+            if not columns or not rows:
+                continue
+            x, ys = detect_chart_fields(columns, rows)
+            if x and ys:
+                break
+        else:
+            return False
+        # 预览可成图：再用真实全量构建核验，保证与点击后返回的图表一致
+        specs, _err = build_charts_for_request(conversation_id, request_id, type="auto")
+        return bool(specs)
+    except Exception:
+        # 图表探测失败不应影响回答落盘：按钮不显示即可
         return False
-    for e in matched:
-        columns = list(e.get("columns") or [])
-        rows = list(e.get("preview_rows") or [])
-        if not columns or not rows:
-            continue
-        x, ys = detect_chart_fields(columns, rows)
-        if x and ys:
-            return True
-    return False
 
 
 def _list_result_hints(conversation_id: str) -> str:

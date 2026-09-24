@@ -4,7 +4,7 @@
 ACTIVE_REQUESTS = {}
 
 
-def make_active_sink(active_requests, conversation_id):
+def make_active_sink(active_requests, conversation_id, request_id=""):
     """构造 StreamBus 镜像回调：把本请求的事件增量累积进指定注册表快照。
 
     客户端断开（刷新/关闭）后 SSE 线程关闭了总线，但后台 worker 仍继续产出事件；
@@ -21,7 +21,16 @@ def make_active_sink(active_requests, conversation_id):
             "sql": "",
             "llm_tokens": {},
             "context": None,
+            "cancel_requested": False,
         })
+        # cancel_chat 清除注册表后若仍收到尾部事件，镜像会重建快照：
+        # 补回请求号与已停止标记，保证 worker 取消判定与 finally 清理始终生效
+        if request_id and not snap.get("request_id"):
+            snap["request_id"] = request_id
+        if request_id:
+            _flag = CANCEL_FLAGS.get(conversation_id)
+            if _flag and _flag.get("request_id") == str(request_id):
+                snap["cancel_requested"] = True
         etype = event.get("type")
         parts = snap["thinking_parts"]
         if etype in ("status", "thinking"):
@@ -127,3 +136,43 @@ def _extract_node_detail(node_name, node_update):
             parts.append(str(node_update.get("self_heal_note")))
     return "\n".join(parts)
 
+
+# 停止请求的独立标记：cancel_chat 立即落盘 aborted 并清除 ACTIVE_REQUESTS 后，
+# 后台 worker 仍能据此识别"用户已停止本请求"，从而按 aborted 收尾，不再被误写成 failed/success。
+CANCEL_FLAGS = {}
+
+
+def set_cancel_flag(conversation_id: str, request_id: str, content: str = "") -> None:
+    """登记已请求停止的会话+请求号（跨线程可读，由 worker finally 清理）。
+
+    content 保存停止时已流出的部分回答：cancel_chat 会立即清除 ACTIVE_REQUESTS，
+    worker 收尾时需从此处兜底读取，避免把已保留的部分回答覆盖成"已停止生成"。
+    """
+    if conversation_id and request_id:
+        CANCEL_FLAGS[conversation_id] = {
+            "request_id": request_id,
+            "content": content,
+        }
+
+
+def clear_cancel_flag(conversation_id: str, request_id: str) -> None:
+    """清理停止标记，仅当仍属于同一请求号时删除，避免误清新请求标志。"""
+    flag = CANCEL_FLAGS.get(conversation_id)
+    if flag and flag.get("request_id") == request_id:
+        CANCEL_FLAGS.pop(conversation_id, None)
+
+
+def is_cancel_requested(active_requests, conversation_id, request_id="") -> bool:
+    """判断某会话是否有已请求的取消标志（供后台 graph 线程在流式迭代中检查）。
+
+    优先看 ACTIVE_REQUESTS 内的实时标志；cancel_chat 清除注册表后，
+    再按 request_id 匹配独立 CANCEL_FLAGS，保证 worker 仍能识别本请求已停止。
+    """
+    snap = active_requests.get(conversation_id)
+    if snap and snap.get("cancel_requested"):
+        return True
+    if request_id:
+        flag = CANCEL_FLAGS.get(conversation_id)
+        if flag and flag.get("request_id") == str(request_id):
+            return True
+    return False

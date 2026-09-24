@@ -174,10 +174,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .msg .avatar { width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
 .msg.assistant .avatar { background: var(--accent); }
 .msg.user .avatar { background: var(--accent2); }
-.msg .bubble { padding: 14px 18px; border-radius: 14px; font-size: 14px; line-height: 1.6; max-width: 100%; border: 1px solid var(--border-mid); transition: background 0.2s ease, border-color 0.2s ease; }
+.msg .bubble { padding: 14px 18px; border-radius: 14px; font-size: 14px; line-height: 1.6; max-width: 100%; min-width: 0; border: 1px solid var(--border-mid); transition: background 0.2s ease, border-color 0.2s ease; }
 .msg.assistant .bubble { background: var(--panel-bg); }
 .msg.user .bubble { background: var(--panel-alt); border-color: var(--border-strong); }
 .msg .bubble pre { background: var(--code-bg); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+.msg.user .user-bubble { position: relative; }
+.msg.user .user-bubble.editing { flex: 1 1 auto; width: auto; min-width: 0; }
+.user-bubble-edit { position: absolute; top: 8px; right: 8px; display: none; align-items: center; justify-content: center; width: 22px; height: 22px; background: var(--code-bg); border: 1px solid var(--border-mid); border-radius: 6px; color: var(--text-muted); cursor: pointer; font-size: 12px; transition: border-color 0.15s ease, color 0.15s ease; padding: 0; }
+.user-bubble-edit:hover { border-color: var(--accent); color: var(--accent); }
+.msg.user:hover .user-bubble-edit.enabled { display: inline-flex; }
+.user-edit-textarea { width: 100%; min-height: 56px; background: var(--code-bg); color: var(--text); border: 1px solid var(--focus-border); border-radius: 8px; padding: 8px 10px; font-size: 14px; font-family: inherit; line-height: 1.5; outline: none; resize: vertical; }
+.user-edit-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.user-edit-actions button { padding: 6px 14px; border: none; border-radius: 8px; font-size: 13px; cursor: pointer; transition: opacity 0.2s ease, transform 0.12s ease; }
+.user-edit-actions button:active { transform: scale(0.97); }
+.user-edit-btn-cancel { background: var(--header-bg); color: var(--text-sub); }
+.user-edit-btn-send { background: var(--accent); color: #fff; }
 
 /* 折叠面板 */
 .collapse { margin-top: 10px; }

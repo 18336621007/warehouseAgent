@@ -18,7 +18,20 @@ var resuming = {};
 // 左侧会话列表的进行中状态：conversation_id -> { active, last_status, pendingDone }
 // pendingDone 表示该会话已完成但用户尚未点击查看，用绿色小圆点提示
 var convActivity = {};
-var _convPolling = false; // 会话状态轮询是否正在执行，避免并发重叠
+var editRound = null; // 最近一轮重新生成状态（点击编辑入口后暂存）
+var localStopped = {}; // 用户主动停止过的轮次（conversation_id -> stop 时 request_id），阻止轮询重新拉回后台未完成结果
+function saveLocalStopped() {
+    // 停止标记落 localStorage：刷新/切回后仍能跳过对已停止请求的恢复
+    try { localStorage.setItem("localStopped", JSON.stringify(localStopped)); } catch (e) {}
+}
+function loadLocalStopped() {
+    // 从 localStorage 恢复本地停止标记，配合后端落盘 aborted 避免刷新后复活
+    try {
+        var _s = JSON.parse(localStorage.getItem("localStopped") || "{}");
+        if (_s && typeof _s === "object") localStopped = _s;
+    } catch (e) {}
+}
+
 
 function cssVar(name, fallback) {
     // 从当前主题的 CSS 变量读取颜色，图表等静态绘制需要用真实值时使用
@@ -120,6 +133,8 @@ async function newChat() {
         persistCurrentConversation();
         conversations[conversationId] = { title: "新对话", creator: creator, messages: [], _loadedFromServer: true };
         $("chatArea").innerHTML = '<div class="empty-state" id="emptyState">新建对话，开始查询吧</div>';
+        editRound = null;
+        resetSendButtonLabel();
         refreshConvList();
         updateInputLock();
         updateContextRing(null, null);
@@ -129,6 +144,8 @@ async function newChat() {
 
 async function loadConversation(conversationIdToLoad, opts) {
     conversationId = conversationIdToLoad;
+    editRound = null;
+    resetSendButtonLabel();
     persistCurrentConversation();
     // 点击进入会话 → 取消“完成待查看”绿色标记
     clearConversationDone(conversationIdToLoad);
@@ -163,6 +180,13 @@ async function loadConversation(conversationIdToLoad, opts) {
         if (!(opts && opts.skipResume) && _lastMsg
                 && _lastMsg.role === "assistant" && _lastMsg.status === "processing") {
             _skipStub = true;
+            // 用户已点击停止但后台仍 active：显示“正在停止…”占位，不恢复真实思考流
+            if (localStopped[conversationIdToLoad]) {
+                var _pStop = pendingRequests[conversationIdToLoad] || (pendingRequests[conversationIdToLoad] = createPendingRequest());
+                _pStop.status = "正在停止…";
+                _pStop.request_id = _lastMsg.request_id || (localStopped[conversationIdToLoad] || "");
+                _pStop.userStopped = true;
+            }
         }
         conv.messages.forEach(function (m, idx) {
             if (_skipStub && idx === conv.messages.length - 1) return;
@@ -173,6 +197,7 @@ async function loadConversation(conversationIdToLoad, opts) {
     }
     // 该会话仍有进行中请求时恢复占位消息（思考内容从状态对象读取）
     if (pendingRequests[conversationIdToLoad]) appendPendingMessage(conversationIdToLoad);
+    updateLastRoundEdit();
     refreshConvList();
     updateInputLock();
     // 上下文圆环用服务端从 Checkpoint 实时估算的占用恢复（不同会话各自独立，不依赖落盘快照）
@@ -181,7 +206,8 @@ async function loadConversation(conversationIdToLoad, opts) {
     if (!(opts && opts.skipResume)) {
         var _msgs = conv && conv.messages;
         var _last = _msgs && _msgs[_msgs.length - 1];
-        if (_last && _last.role === "assistant" && _last.status === "processing") {
+        if (_last && _last.role === "assistant" && _last.status === "processing"
+                && !localStopped[conversationIdToLoad]) {
             maybeResumeActiveRequest(conversationIdToLoad);
         }
     }
@@ -264,37 +290,75 @@ function clearConversationDone(convId) {
     }
 }
 
-async function pollConvActivity() {
-    // 定时轮询会话列表：动态刷新左侧状态图标（处理中/完成待查看），不整表重建避免打断操作
-    if (_convPolling) return;
-    _convPolling = true;
-    try {
-        var res = await fetch(API + "/conversations");
-        var data = await res.json();
-        var needListRefresh = false;
-        for (var ci = 0; ci < data.conversations.length; ci++) {
-            var c = data.conversations[ci];
-            var status = computeConvStatus(c);
-            var div = document.querySelector(".conv-item[data-conv-id=\"" + c.conversation_id + "\"]");
-            if (div) {
-                renderConvStatus(div, status);
-            } else {
-                // 飞书等后台源新增会话时，第一次探测到就重建左侧列表，不用浏览器刷新
-                needListRefresh = true;
-            }
-            // 当前正在查看的会话被飞书后台新了活跃请求：直接重载会话自动恢复轮询，
-            // 既能显示飞书用户消息，又不会重复出现“处理中”静态占位，不靠手动刷新
-            if (c.active && !activePollers[c.conversation_id] && !pendingRequests[c.conversation_id]) {
-                if (conversationId === c.conversation_id) {
-                    await loadConversation(c.conversation_id);
-                } else {
-                    maybeResumeActiveRequest(c.conversation_id);
-                }
+async function applyConversationDelta(convs) {
+    // SSE 变更快照：只做增量更新（状态图标/新会话登记），不整表重建避免打断左侧操作
+    var needListRefresh = false;
+    var known = {};
+    for (var ci = 0; ci < convs.length; ci++) {
+        var c = convs[ci];
+        known[c.conversation_id] = true;
+        var status = computeConvStatus(c);
+        var div = document.querySelector(".conv-item[data-conv-id=\"" + c.conversation_id + "\"]");
+        if (div) {
+            renderConvStatus(div, status);
+        } else {
+            // 飞书等后台源新增会话时登记元数据，稍后统一重建左侧列表
+            conversations[c.conversation_id] = conversations[c.conversation_id] || { title: c.title, creator: c.creator, messages: [] };
+            conversations[c.conversation_id].creator = c.creator || "";
+            needListRefresh = true;
+        }
+        // 后台不再 active 时清掉本地停止标记，避免影响该会话后续正常请求
+        if (!c.active && localStopped[c.conversation_id]) {
+            delete localStopped[c.conversation_id];
+            saveLocalStopped();
+            delete pendingRequests[c.conversation_id];
+            delete activePollers[c.conversation_id];
+            if (conversationId === c.conversation_id) {
+                await loadConversation(c.conversation_id);
             }
         }
-        if (needListRefresh) refreshConvList();
-    } catch (e) {}
-    finally { _convPolling = false; }
+        // 当前正在查看的会话被飞书等后台新增了活跃请求：直接重载恢复实时状态
+        if (c.active && !localStopped[c.conversation_id] && !activePollers[c.conversation_id] && !pendingRequests[c.conversation_id]) {
+            if (conversationId === c.conversation_id) {
+                await loadConversation(c.conversation_id);
+            } else {
+                maybeResumeActiveRequest(c.conversation_id);
+            }
+        }
+    }
+    if (needListRefresh) await refreshConvList();
+    // 后端已删除/软删除的会话不再出现在快照中：同步移除左侧条目与其内存状态
+    document.querySelectorAll(".conv-item[data-conv-id]").forEach(function (el) {
+        var _cid = el.getAttribute("data-conv-id");
+        if (_cid && !known[_cid]) {
+            el.remove();
+            delete conversations[_cid];
+            delete convActivity[_cid];
+            delete pendingRequests[_cid];
+            delete activePollers[_cid];
+            delete localStopped[_cid];
+            saveLocalStopped();
+        }
+    });
+}
+
+function subscribeConversationEvents() {
+    // 首屏只读一次全量，之后订阅 SSE 收到变更增量刷新，代替 2.5s 定时轮询
+    refreshConvList();
+    var es = new EventSource(API + "/conversations/events");
+    es.onmessage = function (ev) {
+        try {
+            var data = JSON.parse(ev.data || "{}");
+            if (data.conversations) applyConversationDelta(data.conversations);
+        } catch (e) {}
+    };
+    es.onopen = function () {
+        // SSE 断线重连成功后重新读一次全量，保证与后端状态一致
+        refreshConvList();
+    };
+    es.onerror = function () {
+        // EventSource 会自动重连，无需手动干预
+    };
 }
 
 async function refreshConvList() {
@@ -348,7 +412,7 @@ async function refreshConvList() {
             actions.appendChild(delBtn);
 
             div.appendChild(actions);
-            // 渲染会话状态图标（处理中/完成待查看），后续由 pollConvActivity 增量更新
+            // 渲染会话状态图标（处理中/完成待查看），后续由 SSE 变更快照增量更新
             renderConvStatus(div, computeConvStatus(c));
             list.appendChild(div);
         });
@@ -358,13 +422,17 @@ async function refreshConvList() {
 function lockInput(disabled) {
     var inp = $("msgInput"), btn = $("sendBtn");
     if (inp) inp.disabled = disabled;
-    if (btn) btn.disabled = disabled;
+    // 生成中保留按钮可点击（显示为⏹️停止），不随输入锁定禁用
+    var generating = pendingRequests[conversationId] && !pendingRequests[conversationId].doneReceived;
+    if (btn) btn.disabled = disabled && !generating;
 }
 
 function updateInputLock() {
     // 只有当前显示会话存在未结束请求（done/error 未收）时才锁定输入
     var pend = pendingRequests[conversationId];
     lockInput(!!(pend && !pend.doneReceived));
+    // 输入锁定状态变化后同步发送按钮：生成中显示⏹️停止，否则恢复发送/重新生成
+    updateSendButton();
 }
 
 function createPendingRequest() {
@@ -388,6 +456,8 @@ function createPendingRequest() {
         llmTokens: null,  // 本轮 LLM token 消耗汇总（输入/输出/缓存命中/未命中）
         contextProgress: null,  // 上下文使用进度（used/window/percent），供进度条展示
         contextCompacted: null,  // 上下文压缩提示（saved_chars 等），压缩发生时展示
+        abortCtrl: null,  // 转发流请求的 AbortController（停止生成用）
+        userStopped: false,  // 用户是否主动点击了停止
     };
 }
 
@@ -405,6 +475,10 @@ async function maybeResumeActiveRequest(convId) {
             pend.status = data.status || pend.status;
             pend.content = data.content || "";
             pend.contextProgress = data.context || null;
+            if (data.cancel_requested && !pend.userStopped) {
+                pend.userStopped = true;
+                pend.status = "正在停止…";
+            }
             if (conversationId === convId) {
                 appendPendingMessage(convId);
                 updatePendingMessage(convId);
@@ -433,6 +507,147 @@ function stopPollingActive(convId) {
     delete activePollers[convId];
 }
 
+function updateSendButton() {
+    // 根据当前状态同步发送按钮：生成中显示⏹️停止，编辑最近一轮显示“重新生成”，否则“发送”
+    var _s = $("sendBtn");
+    if (!_s) return;
+    var pend = pendingRequests[conversationId];
+    if (pend && !pend.doneReceived) {
+        _s.textContent = "⏹️";
+        _s.title = "停止生成";
+    } else {
+        _s.textContent = editRound ? "重新生成" : "发送";
+        _s.title = editRound ? "重新生成最近一轮" : "发送";
+    }
+}
+
+function resetSendButtonLabel() {
+    // 恢复/重算发送按钮文案（编辑模式结束后由“重新生成”改回“发送”）
+    updateSendButton();
+}
+
+function enterUserEditMode(uw) {
+    // 用户气泡内部就地编辑：保留时间头与编辑角标，仅隐藏正文并换成 textarea，Enter 提交，Esc 恢复
+    if (!uw || uw._editing) return;
+    var bubble = uw.querySelector(".user-bubble");
+    if (!bubble) return;
+    bubble.classList.add("editing");  // 编辑态让气泡与下方输入框同宽
+    uw._editing = true;
+    var original = uw._userContent || "";
+    var timeEl = bubble.querySelector(".msg-time");
+    var editCorner = uw._editBtn;
+    var hiddenNodes = [];
+    Array.prototype.slice.call(bubble.children).forEach(function (ch) {
+        if (ch === timeEl || ch === editCorner) return;
+        ch.style.display = "none";
+        hiddenNodes.push(ch);
+    });
+    var ta = document.createElement("textarea");
+    ta.className = "user-edit-textarea";
+    ta.value = original;
+    ta.rows = Math.max(2, Math.min(8, original.split("\n").length + 1));
+    bubble.insertBefore(ta, editCorner);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    // 气泡内操作区：取消（恢复原文）+ 发送（提交并重新生成）
+    var actions = document.createElement("div");
+    actions.className = "user-edit-actions";
+    var cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "user-edit-btn-cancel";
+    cancelBtn.textContent = "取消";
+    var sendBtn = document.createElement("button");
+    sendBtn.type = "button";
+    sendBtn.className = "user-edit-btn-send";
+    sendBtn.textContent = "发送";
+    actions.appendChild(cancelBtn);
+    actions.appendChild(sendBtn);
+    bubble.insertBefore(actions, editCorner);
+    var done = false;
+    var ignoreBlur = false;  // 点击气泡内按钮时 textarea 会失焦，先跳过 blur 恢复
+    var restore = function () {
+        if (done || ignoreBlur) return;
+        done = true;
+        ignoreBlur = false;
+        ta.remove();
+        actions.remove();
+        bubble.classList.remove("editing");
+        hiddenNodes.forEach(function (n) { n.style.display = ""; });
+        uw._editing = false;
+    };
+    var commit = function () {
+        var val = ta.value.trim();
+        if (!val) return;
+        done = true;
+        ignoreBlur = false;
+        uw._editing = false;
+        uw._userContent = val;
+        var _input = $("msgInput");
+        if (_input) _input.value = val;
+        editRound = { userEl: uw };
+        updateSendButton();
+        updateLastRoundEdit();
+        sendMsg();
+    };
+    // 按钮 mousedown 先于 click 触发，避免 textarea blur 抢先恢复导致按钮失效
+    cancelBtn.addEventListener("mousedown", function () { ignoreBlur = true; });
+    cancelBtn.addEventListener("click", function () { ignoreBlur = false; restore(); });
+    sendBtn.addEventListener("mousedown", function () { ignoreBlur = true; });
+    sendBtn.addEventListener("click", function () { ignoreBlur = false; commit(); });
+    ta.onkeydown = function (e) {
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(); }
+        else if (e.key === "Escape") { e.preventDefault(); restore(); }
+    };
+    ta.addEventListener("blur", function () { restore(); });
+}
+
+function updateLastRoundEdit() {
+    // 启用/禁用最近一轮“编辑”角标：仅最后一条 user 已跟随一条已完成 assistant 时允许
+    document.querySelectorAll(".user-bubble-edit").forEach(function (b) { b.classList.remove("enabled"); });
+    if (editRound) {
+        if (editRound.userEl && editRound.userEl._editBtn) editRound.userEl._editBtn.classList.add("enabled");
+        return;
+    }
+    var pend = pendingRequests[conversationId];
+    if (pend && !pend.doneReceived) return;
+    var conv = conversations[conversationId];
+    if (!conv || !conv.messages || conv.messages.length < 2) return;
+    var last = conv.messages[conv.messages.length - 1];
+    if (!last || last.role !== "assistant") return;
+    if (last.status !== "success" && last.status !== "failed" && last.status !== "aborted") return;
+    var btns = document.querySelectorAll(".msg.user .user-bubble-edit");
+    if (btns.length) btns[btns.length - 1].classList.add("enabled");
+}
+
+function stopGeneration(convId) {
+    // 停止当前生成：中断前端流式读取 + 通知后端取消后台执行，立即固化已生成内容
+    var pend = pendingRequests[convId];
+    if (!pend || pend.doneReceived) return;
+    pend.doneReceived = true;
+    pend.userStopped = true;
+    pend.status = "aborted";
+    // 记录本轮已本地停止，避免 SSE 变更把后台仍 active 的请求重新拉回处理中
+    localStopped[convId] = pend.request_id || true;
+    saveLocalStopped();
+    stopPollingActive(convId);
+    if (pend.thinkTimer) stopThinkTimer(pend);
+    var ctrl = pend.abortCtrl;
+    if (ctrl) { try { ctrl.abort(); } catch (e) {} }
+    try {
+        fetch(API + "/chat/cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ conversation_id: convId, request_id: pend.request_id || "" }),
+        });
+    } catch (e) {}
+    if (!pend.content || !pend.content.trim()) pend.content = "已停止生成";
+    if (pend.answerTimer) flushAnswerTypewriter(pend);
+    finalizePendingRequest(convId, pend);
+    resetSendButtonLabel();
+    updateLastRoundEdit();
+    refreshConvList();
+}
+
 async function pollActive(convId) {
     // 轮询后台进行中快照：更新占位内容；完成/结束时重载拿最终结果
     if (!activePollers[convId]) return;
@@ -457,6 +672,10 @@ async function pollActive(convId) {
     pend.status = data.status || pend.status;
     pend.content = data.content || "";
     pend.contextProgress = data.context || pend.contextProgress;
+    if (data.cancel_requested && !pend.userStopped) {
+        pend.userStopped = true;
+        pend.status = "正在停止…";
+    }
     // 恢复进行中请求时补消息时间（只补一次，避免轮询反复刷新）
     if (!pend.request_at) pend.request_at = data.request_at || fmtNow();
     // 完成态：停止轮询并重载（拿到落盘的最终答案）
@@ -477,7 +696,18 @@ async function pollActive(convId) {
 
 async function sendMsg() {
     var input = $("msgInput"); if (!input) return;
+    // 生成中发送按钮显示为⏹️，点击即停止当前生成
+    var _busyPend = pendingRequests[conversationId];
+    if (_busyPend && !_busyPend.doneReceived) {
+        stopGeneration(conversationId);
+        return;
+    }
     var msg = input.value.trim(); if (!msg) return;
+
+    // 重新生成最近一轮：编辑模式会先移除旧轮（用户+助理），再以新消息重建
+    var regenerateLast = !!editRound;
+    var editUserEl = editRound ? editRound.userEl : null;
+    if (editRound) { editRound = null; resetSendButtonLabel(); }
 
     if (!conversationId) {
         lockInput(true);
@@ -495,12 +725,29 @@ async function sendMsg() {
     if (pendingRequests[reqConv]) return;  // 该会话已有进行中请求，不重复发送
 
     var conv = conversations[reqConv];
+    // 重新生成最近一轮：移除旧用户气泡与跟随的 assistant 气泡，并删除本地消息
+    if (regenerateLast && editUserEl) {
+        var _ea = editUserEl.nextElementSibling;
+        if (_ea && _ea.className && String(_ea.className).indexOf("msg assistant") >= 0) _ea.remove();
+        editUserEl.remove();
+        if (conv && conv.messages && conv.messages.length >= 2) {
+            var _li = conv.messages.length - 1;
+            if (conv.messages[_li].role === "assistant" && conv.messages[_li - 1].role === "user") {
+                conv.messages.splice(_li - 1, 2);
+            }
+        }
+        updateLastRoundEdit();
+    }
     if (conv && (!conv.title || conv.title === "新对话")) conv.title = msg.slice(0, 40);
 
     input.value = "";
     // 占位消息状态：思考文本/状态/最终回复字段，切走再切回也能恢复
+    delete localStopped[reqConv];
+    saveLocalStopped();
     pendingRequests[reqConv] = createPendingRequest();
+    pendingRequests[reqConv].abortCtrl = new AbortController();
     lockInput(true);
+    updateSendButton();
     hideEmpty();
     var userMsgObj = { role: "user", content: msg, request_at: fmtNow() };
     appendMessage("user", msg, "", "", null, 0, "", undefined, userMsgObj);
@@ -514,8 +761,28 @@ async function sendMsg() {
         var res = await fetch(API + "/chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ conversation_id: reqConv, message: msg }),
+            body: JSON.stringify({ conversation_id: reqConv, message: msg, regenerate_last: regenerateLast }),
+            signal: (pendingRequests[reqConv] && pendingRequests[reqConv].abortCtrl) ? pendingRequests[reqConv].abortCtrl.signal : undefined,
         });
+        if (!res.ok) {
+            // 后端拒绝（如停止后立刻重发，上一请求仍在收尾）：提示真实原因，避免误报连接失败
+            var _pend = pendingRequests[reqConv];
+            if (_pend) {
+                _pend.doneReceived = true;
+                flushAnswerTypewriter(_pend);
+                var _errText = "请求被拒绝";
+                try {
+                    var _errBody = await res.json();
+                    if (_errBody && _errBody.error) _errText = "请求被拒绝：" + _errBody.error;
+                } catch (e2) {}
+                _pend.content = _errText;
+                finalizePendingRequest(reqConv, _pend);
+                updateInputLock();
+                refreshConvList();
+                updateLastRoundEdit();
+            }
+            return;
+        }
 
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
@@ -606,6 +873,8 @@ async function sendMsg() {
                         if (reqConv === conversationId) updateContextRing(pend.contextProgress, pend.contextCompacted);
                     } else if (event.type === "done") {
                         pend.doneReceived = true;
+                        if (event.status) pend.status = event.status;
+                        if (event.status === "aborted" && (!pend.content || !pend.content.trim())) pend.content = "已停止生成";
                         if (pend.thinkTimer) stopThinkTimer(pend);
                         if (pend.answerTimer) {
                             // 打字机未播完：暂存最终内容，并设 5 秒硬上限兜底固化消息
@@ -645,7 +914,7 @@ async function sendMsg() {
         if (pend) {
             pend.doneReceived = true;
             flushAnswerTypewriter(pend);
-            pend.content = "连接失败，请确认服务已启动。";
+            if (!pend.userStopped) pend.content = "连接失败，请确认服务已启动。";
         }
     }
 
@@ -672,6 +941,8 @@ function finalizePendingRequest(convId, pend) {
         thinkingSeconds: pend.thinkingSeconds || 0,
         llm_tokens: pend.llmTokens || null,
         request_at: pend.request_at || "",
+        status: pend.status || "",
+        can_chart: false,
     };
     if (conv) conv.messages.push(savedMsg);
     delete pendingRequests[convId];
@@ -687,6 +958,7 @@ function finalizePendingRequest(convId, pend) {
     }
     updateInputLock();
     refreshConvList();
+    updateLastRoundEdit();
 }
 
 function rebuildThinking(pend) {
@@ -788,6 +1060,7 @@ function appendPendingMessage(convId) {
     statusSpan.textContent = pend.status;
     bubble.appendChild(spinner); bubble.appendChild(statusSpan);
 
+    // 生成中的停止入口改在底部发送按钮（显示⏹️），气泡内不再放独立停止按钮
     // 思考过程面板：置于气泡最上方（ChatGPT 风格），默认展开，用户折叠/展开状态实时记录
     var collapse = document.createElement("div"); collapse.className = "collapse thinking-panel";
     var btn = document.createElement("button"); btn.className = "collapse-btn";
@@ -1058,12 +1331,12 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         bubble.appendChild(scoreArea);
     }
 
-    // 生成图表按钮（仿豆包）：仅成功且后端确认可生成时展示，
-    // 无法生成（failed/chat/processing/can_chart=false）不显示按钮
+    // 生成图表按钮（仿豆包）：仅后端明确确认可生成时展示（can_chart===true），
+    // 旧记录/缺失字段/无法生成（failed/chat/processing）一律不显示，避免点了才发现失败
     if (role === "assistant" && requestId && !emptyReply
             && !hasChartBlock(content)
             && msgObj && msgObj.status === "success"
-            && msgObj.can_chart !== false) {
+            && msgObj.can_chart === true) {
         var genBtn = document.createElement("button");
         genBtn.className = "chart-gen-btn";
         genBtn.type = "button";
@@ -1118,6 +1391,23 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         tEl.className = "msg-time";
         tEl.textContent = fmtMsgTime(msgObj.request_at);
         bubble.insertBefore(tEl, bubble.firstChild);
+    }
+
+    // 用户气泡右上角 hover 显示编辑角标，点击后气泡内就地编辑文字，Enter 重新生成
+    if (role === "user") {
+        var editCorner = document.createElement("button");
+        editCorner.className = "user-bubble-edit";
+        editCorner.type = "button";
+        editCorner.title = "编辑最近一轮消息重新生成";
+        editCorner.textContent = "✎";
+        editCorner.onclick = function () {
+            var uw = this.closest(".msg.user");
+            if (uw) enterUserEditMode(uw);
+        };
+        bubble.classList.add("user-bubble");
+        bubble.appendChild(editCorner);
+        wrapper._editBtn = editCorner;
+        wrapper._userContent = content;
     }
 
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
@@ -1327,10 +1617,31 @@ function normalizeChartData(spec) {
     } else if (typeof spec.yAxis === "string") {
         yField = spec.yAxis;
     }
+    // 兼容 LLM 把标题/坐标轴注释放在 spec.options 内的写法
+    var _opts = spec.options || {};
+    if (_opts.xAxis && typeof _opts.xAxis === "object" && !Array.isArray(_opts.xAxis)) {
+        xField = _opts.xAxis.field || xField;
+        xName = _opts.xAxis.name || xName;
+    } else if (typeof _opts.xAxis === "string") {
+        xField = _opts.xAxis;
+    }
+    if (_opts.yAxis && typeof _opts.yAxis === "object" && !Array.isArray(_opts.yAxis)) {
+        yField = _opts.yAxis.field || yField;
+        yName = _opts.yAxis.name || yName;
+    } else if (typeof _opts.yAxis === "string") {
+        yField = _opts.yAxis;
+    }
     var categories = Array.isArray(spec.xAxis) ? spec.xAxis.slice() : [];
     var seriesList = (spec.series || []).map(function (s) {
         return { name: s.name || "", values: s.data || [] };
     });
+    // 兼容 Chart.js 风格：data.labels + data.datasets（LLM 常见输出差异）
+    if (spec.data && Array.isArray(spec.data.labels) && Array.isArray(spec.data.datasets)) {
+        categories = spec.data.labels.slice();
+        seriesList = spec.data.datasets.map(function (s) {
+            return { name: s.label || "", values: (s.data || []).slice() };
+        });
+    }
     if (!seriesList.length && Array.isArray(spec.data) && spec.data.length) {
         // 多序列：yField/yFields 均可能为数组（兼容 LLM 两种写法）
         var yFieldList = Array.isArray(spec.yField) ? spec.yField : (Array.isArray(spec.yFields) ? spec.yFields : null);
@@ -1393,13 +1704,15 @@ function buildChartOption(spec, type) {
     var categories = norm.categories;
     var seriesList = norm.seriesList;
     if (!seriesList.length) seriesList = [{ name: "", values: [] }];
+    // 标题兼容 LLM 放入 spec.options.title 的写法，未提供则回退到 spec.title
+    var chartTitle = spec.title || (spec.options && spec.options.title) || "";
     var opt = {
         backgroundColor: "transparent",
         color: [cssVar("--accent", "#10A37F"), cssVar("--accent2", "#5C4EC2"), cssVar("--warn", "#F0C040"), cssVar("--danger2", "#E46C6C"), "#8A6CF0", "#3EC6E0"],
-        title: spec.title ? { text: spec.title, left: "center", top: 4, textStyle: { color: dark.text, fontSize: 14 } } : undefined,
+        title: chartTitle ? { text: chartTitle, left: "center", top: 4, textStyle: { color: dark.text, fontSize: 14 } } : undefined,
         tooltip: { trigger: (type === "pie" || type === "donut" || type === "heatmap") ? "item" : "axis" },
         textStyle: { color: dark.text },
-        grid: { left: norm.yName ? 64 : 48, right: 24, top: spec.title ? 44 : 24, bottom: norm.xName ? 44 : 36, containLabel: true },
+        grid: { left: norm.yName ? 64 : 48, right: 24, top: chartTitle ? 44 : 24, bottom: norm.xName ? 44 : 36, containLabel: true },
     };
     if (type === "wordcloud") {
         // 词云（关键词云图）：字号大小代表频次，对应关键词的数值大小
@@ -1437,12 +1750,12 @@ function buildChartOption(spec, type) {
             });
         });
         if (!yCats.length) yCats = ["值"];
-        opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line } }, axisLabel: { color: dark.text }, splitArea: { show: true, areaStyle: { color: ["rgba(255,255,255,0.02)", "rgba(255,255,255,0.04)"] } } };
+        opt.xAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line } }, axisLabel: { color: dark.text }, splitArea: { show: true, areaStyle: { color: ["rgba(255,255,255,0.02)", "rgba(255,255,255,0.04)"] } } };
         opt.yAxis = { type: "category", data: yCats, name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line } }, axisLabel: { color: dark.text } };
         opt.series = [{ type: "heatmap", data: cells, label: { show: true, color: dark.text, fontSize: 11 }, itemStyle: { borderColor: cssVar("--bg", "#212121"), borderWidth: 1 } }];
         if (isFinite(hMin) && isFinite(hMax) && hMax >= hMin) {
             opt.visualMap = { min: hMin, max: hMax, calculable: true, orient: "horizontal", left: "center", bottom: 0, textStyle: { color: dark.sub }, inRange: { color: [cssVar("--code-bg", "#1A1A1A"), cssVar("--hover-bg", "#2E5A45"), cssVar("--accent", "#10A37F"), cssVar("--warn", "#F0C040")] } };
-            opt.grid.bottom = 40;
+            opt.grid.bottom = norm.xName ? 68 : 40;
         }
         // 热力图同样允许横轴范围选择与缩放
         opt.dataZoom = [
@@ -1468,11 +1781,11 @@ function buildChartOption(spec, type) {
     } else {
         if (type === "hbar") {
             // 横向条形图：类别放到 y 轴，数值放到 x 轴
-            opt.xAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
-            opt.yAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
+            opt.xAxis = { type: "value", name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+            opt.yAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
         } else {
-            opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
-            opt.yAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+            opt.xAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
+            opt.yAxis = { type: "value", name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
         }
         opt.series = seriesList.map(function (s) {
             var item = { name: s.name, type: type === "area" ? "line" : (type === "hbar" ? "bar" : type), data: s.values };
@@ -1486,13 +1799,14 @@ function buildChartOption(spec, type) {
             opt.dataZoom = [{ type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true }];
         } else {
             // 底部可拖拽滑块调整横轴显示范围（常见于按日期查看区间），同时支持滚轮/拖拽缩放
-            opt.grid.bottom = 58;
+            // x 轴有名称时额外留出底部空间，避免“城市”等轴名被滑块盖住
+            opt.grid.bottom = norm.xName ? 84 : 58;
             opt.dataZoom = [
             { type: "slider", xAxisIndex: 0, height: 16, bottom: 6, showDataShadow: false,
+              filterMode: "filter",
               borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
               fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
-            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true },
-            { type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true }
+            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" }
         ];
         }
         // 0 参考线：数据存在负值时在 y=0 画一条醒目的横线，便于观测正负
@@ -1566,12 +1880,20 @@ function skipName() {
 
 (function init() {
     // 初始化主题：恢复已选配色并绑定切换事件
+    loadLocalStopped();
     initTheme();
+    // 编辑最近一轮模式下按 Esc 取消编辑，恢复普通发送
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && editRound) {
+            editRound = null;
+            resetSendButtonLabel();
+            updateLastRoundEdit();
+        }
+    });
     // 图表随窗口/侧栏尺寸变化自适应，避免容器大小改变后出现遮挡
     window.addEventListener("resize", function () { chartResizeAll(); });
-    // 准实时刷新左侧会话状态：处理中显示加载圈，完成后变绿色待点击
-    setInterval(pollConvActivity, 2500);
-    pollConvActivity();
+    // 左侧会话状态改为 SSE 推送：首屏只读一次全量，后续接收变更增量，不再 2.5s 轮询
+    subscribeConversationEvents();
     // 创建人：首次进入在页面内弹层让用户自行选择“确定”或“跳过”（不用 prompt，切窗口不消失）
     creator = localStorage.getItem("creator") || "";
     // 旧逻辑残留的“未命名”也视为未设置，让用户重新选择一次

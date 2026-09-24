@@ -7,6 +7,8 @@ from agentTest.validate.sql_validate import is_read_only_sql
 from agentTest.validate.sql_validate import validate_hive_sql
 from agentTest.config.planner import PROBE_VALUES_LIMIT_DEFAULT
 from agentTest.config.planner import PROBE_VALUES_LIMIT_MAX
+from agentTest.langgraph_app.tools.sql_query_tool import QueryCancelledError
+from agentTest.langgraph_app.tools.sql_query_tool import run_query_cancellable
 
 # LIKE 特殊字符（% _ \），转义避免关键词被当作通配符匹配越界
 _LIKE_SPECIAL = re.compile(r"[%_\\]")
@@ -103,7 +105,14 @@ def build_probe_values_tool(datasource, metadata_provider, limit_default=PROBE_V
             return f"探查 SQL 未通过 Hive 校验：{message}"
 
         try:
-            result = probe_datasource.query(sql, timeout_seconds=QUERY_TIMEOUT_SECONDS, max_rows=limit_int)
+            result = run_query_cancellable(
+                probe_datasource,
+                sql,
+                timeout_seconds=QUERY_TIMEOUT_SECONDS,
+                max_rows=limit_int,
+            )
+        except QueryCancelledError:
+            return "值探查已停止：用户已终止本轮生成。"
         except Exception as error:
             return f"值探查执行失败：{error}"
 

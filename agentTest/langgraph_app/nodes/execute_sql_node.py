@@ -8,6 +8,7 @@ from agentTest.langgraph_app.runtime.graph_logger import log_node_start
 from agentTest.langgraph_app.runtime.graph_logger import log_node_event
 from agentTest.langgraph_app.runtime.graph_logger import start_timer
 from agentTest.langgraph_app.state.agent_state import AgentState
+from agentTest.langgraph_app.tools.sql_query_tool import QueryCancelledError
 from agentTest.langgraph_app.services.sql_table_filter_validator import resolve_required_filter_fields
 
 
@@ -142,6 +143,14 @@ def build_execute_sql_node(runtime):
                     "sql_result": sql_result,
                     "sql_exec_failed": False,
                     "sql_exec_error": "",
+                }
+            except QueryCancelledError:
+                # 用户在 SQL 执行期间点了停止：不再降级，直接返回取消标记
+                log_node_error("execute_sql", error="查询已停止（用户终止本轮生成）", ms=elapsed_ms(timer))
+                return {
+                    "sql_exec_failed": True,
+                    "sql_exec_error": "查询已停止",
+                    "sql_result": None,
                 }
             except ValueError as error:
                 # 校验失败：引擎无关，不降级，直接返回（换引擎大概率同样拒绝）
