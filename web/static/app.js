@@ -20,6 +20,64 @@ var resuming = {};
 var convActivity = {};
 var _convPolling = false; // 会话状态轮询是否正在执行，避免并发重叠
 
+function cssVar(name, fallback) {
+    // 从当前主题的 CSS 变量读取颜色，图表等静态绘制需要用真实值时使用
+    try {
+        var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        if (v) return v;
+    } catch (e) {}
+    return fallback;
+}
+function cssRgb(name, fallback) {
+    // 读取 --xxx-rgb 类的显式降质变量（例如 16, 163, 127），用于生成 canvas 支持的 rgba 颜色
+    var raw = cssVar(name, fallback || "");
+    var parts = String(raw).split(",").map(function (x) { return String(x).trim(); }).filter(function (x) { return x !== ""; });
+    return parts.length >= 3 ? (parts.slice(0, 3).join(", ")) : (fallback || "16, 163, 127");
+}
+function applyTheme(theme, persist) {
+    // 应用主题：设置 html data-theme + 回写选择框，并重新渲染已生成的图表配色
+    document.documentElement.setAttribute("data-theme", theme);
+    if (persist) { try { localStorage.setItem("theme", theme); } catch (e) {} }
+    var sel = $("themeSelect");
+    if (sel) sel.value = theme;
+    // 主题切换平滑过渡：临时加过渡类，结束后移除，避免长期全局 transition 干扰既有动画
+    var html = document.documentElement;
+    html.classList.add("theme-switching");
+    if (html._themeTransTimer) clearTimeout(html._themeTransTimer);
+    html._themeTransTimer = setTimeout(function () {
+        html.classList.remove("theme-switching");
+    }, 420);
+    reApplyCharts();
+}
+function initTheme() {
+    // 开页恢复用户选择的主题；切换时提前读取选择框
+    var theme = "dark";
+    try { theme = localStorage.getItem("theme") || "dark"; } catch (e) {}
+    applyTheme(theme, false);
+    var sel = $("themeSelect");
+    if (sel) sel.addEventListener("change", function () { applyTheme(sel.value, true); });
+}
+function reApplyCharts() {
+    // 主题切换后：重置已渲染图表并重新构建，保留用户手动选择的图表类型
+    var savedSpecs = [];
+    document.querySelectorAll(".chart-box[data-chart]").forEach(function (el) {
+        savedSpecs.push({ el: el, spec: el._chartSpec ? JSON.parse(JSON.stringify(el._chartSpec)) : null });
+        try {
+            if (el._chart) { try { el._chart.dispose(); } catch (e) {} el._chart = null; }
+            el._chartRendered = false;
+            delete el._decorated;
+            if (el._chartHolder) { el._chartHolder.innerHTML = ""; }
+            else el.innerHTML = "";
+        } catch (e) {}
+    });
+    renderCharts(document.body);
+    savedSpecs.forEach(function (item) {
+        if (item.spec && item.el._chartSpec && item.spec.type !== item.el._chartSpec.type) {
+            try { switchChartType(item.el, item.spec.type); } catch (e) {}
+        }
+    });
+}
+
 function persistCurrentConversation() {
     // 切换/新建/删除会话时记录当前会话到 localStorage，刷新后恢复用户原本所在会话
     if (conversationId) localStorage.setItem("currentConvId", conversationId);
@@ -213,11 +271,28 @@ async function pollConvActivity() {
     try {
         var res = await fetch(API + "/conversations");
         var data = await res.json();
-        data.conversations.forEach(function (c) {
+        var needListRefresh = false;
+        for (var ci = 0; ci < data.conversations.length; ci++) {
+            var c = data.conversations[ci];
             var status = computeConvStatus(c);
             var div = document.querySelector(".conv-item[data-conv-id=\"" + c.conversation_id + "\"]");
-            if (div) renderConvStatus(div, status);
-        });
+            if (div) {
+                renderConvStatus(div, status);
+            } else {
+                // 飞书等后台源新增会话时，第一次探测到就重建左侧列表，不用浏览器刷新
+                needListRefresh = true;
+            }
+            // 当前正在查看的会话被飞书后台新了活跃请求：直接重载会话自动恢复轮询，
+            // 既能显示飞书用户消息，又不会重复出现“处理中”静态占位，不靠手动刷新
+            if (c.active && !activePollers[c.conversation_id] && !pendingRequests[c.conversation_id]) {
+                if (conversationId === c.conversation_id) {
+                    await loadConversation(c.conversation_id);
+                } else {
+                    maybeResumeActiveRequest(c.conversation_id);
+                }
+            }
+        }
+        if (needListRefresh) refreshConvList();
     } catch (e) {}
     finally { _convPolling = false; }
 }
@@ -983,12 +1058,12 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
         bubble.appendChild(scoreArea);
     }
 
-    // 生成图表按钮（仿豆包）：回答未含图表且该轮有可用落盘结果时展示，
-    // 点击后由后端按落盘结果自动生成图表，格式与 make_chart 工具完全一致
-    // 纯闲聊（chat）/失败（failed）无查询结果，不显示生成按钮
+    // 生成图表按钮（仿豆包）：仅成功且后端确认可生成时展示，
+    // 无法生成（failed/chat/processing/can_chart=false）不显示按钮
     if (role === "assistant" && requestId && !emptyReply
             && !hasChartBlock(content)
-            && (!msgObj || (msgObj.status !== "failed" && msgObj.status !== "chat"))) {
+            && msgObj && msgObj.status === "success"
+            && msgObj.can_chart !== false) {
         var genBtn = document.createElement("button");
         genBtn.className = "chart-gen-btn";
         genBtn.type = "button";
@@ -1011,12 +1086,8 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
                 });
                 var data = await resp.json();
                 if (!data.success || !data.charts || !data.charts.length) {
-                    genBtn.disabled = false;
-                    genBtn.textContent = "📊 生成图表";
-                    var errEl = document.createElement("div");
-                    errEl.className = "chart-gen-error";
-                    errEl.textContent = data.error || "暂无可用数据生成图表";
-                    bubble.appendChild(errEl);
+                    // 后端无法生成图表（无落盘/无适合数据）：直接隐藏按钮，不保留错误提示
+                    genBtn.remove();
                     return;
                 }
                 // 生成成功：按钮替换为图表，渲染后可点类型切换折线/柱状/饼图
@@ -1034,19 +1105,19 @@ function appendMessage(role, content, sql, thinking, evaluator, dialogueId, requ
                 var firstChart = bubble.querySelector(".chart-box");
                 if (firstChart) firstChart.scrollIntoView({ behavior: "smooth", block: "nearest" });
             } catch (e) {
-                genBtn.disabled = false;
-                genBtn.textContent = "📊 生成图表";
+                // 生成失败同样隐藏按钮，不再保留无法成图的入口
+                genBtn.remove();
             }
         };
         bubble.appendChild(genBtn);
     }
 
-    // 消息发送时间：从消息记录读取 request_at（随 MySQL 落盘），无则省略
+    // 消息发送时间：从消息记录读取 request_at（随 MySQL 落盘），显示在气泡上方
     if (msgObj && msgObj.request_at) {
         var tEl = document.createElement("div");
         tEl.className = "msg-time";
         tEl.textContent = fmtMsgTime(msgObj.request_at);
-        bubble.appendChild(tEl);
+        bubble.insertBefore(tEl, bubble.firstChild);
     }
 
     wrapper.appendChild(avatar); wrapper.appendChild(bubble);
@@ -1154,14 +1225,70 @@ function chartResizeAll() {
     });
 }
 
+function ensureChartDecor(el) {
+    // 给图表容器挂上类型切换工具栏 + 图表 holder（仅首次初始化一次）
+    if (el._decorated) return;
+    el.innerHTML = "";
+    var toolbar = document.createElement("div"); toolbar.className = "chart-toolbar";
+    var items = [["line", "折线"], ["bar", "柱状"], ["hbar", "条形"], ["area", "面积"], ["pie", "饼图"], ["donut", "环形"], ["heatmap", "热力"], ["wordcloud", "词云"]];
+    items.forEach(function (pair) {
+        var btn = document.createElement("button");
+        btn.className = "chart-type-btn";
+        btn.dataset.type = pair[0];
+        btn.textContent = pair[1];
+        btn.onclick = function () { switchChartType(el, pair[0]); };
+        toolbar.appendChild(btn);
+    });
+    var holder = document.createElement("div"); holder.className = "chart-holder";
+    el.appendChild(toolbar);
+    el.appendChild(holder);
+    el._chartToolbar = toolbar;
+    el._chartHolder = holder;
+    el._decorated = true;
+}
+
+function renderChartFallback(el, txt) {
+    // 图表解析/渲染失败时回退展示原始 JSON，保证内容可见
+    try { txt = JSON.stringify(JSON.parse(txt || ""), null, 2); } catch (e) {}
+    if (el._chartHolder) el._chartHolder.innerHTML = "<pre style=\"margin:0;white-space:pre-wrap;font-size:12px;color:var(--text-sub)\">" + String(txt).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</pre>";
+    else el.innerHTML = "<pre style=\"margin:0;white-space:pre-wrap;font-size:12px;color:var(--text-sub)\">" + String(txt).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</pre>";
+}
+
+function switchChartType(el, type) {
+    // 用户手动切换图表类型：重建 ECharts（折线/柱状/面积/饼图/环形/热力）
+    if (!el || !el._chartSpec) return;
+    var spec = JSON.parse(JSON.stringify(el._chartSpec));
+    spec.type = type;
+    try {
+        var holder = el._chartHolder || el;
+        if (el._chart) { try { el._chart.dispose(); } catch (e) {} el._chart = null; }
+        el._chartRendered = false;
+        var opt = buildChartOption(spec, type);
+        var hasData = (opt.series || []).some(function (s) { return s.data && s.data.length; });
+        if (!hasData) { renderChartFallback(el, el.dataset.chart || ""); return; }
+        holder.innerHTML = "";
+        var chart = echarts.init(holder);
+        chart.setOption(opt);
+        el._chart = chart;
+        el._chartSpec = spec;
+        el._chartRendered = true;
+        if (el._chartToolbar) {
+            el._chartToolbar.querySelectorAll(".chart-type-btn").forEach(function (b) {
+                b.classList.toggle("active", b.dataset.type === type);
+            });
+        }
+        chart.resize();
+    } catch (e) {
+        renderChartFallback(el, el.dataset.chart || "");
+    }
+}
+
 function renderCharts(root) {
     // 扫描并渲染图表块：数据来自 execute_query 真实结果，仅渲染一次，避免流式反复重建
     if (!root || typeof window.echarts === "undefined") {
         // ECharts 未加载时回退展示原始 JSON，保证内容可见
         if (root) root.querySelectorAll(".chart-box[data-chart]").forEach(function (el) {
-            var txt = el.dataset.chart || "";
-            try { txt = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {}
-            el.innerHTML = "<pre style=\"margin:0;white-space:pre-wrap;font-size:12px;color:#ACACBE\">" + txt.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</pre>";
+            renderChartFallback(el, el.dataset.chart || "");
         });
         return;
     }
@@ -1170,18 +1297,12 @@ function renderCharts(root) {
         try {
             var spec = JSON.parse(el.dataset.chart || "null");
             if (!spec || !spec.type) throw new Error("bad chart spec");
-            var opt = buildChartOption(spec);
-            // 数据为空兜底：不渲染空白图，回退展示原始 JSON，避免"看不到图表"
-            var hasData = (opt.series || []).some(function (s) { return s.data && s.data.length; });
-            if (!hasData) throw new Error("empty chart data");
-            var chart = echarts.init(el);
-            chart.setOption(opt);
-            el._chart = chart;
+            ensureChartDecor(el);
             el._chartSpec = spec;
-            el._chartRendered = true;
+            switchChartType(el, spec.type || "bar");
         } catch (e) {
             // 解析/渲染失败或数据为空：回退展示原始 JSON，不显示空白图表框
-            el.innerHTML = "<pre style=\"margin:0;white-space:pre-wrap;font-size:12px;color:#ACACBE\">" + (el.dataset.chart || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</pre>";
+            renderChartFallback(el, el.dataset.chart || "");
         }
     });
 }
@@ -1230,6 +1351,11 @@ function normalizeChartData(spec) {
         categories = seriesList[0].values.map(function (v) { return v.name; });
         seriesList[0].values = seriesList[0].values.map(function (v) { return v.value; });
     }
+    if (spec.wordField && spec.valueField && Array.isArray(spec.data) && spec.data.length && !categories.length) {
+        // 词云：把 word/value 转成一组系列（词 + 词频），方便切换折线/柱状等
+        categories = spec.data.map(function (d) { return String(d[spec.wordField] != null ? d[spec.wordField] : ""); });
+        seriesList = [{ name: spec.yName || spec.valueField, values: spec.data.map(function (d) { var v = Number(d[spec.valueField]); return isNaN(v) ? null : v; }) }];
+    }
     return {
         categories: categories,
         seriesList: seriesList,
@@ -1260,8 +1386,8 @@ function buildPieData(categories, values) {
 
 function buildChartOption(spec, type) {
     // 把 LLM 输出的简单图表描述转成 ECharts option（深色主题适配当前界面）
-    // type 缺省时用 spec.type（图表类型已由 AI 决定，不再提供用户切换）
-    var dark = { text: "#ECECF1", sub: "#9A9AAC", line: "#7A7A8A", split: "#3A3A44" };
+    // type 缺省时用 spec.type（默认图表类型由 AI 决定，用户可通过图表工具栏切换）
+    var dark = { text: cssVar("--text", "#ECECF1"), sub: cssVar("--text-faint", "#9A9AAC"), line: cssVar("--border-mid", "#7A7A8A"), split: cssVar("--border-dim", "#3A3A44") };
     type = type || spec.type || "bar";
     var norm = normalizeChartData(spec);
     var categories = norm.categories;
@@ -1269,52 +1395,113 @@ function buildChartOption(spec, type) {
     if (!seriesList.length) seriesList = [{ name: "", values: [] }];
     var opt = {
         backgroundColor: "transparent",
-        color: ["#10A37F", "#4E8CF0", "#F0C040", "#E46C6C", "#8A6CF0", "#3EC6E0"],
+        color: [cssVar("--accent", "#10A37F"), cssVar("--accent2", "#5C4EC2"), cssVar("--warn", "#F0C040"), cssVar("--danger2", "#E46C6C"), "#8A6CF0", "#3EC6E0"],
         title: spec.title ? { text: spec.title, left: "center", top: 4, textStyle: { color: dark.text, fontSize: 14 } } : undefined,
-        tooltip: { trigger: type === "pie" ? "item" : "axis" },
+        tooltip: { trigger: (type === "pie" || type === "donut" || type === "heatmap") ? "item" : "axis" },
         textStyle: { color: dark.text },
         grid: { left: norm.yName ? 64 : 48, right: 24, top: spec.title ? 44 : 24, bottom: norm.xName ? 44 : 36, containLabel: true },
     };
-    if (type === "pie") {
+    if (type === "wordcloud") {
+        // 词云（关键词云图）：字号大小代表频次，对应关键词的数值大小
+        var words = [];
+        if (spec.wordField && spec.valueField && Array.isArray(spec.data)) {
+            spec.data.forEach(function (d) {
+                var v = Number(d[spec.valueField]);
+                if (!isNaN(v) && v > 0) words.push({ name: String(d[spec.wordField] != null ? d[spec.wordField] : ""), value: v });
+            });
+        }
+        if (!words.length) {
+            // 普通图表数据回退：把类别当关键词，取第一组数值作为词频
+            (seriesList[0] && seriesList[0].values || []).forEach(function (v, i) {
+                var n = Number(v);
+                if (!isNaN(n) && n > 0) words.push({ name: String(categories[i] || ("词" + (i + 1))), value: n });
+            });
+        }
+        opt.series = [{ type: "wordCloud", shape: "circle", sizeRange: [14, 68], rotationRange: [-45, 45], rotationStep: 15, gridSize: 8, width: "94%", height: "90%", drawOutOfBound: false, textStyle: { color: cssVar("--accent", "#10A37F") }, emphasis: { textStyle: { color: cssVar("--text", "#ECECF1") } }, data: words }];
+        delete opt.xAxis; delete opt.yAxis; delete opt.dataZoom; delete opt.legend;
+        opt.tooltip = { trigger: "item", formatter: function (p) { return (p.name || "") + ": " + (p.value == null ? "" : p.value); } };
+        return opt;
+    } else if (type === "heatmap") {
+        // 热力图：x 轴为分类/日期，y 轴为系列，颜色深浅表示值大小
+        var cells = [];
+        var yCats = [];
+        var hMin = Infinity, hMax = -Infinity;
+        seriesList.forEach(function (s, si) {
+            yCats.push(s.name || ("系列" + (si + 1)));
+            (s.values || []).forEach(function (v, ci) {
+                var n = Number(v);
+                if (isNaN(n)) return;
+                cells.push([ci, si, n]);
+                if (n < hMin) hMin = n;
+                if (n > hMax) hMax = n;
+            });
+        });
+        if (!yCats.length) yCats = ["值"];
+        opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line } }, axisLabel: { color: dark.text }, splitArea: { show: true, areaStyle: { color: ["rgba(255,255,255,0.02)", "rgba(255,255,255,0.04)"] } } };
+        opt.yAxis = { type: "category", data: yCats, name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line } }, axisLabel: { color: dark.text } };
+        opt.series = [{ type: "heatmap", data: cells, label: { show: true, color: dark.text, fontSize: 11 }, itemStyle: { borderColor: cssVar("--bg", "#212121"), borderWidth: 1 } }];
+        if (isFinite(hMin) && isFinite(hMax) && hMax >= hMin) {
+            opt.visualMap = { min: hMin, max: hMax, calculable: true, orient: "horizontal", left: "center", bottom: 0, textStyle: { color: dark.sub }, inRange: { color: [cssVar("--code-bg", "#1A1A1A"), cssVar("--hover-bg", "#2E5A45"), cssVar("--accent", "#10A37F"), cssVar("--warn", "#F0C040")] } };
+            opt.grid.bottom = 40;
+        }
+        // 热力图同样允许横轴范围选择与缩放
+        opt.dataZoom = [
+            { type: "slider", xAxisIndex: 0, height: 14, bottom: 6, showDataShadow: false, borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 } },
+            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true }
+        ];
+    } else if (type === "pie" || type === "donut") {
+        // 环形图 = 饼图 + 内圈留白；普通饼图仍沿用实心样式
+        var pieRadius = type === "donut" ? ["42%", "62%"] : ["0%", "52%"];
         opt.series = seriesList.map(function (s) {
             return {
-                name: s.name, type: "pie", radius: ["0%", "52%"], center: ["36%", "50%"],
+                name: s.name, type: "pie", radius: pieRadius, center: ["36%", "50%"],
                 data: buildPieData(categories, s.values),
                 minAngle: 2,
                 avoidLabelOverlap: true,
                 label: { color: dark.text, fontSize: 11, formatter: "{b}: {d}%", overflow: "truncate", width: 70 },
                 labelLine: { length: 10, length2: 8, lineStyle: { color: dark.sub } },
-                itemStyle: { borderColor: "#212121", borderWidth: 1 }
+                itemStyle: { borderColor: cssVar("--bg", "#212121"), borderWidth: 1 }
             };
         });
         // 图例放右侧避免遮挡饼图底部与标签，扇区多时可滚动；给图例固定宽度，避免窄屏下遮挡饼图
         opt.legend = { orient: "vertical", right: 4, top: "middle", width: 86, type: "scroll", itemWidth: 9, itemHeight: 9, itemGap: 3, textStyle: { color: dark.sub, fontSize: 11 } };
     } else {
-        opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
-        opt.yAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+        if (type === "hbar") {
+            // 横向条形图：类别放到 y 轴，数值放到 x 轴
+            opt.xAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+            opt.yAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
+        } else {
+            opt.xAxis = { type: "category", data: categories, name: norm.xName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
+            opt.yAxis = { type: "value", name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+        }
         opt.series = seriesList.map(function (s) {
-            var item = { name: s.name, type: type === "area" ? "line" : type, data: s.values };
+            var item = { name: s.name, type: type === "area" ? "line" : (type === "hbar" ? "bar" : type), data: s.values };
             if (type === "line" || type === "area") { item.smooth = true; item.lineStyle = { width: 2 }; }
             if (type === "area") { item.areaStyle = {}; }
-            if (type === "bar") { item.barMaxWidth = 40; }
+            if (type === "bar" || type === "hbar") { item.barMaxWidth = 40; }
             return item;
         });
-        // 底部可拖拽滑块调整横轴显示范围（常见于按日期查看区间），同时支持滚轮/拖拽缩放
-        opt.grid.bottom = 58;
-        opt.dataZoom = [
+        if (type === "hbar") {
+            // 横向条形图：类别多时可向上缩放/滚动 y 轴
+            opt.dataZoom = [{ type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true }];
+        } else {
+            // 底部可拖拽滑块调整横轴显示范围（常见于按日期查看区间），同时支持滚轮/拖拽缩放
+            opt.grid.bottom = 58;
+            opt.dataZoom = [
             { type: "slider", xAxisIndex: 0, height: 16, bottom: 6, showDataShadow: false,
               borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
-              fillerColor: "rgba(16,163,127,0.16)", handleStyle: { color: dark.text } },
+              fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
             { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true },
             { type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true }
         ];
+        }
         // 0 参考线：数据存在负值时在 y=0 画一条醒目的横线，便于观测正负
         var hasNegative = seriesList.some(function (s) {
             return (s.values || []).some(function (v) { return typeof v === "number" && v < 0; });
         });
         if (hasNegative) {
             opt.series.forEach(function (item) {
-                item.markLine = { silent: true, symbol: "none", lineStyle: { color: "#F0C040", width: 1.2 }, label: { show: false }, data: [{ yAxis: 0 }] };
+                item.markLine = { silent: true, symbol: "none", lineStyle: { color: cssVar("--warn", "#F0C040"), width: 1.2 }, label: { show: false }, data: type === "hbar" ? [{ xAxis: 0 }] : [{ yAxis: 0 }] };
             });
         }
         opt.legend = { top: 0, right: 8, textStyle: { color: dark.sub } };
@@ -1378,6 +1565,8 @@ function skipName() {
 }
 
 (function init() {
+    // 初始化主题：恢复已选配色并绑定切换事件
+    initTheme();
     // 图表随窗口/侧栏尺寸变化自适应，避免容器大小改变后出现遮挡
     window.addEventListener("resize", function () { chartResizeAll(); });
     // 准实时刷新左侧会话状态：处理中显示加载圈，完成后变绿色待点击

@@ -312,7 +312,7 @@ def chat():
             if intent_result.intent == "chat":
                 reply = intent_result.quick_reply or "你好！有什么可以帮你的吗？"
                 session["messages"].append({"role": "user", "content": message, "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S")})
-                session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "request_id": request_id, "thinking_seconds": round(elapsed_ms(request_timer) / 1000), "status": "chat", "error_message": "", "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S")})
+                session["messages"].append({"role": "assistant", "content": reply, "sql": "", "thinking": "[intent] chat", "evaluator": None, "request_id": request_id, "thinking_seconds": round(elapsed_ms(request_timer) / 1000), "status": "chat", "error_message": "", "can_chart": False, "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S")})
                 _persist_conversation(conversation_id)
                 log_request_end(
                     result_type="chat",
@@ -342,7 +342,7 @@ def chat():
             "role": "assistant", "content": "", "sql": "", "thinking": "",
             "dialogue_id": 0, "evaluator": None, "llm_tokens": {},
             "request_id": request_id, "thinking_seconds": 0,
-            "status": "processing", "error_message": "",
+            "status": "processing", "error_message": "", "can_chart": False,
             "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
         })
         _persist_conversation(conversation_id)
@@ -491,6 +491,9 @@ def chat():
             # 请求级 LLM token 汇总（在 log_request_end 清理聚合器之前读取）
             llm_tokens = get_llm_token_usage()
             # 覆盖本轮开头的"处理中"占位回答（round_no 不变），不新增轮次
+            # 成功轮回填 can_chart：仅当该请求存在可自动成图的落盘结果时为 True，
+            # 前端据此决定是否显示『生成图表』按钮（无法生成就不展示）
+            from agentTest.langgraph_app.tools.chart_tool import has_chartable_result
             session["messages"][-1] = {
                 "role": "assistant", "content": final_answer, "sql": display_sql,
                 "thinking": "\n".join(thinking_parts),
@@ -501,6 +504,7 @@ def chat():
                 "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
                 "status": "success",
                 "error_message": "",
+                "can_chart": has_chartable_result(conversation_id, request_id),
                 "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
             }
             _persist_conversation(conversation_id)
@@ -586,6 +590,7 @@ def chat():
                 "thinking_seconds": round(elapsed_ms(request_timer) / 1000),
                 "status": "failed",
                 "error_message": f"{QUERY_ERROR_CODE}:{error_id}",
+                "can_chart": False,
                 "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
             }
             _persist_conversation(conversation_id)

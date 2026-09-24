@@ -70,9 +70,50 @@ def _draw_pie(ax, x_vals, values, title):
         ax.set_title(title, fontsize=12)
 
 
+def _render_wordcloud(spec: dict, width: float = 9.0, height: float = 4.6) -> bytes:
+    """词云（关键词云图）：字号大小代表频次，与前端 ECharts wordCloud 一致。"""
+    word_field = str(spec.get("wordField") or "word")
+    val_field = str(spec.get("valueField") or "value")
+    data = spec.get("data") or []
+    title = str(spec.get("title") or "")
+    pairs = []
+    for d in data:
+        name = str(d.get(word_field, "")).strip()
+        val = _to_float(d.get(val_field))
+        if name and val is not None and val > 0:
+            pairs.append((name, val))
+    if not pairs:
+        raise ValueError("词云 spec 未找到有效的关键词/数值。")
+    pairs.sort(key=lambda kv: -kv[1])
+    pairs = pairs[:120]
+    freq = dict(pairs)
+    import os
+    from wordcloud import WordCloud
+    font_path = None
+    for fp in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyh.ttf", r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\simsun.ttc"):
+        if os.path.exists(fp):
+            font_path = fp
+            break
+    wc = WordCloud(font_path=font_path, width=1200, height=520, background_color="white",
+                   prefer_horizontal=0.9, collocations=False, max_words=len(pairs), random_state=42)
+    wc.generate_from_frequencies(freq)
+    fig, ax = plt.subplots(figsize=(width, height), dpi=150)
+    ax.imshow(wc, interpolation="bilinear")
+    ax.axis("off")
+    if title:
+        ax.set_title(title, fontsize=12)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def render_spec_png(spec: dict, width: float = 9.0, height: float = 4.6) -> bytes:
     """把规范图表 spec 渲染成 PNG bytes；spec 结构同 make_chart 输出。"""
     chart_type = str(spec.get("type") or "line")
+    if chart_type == "wordcloud":
+        return _render_wordcloud(spec, width, height)
     x_field = str(spec.get("xField") or "")
     y_field = spec.get("yField") or ""
     data = spec.get("data") or []

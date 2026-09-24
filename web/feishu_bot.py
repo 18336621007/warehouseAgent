@@ -296,11 +296,15 @@ class FeishuBot:
         start_wall = time.time()
         try:
             # 正常链路：占位落盘 → 流式执行 → 用最终状态覆盖占位
-            self.sessions[cid]["messages"].append({"role": "user", "content": text})
+            _now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            self.sessions[cid]["messages"].append({
+                "role": "user", "content": text, "request_at": _now_str,
+            })
             self.sessions[cid]["messages"].append({
                 "role": "assistant", "content": "", "sql": "", "thinking": "",
                 "request_id": request_id, "thinking_seconds": 0,
                 "status": "processing", "error_message": "", "llm_tokens": {},
+                "request_at": _now_str,
             })
             _persist(self.sessions, cid)
             # 注册为进行中请求：飞书会话也能在网页端轮询到实时思考/回答
@@ -385,6 +389,7 @@ class FeishuBot:
                     "thinking_seconds": round(time.time() - start_wall),
                     "status": "success", "error_message": "",
                     "llm_tokens": llm_tokens,
+                    "request_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                 }
                 _persist(self.sessions, cid)
                 bus.emit({
@@ -402,6 +407,7 @@ class FeishuBot:
                     "thinking_seconds": round(time.time() - start_wall),
                     "status": "failed", "error_message": error,
                     "llm_tokens": {},
+                    "request_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                 }
                 _persist(self.sessions, cid)
                 bus.emit({

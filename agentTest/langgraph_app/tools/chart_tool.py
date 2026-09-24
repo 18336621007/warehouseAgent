@@ -12,8 +12,8 @@ from agentTest.langgraph_app.tools.result_query_tool import get_result_conversat
 
 # 图表最大行数上限（防止超大结果撑爆 prompt/前端）
 MAX_CHART_ROWS = 200
-# 支持的图表类型（折线/柱状/面积/饼图）
-_ALLOWED_TYPES = ("line", "bar", "pie", "area")
+# 支持的图表类型（折线/柱状/面积/饼图/词云）
+_ALLOWED_TYPES = ("line", "bar", "pie", "area", "wordcloud")
 
 
 def _to_str_list(value) -> list:
@@ -117,6 +117,31 @@ def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields:
     for f in y_fields:
         if f not in col_set:
             return None, f"y_field '{f}' 不在结果字段中，可用字段: {', '.join(columns) or '无'}。"
+    if type == "wordcloud":
+        # 关键词词云：y_fields[0]=关键词列，y_fields[1]=数值列（字号大小与数值正相关）
+        if len(y_fields) < 2:
+            return None, "wordcloud 需要 y_fields 传两个字段：[关键词列, 数值列]。"
+        word_field, value_field = y_fields[0], y_fields[1]
+        max_rows = max(1, min(int(max_rows or MAX_CHART_ROWS), MAX_CHART_ROWS))
+        chart_rows = []
+        for r in rows[:max_rows]:
+            raw = r.get(value_field)
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                val = raw
+            chart_rows.append({word_field: r.get(word_field), value_field: val})
+        if not chart_rows:
+            return None, "落盘结果为空，无法生成词云。"
+        spec = {
+            "type": "wordcloud",
+            "title": title or "",
+            "wordField": word_field,
+            "valueField": value_field,
+            "yName": y_name or word_field,
+            "data": chart_rows,
+        }
+        return spec, ""
     # 未显式指定时自动探测 x/y（前端按钮与 LLM 缺参场景）
     if not x_field or not y_fields:
         auto_x, auto_y = detect_chart_fields(columns, rows)
@@ -192,6 +217,35 @@ def build_charts_for_request(conversation_id: str, request_id: str, type: str = 
     return specs, ""
 
 
+def has_chartable_result(conversation_id: str, request_id: str) -> bool:
+    """轻量判断该请求是否有可用于自动生成图表的数据（供前端『生成图表』按钮显隐）。
+
+    复用落盘索引的 columns + preview_rows 用 detect_chart_fields 探测 x/y，
+    不读全量 CSV，避免大结果在每轮完成时造成额外 IO。
+    """
+    from agentTest.langgraph_app.services.result_store import list_result_index
+    if not conversation_id or not request_id:
+        return False
+    request_id = str(request_id or "").strip()
+    entries = list_result_index(conversation_id, limit=20)
+    matched = [
+        e for e in entries
+        if str(e.get("source_request_id") or "").startswith(request_id)
+        or str(e.get("result_id") or "").startswith(request_id)
+    ]
+    if not matched:
+        return False
+    for e in matched:
+        columns = list(e.get("columns") or [])
+        rows = list(e.get("preview_rows") or [])
+        if not columns or not rows:
+            continue
+        x, ys = detect_chart_fields(columns, rows)
+        if x and ys:
+            return True
+    return False
+
+
 def _list_result_hints(conversation_id: str) -> str:
     """定位失败时列出最近可用轮次引用，引导 LLM 用正确 result_id/round_no 重试。"""
     try:
@@ -263,7 +317,7 @@ def build_make_chart_tool():
         description=(
             "根据 execute_query 已落盘的查询结果生成图表。"
             "参数 result_id 取 execute_query 返回的『结果已落盘』信息中的 result_id；"
-            "type 可选 line/bar/pie/area；x_field/y_fields 为结果中的字段名（y_fields 支持数组）；"
+            "type 可选 line/bar/pie/area/wordcloud；wordcloud 时 y_fields=[关键词列,数值列]；x_field/y_fields 为结果中的字段名（y_fields 支持数组）；"
             "title/x_name/y_name 为可选的标题与轴含义。"
             "返回一个规范 ```chart 代码块，请把它原样粘贴到最终回答中展示图表，不要手写 chart JSON。"
         ),
