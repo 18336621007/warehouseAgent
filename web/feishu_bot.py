@@ -184,7 +184,8 @@ class FeishuBot:
         if resp.code != 0:
             print(f"[feishu] send text failed: code={resp.code} msg={resp.msg}")
 
-    def _send_markdown(self, receive_id: str, receive_id_type: str, markdown: str):
+    def _send_markdown(self, receive_id: str, receive_id_type: str, markdown: str,
+                        cid: str = "", request_id: str = ""):
         """以飞书互动卡片（markdown 元素）发送 Markdown 内容，让飞书按卡片规则解析。
         注意：content 必须传 JSON.stringify 后的字符串（内部 \n 为真换行），否则会被再次转义破坏格式。"""
         content = markdown[:_TEXT_MAX * 2]
@@ -198,7 +199,7 @@ class FeishuBot:
                 ],
             },
         }
-        self._post_interactive_card(receive_id, receive_id_type, card)
+        return self._post_interactive_card(receive_id, receive_id_type, card, cid=cid, request_id=request_id)
 
     def _ensure_tenant_token(self) -> str:
         """获取并缓存飞书应用 tenant_access_token（原始 HTTP 发送互动卡片使用）。"""
@@ -218,15 +219,18 @@ class FeishuBot:
             self._tenant_token = data["tenant_access_token"]
         return self._tenant_token
 
-    def _post_interactive_card(self, receive_id: str, receive_id_type: str, card: dict):
-        """原始 HTTP 发送互动卡片：content 传 JSON 字符串，避免 SDK 二次序列化导致换行丢失破坏 markdown。"""
+    def _post_interactive_card(self, receive_id: str, receive_id_type: str, card: dict,
+                               cid: str = "", request_id: str = "") -> bool:
+        """原始 HTTP 发送互动卡片：content 传 JSON 字符串，避免 SDK 二次序列化导致换行丢失破坏 markdown。
+        返回是否发送成功，并把失败原因写入 langgraph_app.jsonl，便于按 request_id 排查。"""
         try:
             import urllib.request
             from urllib.parse import urlencode
             token = self._ensure_tenant_token()
             if not token:
                 print("[feishu] interactive card send skipped: missing tenant token")
-                return
+                self._log_feishu_event(cid, request_id, "feishu.card.failed", "missing tenant token")
+                return False
             content = json.dumps(card, ensure_ascii=False)
             url = "https://open.feishu.cn/open-apis/im/v1/messages?" + urlencode({"receive_id_type": receive_id_type})
             payload = json.dumps({"receive_id": receive_id, "msg_type": "interactive", "content": content},
@@ -239,8 +243,14 @@ class FeishuBot:
                 result = json.loads(resp.read().decode("utf-8"))
             if result.get("code") != 0:
                 print(f"[feishu] interactive card failed: code={result.get('code')} msg={result.get('msg')}")
+                self._log_feishu_event(cid, request_id, "feishu.card.failed",
+                                       f"code={result.get('code')} msg={result.get('msg')}")
+                return False
+            return True
         except Exception as exc:
             print(f"[feishu] interactive card failed: {exc}")
+            self._log_feishu_event(cid, request_id, "feishu.card.failed", f"exception={exc}")
+            return False
 
 
     def _upload_and_send_image(self, receive_id: str, receive_id_type: str, png_bytes: bytes) -> bool:
@@ -561,7 +571,8 @@ class FeishuBot:
                                 f"系统暂时无法完成本次查询，请稍后重试。\n错误编号：{error_id}")
                 return
             reply = self._build_reply_text(answer, cid)
-            self._send_markdown(receive_id, receive_id_type, reply)
+            # 只发互动卡片，不降级纯文本；卡片失败原因由 _post_interactive_card 写入日志
+            self._send_markdown(receive_id, receive_id_type, reply, cid=cid, request_id=request_id)
             # 数值型结果统一补发一张静态 PNG 图：优先用回答里的 chart 块，没有则从落盘结果自动选图
             self._try_send_chart(cid, request_id, answer, receive_id, receive_id_type)
         except Exception as exc:
