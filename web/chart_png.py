@@ -4,21 +4,60 @@
 #       复用同一份真实落盘数据，保证与网页端图表口径一致；无浏览器依赖（matplotlib Agg 后端）。
 import io
 import json
+import os
 import re
 import matplotlib
 matplotlib.use("Agg")  # 无界面后端，避免在无 GUI 环境报错
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+from agentTest.langgraph_app.tools.chart_labels import field_label
 
-# 中文字体：优先系统常见中文字体，找不到则退回默认（避免中文变方块）
-_FONT_CANDIDATES = ("Microsoft YaHei", "SimHei", "PingFang SC", "Noto Sans CJK SC", "WenQuanYi Zen Hei")
-for _f in _FONT_CANDIDATES:
-    try:
-        font_manager.findfont(_f, fallback_to_default=False)
-        plt.rcParams["font.sans-serif"] = [_f, "DejaVu Sans"]
-        break
-    except Exception:
-        continue
+# 中文字体：先按常见字体文件路径探测（兼容 Windows / Linux / macOS），
+# 命中后注册到 matplotlib 并缓存字体路径供 wordcloud 复用，降低中文渲染成方块的概率
+_FONT_FILE_CANDIDATES = (
+    ("Microsoft YaHei", (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyh.ttf")),
+    ("SimHei", (r"C:\Windows\Fonts\simhei.ttf",)),
+    ("PingFang SC", ("/System/Library/Fonts/PingFang.ttc",)),
+    ("Noto Sans CJK SC", (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    )),
+    ("WenQuanYi Zen Hei", (
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/wqy/wqy-zenhei.ttc",
+    )),
+)
+_FONT_NAME_CANDIDATES = ("Microsoft YaHei", "SimHei", "PingFang SC", "Noto Sans CJK SC", "WenQuanYi Zen Hei")
+_CJK_FONT_PATH = ""  # 已解析的中文字体文件路径（wordcloud 渲染时复用）
+
+
+def _apply_cjk_font():
+    """探测并应用支持中文的 matplotlib 字体，返回命中的字体文件路径。"""
+    global _CJK_FONT_PATH
+    for _family, _paths in _FONT_FILE_CANDIDATES:
+        for _path in _paths:
+            if os.path.exists(_path):
+                try:
+                    font_manager.fontManager.addfont(_path)
+                    _prop = font_manager.FontProperties(fname=_path)
+                    plt.rcParams["font.sans-serif"] = [_prop.get_name(), "DejaVu Sans"]
+                    _CJK_FONT_PATH = _path
+                    return _path
+                except Exception:
+                    continue
+    for _f in _FONT_NAME_CANDIDATES:
+        try:
+            _found = font_manager.findfont(_f, fallback_to_default=False)
+            plt.rcParams["font.sans-serif"] = [_f, "DejaVu Sans"]
+            _CJK_FONT_PATH = _found
+            return _found
+        except Exception:
+            continue
+    return ""
+
+
+_apply_cjk_font()
 plt.rcParams["axes.unicode_minus"] = False  # 正常显示负号
 
 # 饼图最大扇区数：超出部分合并为“其他”，避免标签重叠（与前端 ECharts 行为一致）
@@ -38,7 +77,7 @@ def _to_float(v):
 def _prepare_xy(data, x_field, y_fields):
     """从 data 提取 x 序列与各 y 数值序列，返回 (x_vals, series_list)。"""
     x_vals = []
-    series_list = [{"name": f, "values": []} for f in y_fields]
+    series_list = [{"name": field_label(f), "values": []} for f in y_fields]
     for d in data:
         x_vals.append(str(d.get(x_field, "")))
         for s in series_list:
@@ -89,11 +128,7 @@ def _render_wordcloud(spec: dict, width: float = 9.0, height: float = 4.6) -> by
     freq = dict(pairs)
     import os
     from wordcloud import WordCloud
-    font_path = None
-    for fp in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyh.ttf", r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\simsun.ttc"):
-        if os.path.exists(fp):
-            font_path = fp
-            break
+    font_path = _CJK_FONT_PATH or None  # 复用图表渲染解析到的中文字体，兼容 Linux / Windows
     wc = WordCloud(font_path=font_path, width=1200, height=520, background_color="white",
                    prefer_horizontal=0.9, collocations=False, max_words=len(pairs), random_state=42)
     wc.generate_from_frequencies(freq)
@@ -118,10 +153,11 @@ def render_spec_png(spec: dict, width: float = 9.0, height: float = 4.6) -> byte
     y_field = spec.get("yField") or ""
     data = spec.get("data") or []
     title = str(spec.get("title") or "")
-    x_name = str(spec.get("xName") or x_field)
-    y_name = str(spec.get("yName") or "")
     y_fields = y_field if isinstance(y_field, list) else [str(y_field or "")]
     y_fields = [f for f in y_fields if f]
+    # 图表标签缺省时把英文字段名转成中文，避免图内出现英文指标
+    x_name = str(spec.get("xName") or field_label(x_field))
+    y_name = str(spec.get("yName") or (field_label(y_fields[0]) if len(y_fields) == 1 else ""))
     if not x_field or not y_fields or not data:
         raise ValueError("图表 spec 缺少 xField / yField / data，无法渲染。")
 

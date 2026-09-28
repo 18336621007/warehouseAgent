@@ -9,6 +9,7 @@ from langchain_core.tools import StructuredTool
 
 from agentTest.langgraph_app.services.result_store import read_result_full
 from agentTest.langgraph_app.tools.result_query_tool import get_result_conversation
+from agentTest.langgraph_app.tools.chart_labels import field_label
 
 # 图表最大行数上限（防止超大结果撑爆 prompt/前端）
 MAX_CHART_ROWS = 200
@@ -169,8 +170,8 @@ def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields:
         "title": title or "",
         "xField": x_field,
         "yField": y_fields if len(y_fields) > 1 else y_fields[0],
-        "xName": x_name or x_field,
-        "yName": y_name or (y_fields[0] if len(y_fields) == 1 else ""),
+        "xName": x_name or field_label(x_field),
+        "yName": y_name or (field_label(y_fields[0]) if len(y_fields) == 1 else ""),
         "data": chart_rows,
     }
     return spec, ""
