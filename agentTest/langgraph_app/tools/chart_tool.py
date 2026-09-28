@@ -9,7 +9,6 @@ from langchain_core.tools import StructuredTool
 
 from agentTest.langgraph_app.services.result_store import read_result_full
 from agentTest.langgraph_app.tools.result_query_tool import get_result_conversation
-from agentTest.langgraph_app.tools.chart_labels import field_label
 
 # 图表最大行数上限（防止超大结果撑爆 prompt/前端）
 MAX_CHART_ROWS = 200
@@ -105,7 +104,8 @@ def detect_chart_fields(columns: list, rows: list) -> tuple:
 
 
 def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields: list,
-                     title: str = "", x_name: str = "", y_name: str = "", max_rows: int = MAX_CHART_ROWS) -> tuple:
+                     title: str = "", x_name: str = "", y_name: str = "",
+                     series_names: list | None = None, max_rows: int = MAX_CHART_ROWS) -> tuple:
     """从落盘结果条目 + 全量行构建规范图表 spec。
 
     校验字段、上限行数、数值化 y 字段；返回 (spec, "") 或 (None, 失败原因)，
@@ -139,7 +139,7 @@ def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields:
             "title": title or "",
             "wordField": word_field,
             "valueField": value_field,
-            "yName": y_name or word_field,
+            "yName": y_name,
             "data": chart_rows,
         }
         return spec, ""
@@ -170,8 +170,9 @@ def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields:
         "title": title or "",
         "xField": x_field,
         "yField": y_fields if len(y_fields) > 1 else y_fields[0],
-        "xName": x_name or field_label(x_field),
-        "yName": y_name or (field_label(y_fields[0]) if len(y_fields) == 1 else ""),
+        "xName": x_name,
+        "yName": y_name,
+        "seriesNames": [str(sn) for sn in (series_names or [])],
         "data": chart_rows,
     }
     return spec, ""
@@ -285,6 +286,7 @@ def build_make_chart_tool():
         title: str = "",
         x_name: str = "",
         y_name: str = "",
+        series_names: list = [],
         max_rows: int = MAX_CHART_ROWS,
     ) -> str:
         result_id = str(result_id or "").strip()
@@ -312,7 +314,7 @@ def build_make_chart_tool():
         entry = data.get("entry") or {}
         rows = list(data.get("rows") or [])
         spec, err = build_chart_spec(
-            entry, rows, type, x_field, y_fields, title, x_name, y_name, max_rows,
+            entry, rows, type, x_field, y_fields, title, x_name, y_name, series_names, max_rows,
         )
         if not spec:
             return err or "无法生成图表。"
@@ -328,7 +330,7 @@ def build_make_chart_tool():
             "根据 execute_query 已落盘的查询结果生成图表。"
             "参数 result_id 取 execute_query 返回的『结果已落盘』信息中的 result_id；"
             "type 可选 line/bar/pie/area/wordcloud；wordcloud 时 y_fields=[关键词列,数值列]；x_field/y_fields 为结果中的字段名（y_fields 支持数组）；"
-            "title/x_name/y_name 为可选的标题与轴含义。"
+            "title/x_name/y_name/series_names 用中文业务含义填写（如 新增订单数、平台），避免图表出现英文字段名；series_names 为 y 轴各系列的中文名，数量应与 y_fields 一致。"
             "返回一个规范 ```chart 代码块，请把它原样粘贴到最终回答中展示图表，不要手写 chart JSON。"
         ),
     )

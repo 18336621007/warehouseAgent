@@ -10,7 +10,6 @@ import matplotlib
 matplotlib.use("Agg")  # 无界面后端，避免在无 GUI 环境报错
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
-from agentTest.langgraph_app.tools.chart_labels import field_label
 
 # 中文字体：先按常见字体文件路径探测（兼容 Windows / Linux / macOS），
 # 命中后注册到 matplotlib 并缓存字体路径供 wordcloud 复用，降低中文渲染成方块的概率
@@ -74,10 +73,11 @@ def _to_float(v):
         return None
 
 
-def _prepare_xy(data, x_field, y_fields):
+def _prepare_xy(data, x_field, y_fields, series_names=None):
     """从 data 提取 x 序列与各 y 数值序列，返回 (x_vals, series_list)。"""
     x_vals = []
-    series_list = [{"key": f, "name": field_label(f), "values": []} for f in y_fields]
+    names = series_names or []
+    series_list = [{"key": f, "name": (names[i] if i < len(names) and names[i] else f), "values": []} for i, f in enumerate(y_fields)]
     for d in data:
         x_vals.append(str(d.get(x_field, "")))
         for s in series_list:
@@ -155,13 +155,14 @@ def render_spec_png(spec: dict, width: float = 9.0, height: float = 4.6) -> byte
     title = str(spec.get("title") or "")
     y_fields = y_field if isinstance(y_field, list) else [str(y_field or "")]
     y_fields = [f for f in y_fields if f]
-    # 图表标签缺省时把英文字段名转成中文，避免图内出现英文指标
-    x_name = str(spec.get("xName") or field_label(x_field))
-    y_name = str(spec.get("yName") or (field_label(y_fields[0]) if len(y_fields) == 1 else ""))
+    # 图表标签由 LLM 决定（make_chart 传入的 x_name/y_name/series_names），不再做程序映射
+    x_name = str(spec.get("xName") or "")
+    y_name = str(spec.get("yName") or "")
+    series_names = list(spec.get("seriesNames") or [])
     if not x_field or not y_fields or not data:
         raise ValueError("图表 spec 缺少 xField / yField / data，无法渲染。")
 
-    x_vals, series_list = _prepare_xy(data, x_field, y_fields)
+    x_vals, series_list = _prepare_xy(data, x_field, y_fields, series_names)
     fig, ax = plt.subplots(figsize=(width, height), dpi=150)
     if chart_type == "pie":
         _draw_pie(ax, x_vals, series_list[0]["values"], title)
