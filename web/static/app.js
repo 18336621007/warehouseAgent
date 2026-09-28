@@ -1791,11 +1791,11 @@ function buildChartOption(spec, type) {
     } else {
         if (type === "hbar") {
             // 横向条形图：类别放到 y 轴，数值放到 x 轴
-            opt.xAxis = { type: "value", name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+            opt.xAxis = { type: "value", scale: true, name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
             opt.yAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
         } else {
             opt.xAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, axisLabel: { color: dark.text } };
-            opt.yAxis = { type: "value", name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+            opt.yAxis = { type: "value", scale: true, name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
         }
         opt.series = seriesList.map(function (s) {
             var item = { name: s.name, type: type === "area" ? "line" : (type === "hbar" ? "bar" : type), data: s.values };
