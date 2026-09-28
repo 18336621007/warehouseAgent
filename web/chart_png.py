@@ -77,11 +77,11 @@ def _to_float(v):
 def _prepare_xy(data, x_field, y_fields):
     """从 data 提取 x 序列与各 y 数值序列，返回 (x_vals, series_list)。"""
     x_vals = []
-    series_list = [{"name": field_label(f), "values": []} for f in y_fields]
+    series_list = [{"key": f, "name": field_label(f), "values": []} for f in y_fields]
     for d in data:
         x_vals.append(str(d.get(x_field, "")))
         for s in series_list:
-            s["values"].append(_to_float(d.get(s["name"])))
+            s["values"].append(_to_float(d.get(s["key"])))  # 用原始字段名取值，中文名仅用于展示
     return x_vals, series_list
 
 

@@ -1643,13 +1643,13 @@ function normalizeChartData(spec) {
     }
     var categories = Array.isArray(spec.xAxis) ? spec.xAxis.slice() : [];
     var seriesList = (spec.series || []).map(function (s) {
-        return { name: s.name || "", values: s.data || [] };
+        return { name: chartFieldLabel(s.name) || "", values: s.data || [] };
     });
     // 兼容 Chart.js 风格：data.labels + data.datasets（LLM 常见输出差异）
     if (spec.data && Array.isArray(spec.data.labels) && Array.isArray(spec.data.datasets)) {
         categories = spec.data.labels.slice();
         seriesList = spec.data.datasets.map(function (s) {
-            return { name: s.label || "", values: (s.data || []).slice() };
+            return { name: chartFieldLabel(s.label) || "", values: (s.data || []).slice() };
         });
     }
     if (!seriesList.length && Array.isArray(spec.data) && spec.data.length) {
@@ -1657,10 +1657,10 @@ function normalizeChartData(spec) {
         var yFieldList = Array.isArray(spec.yField) ? spec.yField : (Array.isArray(spec.yFields) ? spec.yFields : null);
         if (xField && yFieldList) {
             categories = spec.data.map(function (d) { return d[xField]; });
-            seriesList = yFieldList.map(function (f) { return { name: f, values: spec.data.map(function (d) { return d[f]; }) }; });
+            seriesList = yFieldList.map(function (f) { return { name: chartFieldLabel(f), values: spec.data.map(function (d) { return d[f]; }) }; });
         } else if (xField && yField) {
             categories = spec.data.map(function (d) { return d[xField]; });
-            seriesList = [{ name: spec.seriesName || yName || yField, values: spec.data.map(function (d) { return d[yField]; }) }];
+            seriesList = [{ name: (spec.seriesName ? chartFieldLabel(spec.seriesName) : (yName || chartFieldLabel(yField))), values: spec.data.map(function (d) { return d[yField]; }) }];
         } else if (spec.nameField && spec.valueField) {
             // 扁平饼图：nameField/valueField
             categories = spec.data.map(function (d) { return d[spec.nameField]; });
@@ -1675,13 +1675,13 @@ function normalizeChartData(spec) {
     if (spec.wordField && spec.valueField && Array.isArray(spec.data) && spec.data.length && !categories.length) {
         // 词云：把 word/value 转成一组系列（词 + 词频），方便切换折线/柱状等
         categories = spec.data.map(function (d) { return String(d[spec.wordField] != null ? d[spec.wordField] : ""); });
-        seriesList = [{ name: spec.yName || spec.valueField, values: spec.data.map(function (d) { var v = Number(d[spec.valueField]); return isNaN(v) ? null : v; }) }];
+        seriesList = [{ name: chartFieldLabel(spec.yName || spec.valueField), values: spec.data.map(function (d) { var v = Number(d[spec.valueField]); return isNaN(v) ? null : v; }) }];
     }
     return {
         categories: categories,
         seriesList: seriesList,
-        xName: xName || xField || "",
-        yName: yName || yField || "",
+        xName: xName || chartFieldLabel(xField) || "",
+        yName: yName || chartFieldLabel(yField) || "",
     };
 }
 
