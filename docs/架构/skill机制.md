@@ -102,3 +102,4 @@ scope: [planner]                        # 注入范围：planner（当前仅 pla
 
 - **改造前**：`match_skills` 用 trigger_keywords + description 做**程序关键词匹配**，命中就把 skill 正文全量注入 prompt（零 LLM、确定性强，但泛化差、正文常驻上下文）。
 - **改造后（2026-09-15）**：仿 Codex 渐进式披露——只披露 name+description 索引，由 LLM 判断是否 `read_skill` 读取完整正文。`match_skills` / `format_instruction` 保留用于兼容与单测，Planner 主流程不再调用。
+- **2026-09-28**：进一步明确边界——`PLANNER_SYSTEM_PROMPT` 精简为跨业务通用 Agent 底座（工作方式/工具高层用法/数据真实性/失败兜底），业务默认口径、FAQ、口径追问模板、回答模板、图表选型、拒绝场景均收拢到 `skills/gy-offline-nlq/SKILL.md`；系统提示词不再重复业务规则。

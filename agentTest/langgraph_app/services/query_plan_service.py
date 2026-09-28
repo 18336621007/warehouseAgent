@@ -363,16 +363,23 @@ def _build_field_semantic_index() -> dict:
     if _SEMANTIC_TYPE_INDEX is not None:
         return _SEMANTIC_TYPE_INDEX
     index = {}
+    # RAG 关闭时不使用 enriched_* 元数据表，指标类型校验只依赖语义层/其余兜底
     try:
-        from agentTest.metadata.mysql_store import load_enriched_columns
-        for col in load_enriched_columns():
-            field = str(col.get("column_name") or "")
-            ftype = str(col.get("fields_type") or "").lower()
-            if field and ftype:
-                index[field] = ftype
+        from agentTest.config.settings import get_enable_rag
+        rag_enabled = get_enable_rag()
     except Exception:
-        # 元数据不可用时返回空索引，校验退化为不拦截
-        pass
+        rag_enabled = False
+    if rag_enabled:
+        try:
+            from agentTest.metadata.mysql_store import load_enriched_columns
+            for col in load_enriched_columns():
+                field = str(col.get("column_name") or "")
+                ftype = str(col.get("fields_type") or "").lower()
+                if field and ftype:
+                    index[field] = ftype
+        except Exception:
+            # 元数据不可用时返回空索引，校验退化为不拦截
+            pass
     _SEMANTIC_TYPE_INDEX = index
     return index
 
@@ -404,14 +411,21 @@ def _build_table_columns_index() -> dict:
     if _TABLE_COLUMNS_INDEX is not None:
         return _TABLE_COLUMNS_INDEX
     index = {}
+    # RAG 关闭时不使用 enriched_* 元数据表，字段-表归属只叠加语义层 physical 权威定义
     try:
-        from agentTest.metadata.mysql_store import load_enriched_columns
-        for col in load_enriched_columns():
-            table_name = str(col.get("database_name") or "") + "." + str(col.get("table_name") or "")
-            index.setdefault(table_name, set()).add(str(col.get("column_name") or ""))
+        from agentTest.config.settings import get_enable_rag
+        rag_enabled = get_enable_rag()
     except Exception:
-        # 元数据不可用时返回空索引，归属校验退化为不拦截（锁定链路由其他校验兜底）
-        pass
+        rag_enabled = False
+    if rag_enabled:
+        try:
+            from agentTest.metadata.mysql_store import load_enriched_columns
+            for col in load_enriched_columns():
+                table_name = str(col.get("database_name") or "") + "." + str(col.get("table_name") or "")
+                index.setdefault(table_name, set()).add(str(col.get("column_name") or ""))
+        except Exception:
+            # 元数据不可用时返回空索引，归属校验退化为不拦截（锁定链路由其他校验兜底）
+            pass
     # 叠加语义层 physical 表字段（权威定义）：覆盖 data_project 等 Hive 无增强元数据的 Doris 专属表
     try:
         from agentTest.semantic_layer.semantic_layer_provider import get_semantic_layer_provider

@@ -349,6 +349,8 @@ def chat_status(conversation_id):
     snap = ACTIVE_REQUESTS.get(conversation_id)
     if not snap:
         return jsonify({"active": False})
+    _started = snap.get("started_at") or 0
+    _thinking_seconds = int(max(0, time.time() - float(_started))) if _started else 0
     return jsonify({
         "active": True,
         "request_id": snap.get("request_id", ""),
@@ -359,6 +361,8 @@ def chat_status(conversation_id):
         "context": snap.get("context"),
         "llm_tokens": snap.get("llm_tokens", {}),
         "cancel_requested": bool(snap.get("cancel_requested")),
+        "thinking_seconds": _thinking_seconds,
+        "request_at": snap.get("request_at", ""),
     })
 
 
@@ -569,6 +573,8 @@ def chat():
             "llm_tokens": {},
             "context": None,
             "cancel_requested": False,
+            "started_at": time.time(),
+            "request_at": request_started_at.strftime("%Y-%m-%d %H:%M:%S"),
         }
         broadcast_conversations()
         # 查询链路移到后台线程执行：LLM token 在节点内部实时推送到总线，

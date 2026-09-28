@@ -29,6 +29,15 @@ def _ensure_enum_index():
     global _ENRICHED_ENUM_INDEX, _ENRICHED_ENUM_INDEX_SIMPLE
     if _ENRICHED_ENUM_INDEX is not None:
         return
+    # RAG 关闭时不再查询 enriched_* 元数据表，枚举提示保持为空
+    try:
+        from agentTest.config.settings import get_enable_rag
+        if not get_enable_rag():
+            _ENRICHED_ENUM_INDEX = {}
+            _ENRICHED_ENUM_INDEX_SIMPLE = {}
+            return
+    except Exception:
+        pass
     from agentTest.metadata.mysql_store import load_enriched_columns
     index = {}
     index_simple = {}

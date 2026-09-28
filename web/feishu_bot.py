@@ -320,8 +320,8 @@ class FeishuBot:
                 "status": "processing", "error_message": "", "llm_tokens": {},
                 "request_at": _now_str,
             })
-            _persist(self.sessions, cid)
-            # 注册为进行中请求：飞书会话也能在网页端轮询到实时思考/回答
+            # 先注册为进行中请求再广播：网页端 SSE 会话快照能立刻标记 active，
+            # 未刷新的页面也能通过 /api/chat/status 恢复实时思考气泡
             self.active_requests[cid] = {
                 "request_id": request_id,
                 "status": "AI 正在思考...",
@@ -331,7 +331,11 @@ class FeishuBot:
                 "sql": "",
                 "llm_tokens": {},
                 "context": None,
+                "cancel_requested": False,
+                "started_at": start_wall,
+                "request_at": _now_str,
             }
+            _persist(self.sessions, cid)
             bus = StreamBus(sink=make_active_sink(self.active_requests, cid, request_id))
             # 后台线程绑定流式总线，LLM 层的 thinking/answer token 才会实时镜像到注册表
             bind_stream_bus(bus)
@@ -551,7 +555,7 @@ class FeishuBot:
             cid = _collect_messages(self.sessions, open_id, user_name)
             request_id = uuid.uuid4().hex
             # 先回占位提示，用户立即感知已接收；查询完成后另发结果
-            self._send_text(receive_id, receive_id_type, f"正在查询中…（request_id: {request_id}）")
+            self._send_text(receive_id, receive_id_type, f"🤚请稍等一下~正在思考中…🤔（request_id: {request_id}）")
             threading.Thread(
                 target=self._process_message,
                 args=(cid, request_id, user_text, receive_id, receive_id_type),

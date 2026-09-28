@@ -158,29 +158,36 @@ def build_graph_runtime():
     ))
 
     # 从 MySQL 加载字段类型映射（度量/维度）与字段枚举值映射，供 generate_sql/Resolver 使用
-    import re as _re
-    _date_like = _re.compile(r"^\d{6,14}$|^\d{4}-\d{2}-\d{2}$|^\d{4}/\d{1,2}/\d{1,2}$")
-    columns = load_enriched_columns()
-    field_type_map = {}
-    sample_values_map = {}
-    sample_values_map_simple = {}
-    for col in columns:
-        key = f"{col['database_name']}.{col['table_name']}.{col['column_name']}"
-        field_type_map[key] = col.get("fields_type", "dimension")
-        # 排除日期分区类采样值，只保留业务枚举
-        samples = [
-            str(v) for v in (col.get("sample_values") or [])
-            if str(v).strip() and not _date_like.match(str(v))
-        ]
-        if samples:
-            sample_values_map[key] = samples
-            for sample in samples:
-                if sample not in sample_values_map_simple.setdefault(col["column_name"], []):
-                    sample_values_map_simple[col["column_name"]].append(sample)
-    # 同时建一个仅用 column_name 的兜底映射
-    field_type_map_simple = {}
-    for col in columns:
-        field_type_map_simple[col["column_name"]] = col.get("fields_type", "dimension")
+    # RAG 关闭时不再查询 enriched_* 表，字段类型/枚举由语义层与物理元数据提供
+    if rag_enabled:
+        import re as _re
+        _date_like = _re.compile(r"^\d{6,14}$|^\d{4}-\d{2}-\d{2}$|^\d{4}/\d{1,2}/\d{1,2}$")
+        columns = load_enriched_columns()
+        field_type_map = {}
+        sample_values_map = {}
+        sample_values_map_simple = {}
+        for col in columns:
+            key = f"{col['database_name']}.{col['table_name']}.{col['column_name']}"
+            field_type_map[key] = col.get("fields_type", "dimension")
+            # 排除日期分区类采样值，只保留业务枚举
+            samples = [
+                str(v) for v in (col.get("sample_values") or [])
+                if str(v).strip() and not _date_like.match(str(v))
+            ]
+            if samples:
+                sample_values_map[key] = samples
+                for sample in samples:
+                    if sample not in sample_values_map_simple.setdefault(col["column_name"], []):
+                        sample_values_map_simple[col["column_name"]].append(sample)
+        # 同时建一个仅用 column_name 的兜底映射
+        field_type_map_simple = {}
+        for col in columns:
+            field_type_map_simple[col["column_name"]] = col.get("fields_type", "dimension")
+    else:
+        field_type_map = {}
+        field_type_map_simple = {}
+        sample_values_map = {}
+        sample_values_map_simple = {}
 
     query_plan_schema_resolver = (
         QueryPlanSchemaResolver(

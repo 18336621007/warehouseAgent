@@ -475,6 +475,11 @@ async function maybeResumeActiveRequest(convId) {
             pend.status = data.status || pend.status;
             pend.content = data.content || "";
             pend.contextProgress = data.context || null;
+            if (data.request_at) pend.request_at = data.request_at;
+            // 恢复时从后端真实已耗时接续计时，思考按钮不再从 0 重新数
+            if (data.thinking_seconds && !pend.thinkStartAt) {
+                pend.thinkStartAt = Math.max(Date.now() - data.thinking_seconds * 1000, 0);
+            }
             if (data.cancel_requested && !pend.userStopped) {
                 pend.userStopped = true;
                 pend.status = "正在停止…";
@@ -672,6 +677,11 @@ async function pollActive(convId) {
     pend.status = data.status || pend.status;
     pend.content = data.content || "";
     pend.contextProgress = data.context || pend.contextProgress;
+    if (data.request_at) pend.request_at = data.request_at;
+    // 轮询期间保持真实已耗时：首次恢复时从后端 elapsed 接续，而不是从 0 重数
+    if (data.thinking_seconds && !pend.thinkStartAt) {
+        pend.thinkStartAt = Math.max(Date.now() - data.thinking_seconds * 1000, 0);
+    }
     if (data.cancel_requested && !pend.userStopped) {
         pend.userStopped = true;
         pend.status = "正在停止…";
@@ -1023,7 +1033,7 @@ function flushAnswerTypewriter(pend) {
 function startThinkTimer(pend) {
     // 思考计时：每秒刷新思考按钮上的已耗时，仿照 codex 展示思考时长
     if (pend.thinkTimer || pend.thinkingSeconds) return;
-    pend.thinkStartAt = Date.now();
+    if (!pend.thinkStartAt) pend.thinkStartAt = Date.now();
     pend.thinkTimer = setInterval(function () {
         if (conversationId && pendingRequests[conversationId] === pend) {
             updatePendingMessage(conversationId);
