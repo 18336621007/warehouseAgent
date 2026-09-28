@@ -22,23 +22,31 @@ from agentTest.datasource.trino_datasource import TrinoDataSource
 from agentTest.langgraph_app.services.whitelist_filtered_store import WhitelistFilteredVectorStore
 from agentTest.metadata.semantic_metadata_provider import SemanticMetadataProvider
 from agentTest.langgraph_app.skills.skill_loader import build_skill_manager
+from agentTest.config.settings import get_enable_rag
 
 def build_graph_runtime():
     # 结构化日志由TimedRotatingFileHandler按天滚动，服务启动时保留历史日志
 
-    embedding = BailianEmbeddings()
+    rag_enabled = get_enable_rag()
+    # 仅语义一层模式：关闭 RAG/embedding，避免启动时加载向量库与 Embedding 调用
+    if rag_enabled:
+        embedding = BailianEmbeddings()
 
-    # 新增：三层 FAISS 向量库（Advisor 用）
-    db_rag = build_db_rag(embedding)
-    table_rag = build_table_rag(embedding)
-    column_rag = build_column_rag(embedding)
+        # 新增：三层 FAISS 向量库（Advisor 用）
+        db_rag = build_db_rag(embedding)
+        table_rag = build_table_rag(embedding)
+        column_rag = build_column_rag(embedding)
 
-    # 新增：BM25 倒排索引（Advisor 混合检索用）
-    bm25_rag = build_bm25_rag()
-    bm25_retriever = bm25_rag.get("retriever")
+        # 新增：BM25 倒排索引（Advisor 混合检索用）
+        bm25_rag = build_bm25_rag()
+        bm25_retriever = bm25_rag.get("retriever")
 
-    # Evaluator 示例向量库（高质量对话存储，供 Planner/Advisor/Seeker 检索）
-    example_vector_store = ExampleVectorStore(embedding)
+        # Evaluator 示例向量库（高质量对话存储，供 Planner/Advisor/Seeker 检索）
+        example_vector_store = ExampleVectorStore(embedding)
+    else:
+        embedding = None
+        bm25_retriever = None
+        example_vector_store = None
     # 初始化 Evaluator MySQL 表（幂等）
     init_evaluator_table()
 
@@ -52,9 +60,14 @@ def build_graph_runtime():
     llm = LLM()
 
     # 三层向量库加白名单过滤包装（Advisor 检索用，提前为局部变量供工具注册复用）
-    db_vector_store = WhitelistFilteredVectorStore(db_rag["vector_store"], metadata_provider, key="database")
-    table_vector_store = WhitelistFilteredVectorStore(table_rag["vector_store"], metadata_provider, key="table")
-    column_vector_store = WhitelistFilteredVectorStore(column_rag["vector_store"], metadata_provider, key="table")
+    if rag_enabled:
+        db_vector_store = WhitelistFilteredVectorStore(db_rag["vector_store"], metadata_provider, key="database")
+        table_vector_store = WhitelistFilteredVectorStore(table_rag["vector_store"], metadata_provider, key="table")
+        column_vector_store = WhitelistFilteredVectorStore(column_rag["vector_store"], metadata_provider, key="table")
+    else:
+        db_vector_store = None
+        table_vector_store = None
+        column_vector_store = None
 
     # 构建 Advisor 工具（闭包注入向量库/BM25 依赖，替换模块级全局变量）
     advisor_tools = build_advisor_tools(

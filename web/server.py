@@ -36,6 +36,7 @@ from web.conversation_store import init_db as init_conv_db
 from web.conversation_store import load_all as load_conv_all
 from web.conversation_store import upsert as upsert_conv
 from web.conversation_store import soft_delete as soft_delete_conv
+from agentTest.metadata.mysql_store import save_evaluated_dialogue
 from agentTest.metadata.mysql_store import update_user_score
 from langchain_core.messages import RemoveMessage
 
@@ -723,9 +724,47 @@ def chat():
                 }
                 has_sql_query = bool(seen & sql_query_nodes)
                 display_sql = generated_sql if has_sql_query else ""
-            # Evaluator 已并入 Planner（单 Agent），评分功能移除：统一空值兼容前端
+            # 用户打分机制恢复：每条成功回答落一条 evaluated_dialogues，
+            # 与优秀案例/FAISS 解耦，RAG 关闭时仍可保存用户在 MySQL 的评分
             evaluator_payload = None
             dialogue_id = 0
+            if final_status == "success" and not cancelled and (final_answer or "").strip():
+                _eval_question = str(result.get("effective_query") or message or "")
+                _eval_sql = display_sql or generated_sql or ""
+                _eval_tables = []
+                for _exec in (result.get("executed_sql") or []):
+                    if _exec.get("table"):
+                        _eval_tables.append(str(_exec["table"]))
+                _eval_tables = list(dict.fromkeys(_eval_tables))
+                _eval_fields = []
+                for _fld in (result.get("fields") or []):
+                    if isinstance(_fld, str):
+                        _eval_fields.append(_fld)
+                    elif isinstance(_fld, dict):
+                        _eval_fields.append(str(_fld.get("field") or _fld.get("name") or ""))
+                try:
+                    dialogue_id = save_evaluated_dialogue(
+                        question=_eval_question,
+                        effective_query=_eval_question,
+                        resolved_question=_eval_question,
+                        sql=_eval_sql,
+                        answer=final_answer,
+                        tables_used=_eval_tables,
+                        fields_used=[f for f in _eval_fields if f],
+                        advisor_turns=0,
+                        total_time_ms=elapsed_ms(request_timer),
+                        time_score=75.0,
+                        turn_score=75.0,
+                        llm_self_score=75.0,
+                        comprehensive_score=75.0,
+                        domain_tag="",
+                    )
+                    if dialogue_id:
+                        evaluator_payload = {}
+                except Exception as _eval_err:
+                    print(f"[server] save evaluated dialogue failed: {_eval_err}")
+                    evaluator_payload = None
+                    dialogue_id = 0
 
             # 请求级 LLM token 汇总（在 log_request_end 清理聚合器之前读取）
             llm_tokens = get_llm_token_usage()

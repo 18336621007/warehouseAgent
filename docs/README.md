@@ -11,7 +11,7 @@
 - Python 3.11+
 - Hive 连接（PyHive）
 - MySQL（增强元数据存储）
-- 阿里云百炼 Embedding API
+- 阿里云百炼 Embedding API（可选：仅启用 RAG 时需要，`ENABLE_RAG=false` 时无需配置）
 
 ### 2. 安装依赖
 
@@ -27,6 +27,8 @@ pip install -r agentTest/requirements.txt
 OPENAI_API_KEY=your_api_key
 OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 MODEL_NAME=qwen-plus
+# 仅语义层模式：关闭 RAG/embedding 向量检索，只依赖文件 grep 语义层
+ENABLE_RAG=false
 EMBEDDING_MODEL=text-embedding-v4
 
 MYSQL_HOST=localhost
@@ -52,6 +54,8 @@ LOG_STATE_TOP_N=3           # State 快照中列表字段最多记录条数
 # 一键完成：白名单多退少补 + 元数据采集增强 + FAISS/BM25 索引同步 + 优秀案例清理
 python -m agentTest.scripts.sync_metadata
 ```
+
+> 说明：`ENABLE_RAG=false`（仅语义层模式）时可跳过此步；启用 RAG 或需要构建优秀案例向量库时再执行。
 
 ### 5. 启动
 
@@ -80,9 +84,9 @@ python web/server.py
 | 🧠 意图识别 | LLM 自动区分闲聊和查询，闲聊秒回、查数走完整管线 |
 | ➕ 新建对话 | 左侧栏按钮，每个 `conversation_id` 为一个完整对话，全程共享一个 LangGraph Checkpoint |
 | 📋 对话列表 | 历史对话一键切换，支持删除和重命名 |
-| 🔍 思考过程 | 点击折叠面板查看意图识别、Planner 路由、命中表/字段、系统评分 |
+| 🔍 思考过程 | 点击折叠面板查看意图识别、Planner 路由、命中表/字段 |
 | 📊 查看 SQL | 点击折叠面板查看实际执行的 SQL |
-| ⭐ 用户打分 | Evaluator 模块打分入口，1-5 星评分，评分后自动同步 FAISS 示例库 |
+| ⭐ 用户打分 | 1-5 星评分，写入 MySQL evaluated_dialogues；启用 RAG 时再自动同步 FAISS 优秀案例 |
 | 🔢 指标选项确认 | 多口径候选由程序固化，支持数字、中文序号、字段名和中文含义选择 |
 | 🪙 token 统计 | 每条回答气泡显示本请求 LLM token 消耗：输入总token / 输出总token / 缓存命中 / 缓存未命中 |
 | ⚡ 流式输出 | 思考过程与最终回答**真流式**（模型边生成边推送，仿 Codex）；思考面板实时显示「思考中 Xs」，回答开始流式切换「正在生成回答」，固化后显示总耗时 |
@@ -96,8 +100,9 @@ flowchart TD
     P -->|route=execute| S["执行链（原 Seeker）：retrieve_schema → generate_sql → validate_sql → execute_sql → persist_result"]
     S -->|结果落盘| P
     P -->|route=respond| R["输出文本给用户（澄清/最终回答）"]
-    P -->|执行回看后 respond| E["Evaluator"]
-    E --> L["MySQL + FAISS 长期经验记忆"]
+    P -->|执行回看后 respond| E["Evaluator（评分入库）"]
+    E --> L["MySQL 评分记录"]
+    E -. RAG 启用时 .-> F["FAISS 优秀案例同步"]
 ```
 
 详细设计：
@@ -116,7 +121,7 @@ flowchart TD
 | 图编排 | LangGraph（StateGraph + 进程内 MemorySaver checkpoint） |
 | LLM 接口 | LangChain + OpenAI 兼容 API |
 | 意图识别 | LangChain `with_structured_output`（Pydantic 结构化分类） |
-| 向量检索 | FAISS（余弦相似度，三层索引：库/表/字段 + 示例库） |
+| 向量检索 | FAISS（可选，`ENABLE_RAG=true` 时加载：三层索引 + 示例库） |
 | 数据源 | PyHive（Hive，主）+ Doris（三平台天数池，待接入） |
 | 元数据存储 | MySQL（增强后库/表/字段三级 + 评估记录表） |
 | Web 服务 | Flask |
@@ -272,6 +277,8 @@ SELECT id, question FROM evaluated_dialogues WHERE user_score = 75;
 
 ## 数据流转
 
+> 说明：`ENABLE_RAG=false`（仅语义层模式）时跳过 `build_indexes → FAISS` 与 `FAISS Few-shot` 召回，评分只落 MySQL，优秀案例不同步到向量库。
+
 ```
 Hive 表结构
   ↓ metadata_enricher（采集 + LLM 增强）
@@ -298,7 +305,7 @@ MySQL 重算综合分 → is_high_quality 变化时 → FAISS 自动增删
 Web / CLI 请求
   → capture_user_message
   → Planner（唯一 Agent，ReAct 工具循环）：
-      · search_semantic（语义层优先）→ search_tables / search_columns（RAG 兜底）
+      · search_semantic（语义层优先）→ search_tables / search_columns（RAG 兜底，仅启用 RAG 时返回结果）
       · query_stored_result（复用落盘结果）/ read_skill（技能渐进式披露）
       · execute_query（调用执行链子图：精确 Schema → SQL 生成 → 校验 → Trino/Doris/Hive 执行 → 落盘 CSV）
   → 基于工具结果直接撰写 Markdown 最终回答（respond），结束本轮

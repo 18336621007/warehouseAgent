@@ -82,6 +82,9 @@ class TableCoverageAnalyzer:
             table_name, field_name
         ):
             return True
+        # RAG 关闭时向量库为 None，仅用语义层权威字段定义判归属
+        if self._column_vector_store is None:
+            return False
         columns = self._column_vector_store.columns_in_table(table_name)
         return field_name in columns
 

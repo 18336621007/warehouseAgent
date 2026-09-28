@@ -34,6 +34,11 @@ def get_embedding_base_url() -> str:
     return os.getenv("EMBEDDING_BASE_URL", "") or get_openai_base_url()
 
 
+# 简要注释：是否启用 RAG/embedding 检索（true/false，默认 true；仅用语义层时关掉避免加载向量库）。
+def get_enable_rag() -> bool:
+    return os.getenv("ENABLE_RAG", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
 # 简要注释：读取 MODEL_ENABLE_THINKING（true/false），未配置返回 None 表示不传该参数，保持模型默认。
 def get_model_enable_thinking():
     value = os.getenv("MODEL_ENABLE_THINKING", "").strip().lower()

@@ -2,6 +2,8 @@
 
 > 最后更新：2026-08-13 | Web 前端流式输出（思考过程/最终回答逐字、输入框即时解锁）；全局单一共享查询方案（Planner 改选落草稿、门禁只信 explicit_user）；Evaluator 复杂度预算评分；日志 call_id 配对与 LLM 输入去重
 > ⚠️ **现状提示（2026-09-17）**：系统已演进为 M4 单 Agent 架构（父图仅含 capture_user_message + planner 两个节点，查数通过 execute_query 工具在 Planner ReAct 循环内完成）。本文档中的 Advisor 节点（`advisor_graph.py`）、Evaluator（`evaluator_node.py`）及对应提示词（`advisor_prompt.py`/`evaluator_prompt.py`/`final_answer_prompt.py`/`reranker_prompt.py`）均已删除，相关章节保留作演进历史参考。
+
+> 🆕 **现状补充（2026-09-28）**：用户打分机制已恢复为 Web 层评分入口（前端星星 → `/api/score`），成功回答自动写入 `evaluated_dialogues` 一条记录并下发 `evaluator` 对象。`ENABLE_RAG=false` 时评分仅落 MySQL，只有 `ENABLE_RAG=true` 时用户评分变化才联动同步 FAISS 优秀案例。
 > [返回文档索引](../文档索引.md)
 
 ## 一、概述
