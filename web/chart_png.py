@@ -107,6 +107,9 @@ def _draw_pie(ax, x_vals, values, title):
     ax.axis("equal")
     if title:
         ax.set_title(title, fontsize=12)
+    # 饼图扇区上限备注：默认最多展示 N 个，其余合并为“其他”
+    ax.text(0.5, -0.12, "备注：默认最多展示 {} 个扇区，其余合并为“其他”。".format(_MAX_PIE_SLICES),
+            transform=ax.transAxes, ha="center", fontsize=8, color="#555555")
 
 
 def _render_wordcloud(spec: dict, width: float = 9.0, height: float = 4.6) -> bytes:

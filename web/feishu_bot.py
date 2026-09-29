@@ -123,6 +123,7 @@ class FeishuBot:
         self._api_client = None
         self._ws_client = None
         self._tenant_token = ""  # 原始 HTTP 发互动卡片用的应用凭证，懒获取后缓存
+        self._tenant_token_expires_at = 0.0  # token 过期时间点，超过则自动换新
 
     def _ensure_clients(self, app_id: str, app_secret: str):
         """创建 HTTP API client（WS client 在独立线程自建循环后创建）。"""
@@ -189,21 +190,28 @@ class FeishuBot:
         """以飞书互动卡片（markdown 元素）发送 Markdown 内容，让飞书按卡片规则解析。
         注意：content 必须传 JSON.stringify 后的字符串（内部 \n 为真换行），否则会被再次转义破坏格式。"""
         content = markdown[:_TEXT_MAX * 2]
-        # schema 2.0（elements 放 body 下）：飞书按新版卡片规则渲染 markdown，支持表格/列表等
-        card = {
-            "schema": "2.0",
-            "config": {"wide_screen_mode": True},
-            "body": {
-                "elements": [
-                    {"tag": "markdown", "content": content},
-                ],
-            },
-        }
-        return self._post_interactive_card(receive_id, receive_id_type, card, cid=cid, request_id=request_id)
+        body = {"elements": [{"tag": "markdown", "content": content}]}
+        # 固定 schema 2.0（表格渲染依赖它）；优先带 wide_screen_mode，若飞书拒绝则依次降级
+        # config/去掉 config，始终走 schema 2.0，并保留失败日志与 body 便于定位。
+        card_variants = [
+            {"schema": "2.0", "config": {"wide_screen_mode": True}, "body": body},
+            {"schema": "2.0", "config": {}, "body": body},
+            {"schema": "2.0", "body": body},
+        ]
+        for _idx, card in enumerate(card_variants):
+            if self._post_interactive_card(receive_id, receive_id_type, card, cid=cid, request_id=request_id):
+                return True
+            if _idx + 1 < len(card_variants):
+                # 记录本次降级，方便判断哪种 schema2.0 组合被飞书接受
+                self._log_feishu_event(cid, request_id, "feishu.card.retry",
+                                       "schema2.0 variant {num} fallback".format(num=_idx + 2))
+        return False
 
     def _ensure_tenant_token(self) -> str:
-        """获取并缓存飞书应用 tenant_access_token（原始 HTTP 发送互动卡片使用）。"""
-        if self._tenant_token:
+        """获取并缓存飞书应用 tenant_access_token（原始 HTTP 发送互动卡片使用）。
+        token 带 expire 有效期，过期后必须重新获取，否则长跑会拿着失效 token 导致 HTTP 400。"""
+        now = time.time()
+        if self._tenant_token and now < self._tenant_token_expires_at:
             return self._tenant_token
         import urllib.request
         app_id, app_secret = _load_feishu_config()
@@ -217,6 +225,8 @@ class FeishuBot:
             data = json.loads(resp.read().decode("utf-8"))
         if data.get("code") == 0 and data.get("tenant_access_token"):
             self._tenant_token = data["tenant_access_token"]
+            # expire 单位秒，留 60 秒余量提前续期，避免临界过期仍拿着旧 token
+            self._tenant_token_expires_at = time.time() + int(data.get("expire") or 3600) - 60
         return self._tenant_token
 
     def _post_interactive_card(self, receive_id: str, receive_id_type: str, card: dict,
@@ -248,8 +258,16 @@ class FeishuBot:
                 return False
             return True
         except Exception as exc:
-            print(f"[feishu] interactive card failed: {exc}")
-            self._log_feishu_event(cid, request_id, "feishu.card.failed", f"exception={exc}")
+            detail = str(exc)
+            # 读取 HTTPError 响应体，定位飞书返回的具体报错，方便线上排查
+            try:
+                from urllib.error import HTTPError
+                if isinstance(exc, HTTPError):
+                    detail = "http {code}: {body}".format(code=exc.code, body=exc.read().decode("utf-8", "ignore")[:500])
+            except Exception:
+                pass
+            print(f"[feishu] interactive card failed: {detail}")
+            self._log_feishu_event(cid, request_id, "feishu.card.failed", "exception=" + detail)
             return False
 
 
@@ -483,17 +501,14 @@ class FeishuBot:
             pass
 
     def _try_send_chart(self, cid: str, request_id: str, answer: str, receive_id: str, receive_id_type: str) -> bool:
-        """优先用回答里的 chart 块，否则从落盘结果自动选图，渲染 PNG 后发送。"""
+        """只用回答里明确携带的 chart 块发送图片，与网页端显示保持一致；
+        回答没有 chart 块时不再从落盘结果自动选图，避免飞书多发冗余/异常图片。"""
         try:
             from web.chart_png import extract_chart_spec_from_answer, render_spec_png
             spec = extract_chart_spec_from_answer(answer)
             if not spec:
-                from agentTest.langgraph_app.tools.chart_tool import build_charts_for_request
-                specs, err = build_charts_for_request(cid, request_id, type="auto")
-                if err or not specs:
-                    self._log_feishu_event(cid, request_id, "feishu.chart.skipped", f"no chart spec / 落盘结果不可用: {err or ''}")
-                    return False
-                spec = specs[0]
+                self._log_feishu_event(cid, request_id, "feishu.chart.skipped", "回答未携带 chart 块，网页端不显示图表，飞书端不再补发图片")
+                return False
             png_bytes = render_spec_png(spec)
             ok = self._upload_and_send_image(receive_id, receive_id_type, png_bytes)
             if not ok:
@@ -575,8 +590,11 @@ class FeishuBot:
                                 f"系统暂时无法完成本次查询，请稍后重试。\n错误编号：{error_id}")
                 return
             reply = self._build_reply_text(answer, cid)
-            # 只发互动卡片，不降级纯文本；卡片失败原因由 _post_interactive_card 写入日志
-            self._send_markdown(receive_id, receive_id_type, reply, cid=cid, request_id=request_id)
+            # 优先发互动卡片；卡片失败时兜底发纯文本并记录，保证飞书端能收到结论
+            card_ok = self._send_markdown(receive_id, receive_id_type, reply, cid=cid, request_id=request_id)
+            if not card_ok:
+                self._send_text(receive_id, receive_id_type, reply)
+                self._log_feishu_event(cid, request_id, "feishu.card.fallback", "interactive card failed -> plain text fallback")
             # 数值型结果统一补发一张静态 PNG 图：优先用回答里的 chart 块，没有则从落盘结果自动选图
             self._try_send_chart(cid, request_id, answer, receive_id, receive_id_type)
         except Exception as exc:

@@ -281,7 +281,6 @@ def build_make_chart_tool():
     def make_chart(
         result_id: str = "",
         type: str = "line",
-        types: list = [],
         x_field: str = "",
         y_fields: str | list[str] = "",
         title: str = "",
@@ -293,13 +292,14 @@ def build_make_chart_tool():
         result_id = str(result_id or "").strip()
         x_field = str(x_field or "").strip()
         y_fields = _to_str_list(y_fields)
-        types = _to_str_list(types) or [type]
         if not result_id:
             return "缺少 result_id：请从 execute_query 返回的『结果已落盘』信息中取 result_id。"
         if not x_field:
             return "缺少 x_field：指定图表 x 轴使用的字段名。"
         if not y_fields:
             return "缺少 y_fields：指定图表 y 轴使用的字段名（单值或数组）。"
+        if type not in _ALLOWED_TYPES:
+            return "不支持的图表类型 {}，可选: {}。".format(type, "、".join(_ALLOWED_TYPES))
         conversation_id = get_result_conversation()
         if not conversation_id:
             return "当前会话未初始化，无法读取落盘结果。"
@@ -313,26 +313,14 @@ def build_make_chart_tool():
             )
         entry = data.get("entry") or {}
         rows = list(data.get("rows") or [])
-        blocks = []
-        last_err = ""
-        for t in types:
-            if t not in _ALLOWED_TYPES:
-                last_err = "不支持的图表类型 {}，可选: {}。".format(t, "/".join(_ALLOWED_TYPES))
-                continue
-            spec, err = build_chart_spec(
-                entry, rows, t, x_field, y_fields, title, x_name, y_name, series_names, max_rows,
-            )
-            if spec:
-                blocks.append(_build_chart_block(spec))
-            elif not last_err:
-                last_err = err or "无法生成图表。"
-        if not blocks:
-            return last_err or "无法生成图表。"
-        if len(blocks) > 1:
-            return "已生成多张候选图表，若都适合可全部【原样粘贴】到回答中展示：\n" + "\n\n".join(blocks)
+        spec, err = build_chart_spec(
+            entry, rows, type, x_field, y_fields, title, x_name, y_name, series_names, max_rows,
+        )
+        if not spec:
+            return err or "无法生成图表。"
         return (
             "图表已生成，请把下面这段 ```chart 代码块【原样粘贴】到回答中展示图表的位置"
-            "（不要修改、不要重新生成、不要加任何注释）：\n" + blocks[0]
+            "（不要修改、不要重新生成、不要加任何注释）：\n" + _build_chart_block(spec)
         )
 
     return StructuredTool.from_function(
@@ -341,8 +329,8 @@ def build_make_chart_tool():
         description=(
             "根据 execute_query 已落盘的查询结果生成图表。"
             "参数 result_id 取 execute_query 返回的『结果已落盘』信息中的 result_id；"
-            "type 可选 line/bar/pie/area/wordcloud；types 可传多个图表类型（如 line、bar、pie 可同时给出），由你判断这份数据哪些视图合适并决定是否同时给出；wordcloud 时 y_fields=[关键词列,数值列]；x_field/y_fields 为结果中的字段名（y_fields 支持数组）；"
+            "type 可选 line/bar/pie/area/wordcloud；wordcloud 时 y_fields=[关键词列,数值列]；x_field/y_fields 为结果中的字段名（y_fields 支持数组）；"
             "title/x_name/y_name/series_names 用中文业务含义填写（如 新增订单数、平台），避免图表出现英文字段名；series_names 为 y 轴各系列的中文名，数量应与 y_fields 一致。"
-            "返回一个或多个规范 ```chart 代码块，请原样粘贴到最终回答中展示图表，不要手写 chart JSON。"
+            "返回一个规范 ```chart 代码块，请把它原样粘贴到最终回答中展示图表，不要手写 chart JSON。"
         ),
     )

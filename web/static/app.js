@@ -1542,6 +1542,9 @@ function ensureChartDecor(el) {
     var holder = document.createElement("div"); holder.className = "chart-holder";
     el.appendChild(toolbar);
     el.appendChild(holder);
+    var note = document.createElement("div"); note.className = "chart-note";
+    el.appendChild(note);
+    el._chartNote = note;
     el._chartToolbar = toolbar;
     el._chartHolder = holder;
     el._decorated = true;
@@ -1576,6 +1579,9 @@ function switchChartType(el, type) {
             el._chartToolbar.querySelectorAll(".chart-type-btn").forEach(function (b) {
                 b.classList.toggle("active", b.dataset.type === type);
             });
+        }
+        if (el._chartNote) {
+            el._chartNote.textContent = (type === "pie" || type === "donut") ? "备注：默认最多展示 8 个扇区，其余合并为“其他”。" : "";
         }
         chart.resize();
     } catch (e) {
@@ -1811,12 +1817,17 @@ function buildChartOption(spec, type) {
             // 底部可拖拽滑块调整横轴显示范围（常见于按日期查看区间），同时支持滚轮/拖拽缩放
             // x 轴有名称时额外留出底部空间，避免“城市”等轴名被滑块盖住
             opt.grid.bottom = norm.xName ? 84 : 58;
+            opt.grid.right = 52;
             opt.dataZoom = [
             { type: "slider", xAxisIndex: 0, height: 16, bottom: 6, showDataShadow: false,
               filterMode: "filter",
               borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
               fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
-            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" }
+            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" },
+            { type: "slider", yAxisIndex: 0, right: 8, width: 14, bottom: 60, showDataShadow: false,
+              borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
+              fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
+            { type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" }
         ];
         }
         // 0 参考线：数据存在负值时在 y=0 画一条醒目的横线，便于观测正负
