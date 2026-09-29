@@ -1581,7 +1581,7 @@ function switchChartType(el, type) {
             });
         }
         if (el._chartNote) {
-            el._chartNote.textContent = (type === "pie" || type === "donut") ? "备注：默认最多展示 8 个扇区，其余合并为“其他”。" : "";
+            el._chartNote.textContent = (type === "pie" || type === "donut") ? "备注：默认最多展示 7 个扇区，其余合并为“其他”。" : "";
         }
         chart.resize();
     } catch (e) {
@@ -1700,7 +1700,7 @@ function buildPieData(categories, values) {
         if (!isNaN(v) && v > 0) items.push({ name: c, value: v });
     });
     items.sort(function (a, b) { return b.value - a.value; });
-    var MAX_SLICES = 8;
+    var MAX_SLICES = 7;
     if (items.length > MAX_SLICES) {
         var keep = items.slice(0, MAX_SLICES - 1);
         var rest = items.slice(MAX_SLICES - 1);
@@ -1769,21 +1769,29 @@ function buildChartOption(spec, type) {
         opt.xAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line } }, axisLabel: { color: dark.text }, splitArea: { show: true, areaStyle: { color: ["rgba(255,255,255,0.02)", "rgba(255,255,255,0.04)"] } } };
         opt.yAxis = { type: "category", data: yCats, name: norm.yName, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line } }, axisLabel: { color: dark.text } };
         opt.series = [{ type: "heatmap", data: cells, label: { show: true, color: dark.text, fontSize: 11 }, itemStyle: { borderColor: cssVar("--bg", "#212121"), borderWidth: 1 } }];
+        var _gb = norm.xName ? 96 : 56;
+        var _xb = _gb - 16 - 8; // 横滑块贴轴名区底部，下方留 8px
+        opt.grid.bottom = _gb;
+        opt.grid.right = 130;
+        opt.grid.left = 10; // plot 左边界统一，与折线选项对齐
         if (isFinite(hMin) && isFinite(hMax) && hMax >= hMin) {
-            opt.visualMap = { min: hMin, max: hMax, calculable: true, orient: "horizontal", left: "center", bottom: 0, textStyle: { color: dark.sub }, inRange: { color: [cssVar("--code-bg", "#1A1A1A"), cssVar("--hover-bg", "#2E5A45"), cssVar("--accent", "#10A37F"), cssVar("--warn", "#F0C040")] } };
-            opt.grid.bottom = norm.xName ? 68 : 40;
+            // 右侧颜色条替代纵滑块：展示数值与颜色映射，放右边缘
+            opt.visualMap = { min: hMin, max: hMax, calculable: false, orient: "vertical", right: 8, width: 14, top: 56, bottom: _xb + 16, textStyle: { color: dark.sub }, inRange: { color: [cssVar("--code-bg", "#1A1A1A"), cssVar("--hover-bg", "#2E5A45"), cssVar("--accent", "#10A37F"), cssVar("--warn", "#F0C040")] } };
         }
-        // 热力图同样允许横轴范围选择与缩放
+        // 热力图保留底部横滑块(x)；右侧不放纵滑块，改由颜色条展示数值，y 用滚轮/拖拽缩放
         opt.dataZoom = [
-            { type: "slider", xAxisIndex: 0, height: 14, bottom: 6, showDataShadow: false, borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 } },
-            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true }
+            { type: "slider", xAxisIndex: 0, height: 16, bottom: _xb, showDataShadow: false, filterMode: "filter",
+              borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
+              fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
+            { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" },
+            { type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" }
         ];
     } else if (type === "pie" || type === "donut") {
         // 环形图 = 饼图 + 内圈留白；普通饼图仍沿用实心样式
         var pieRadius = type === "donut" ? ["42%", "62%"] : ["0%", "52%"];
         opt.series = seriesList.map(function (s) {
             return {
-                name: s.name, type: "pie", radius: pieRadius, center: ["36%", "50%"],
+                name: s.name, type: "pie", radius: pieRadius, center: ["50%", "50%"],
                 data: buildPieData(categories, s.values),
                 minAngle: 2,
                 avoidLabelOverlap: true,
@@ -1793,7 +1801,7 @@ function buildChartOption(spec, type) {
             };
         });
         // 图例放右侧避免遮挡饼图底部与标签，扇区多时可滚动；给图例固定宽度，避免窄屏下遮挡饼图
-        opt.legend = { orient: "vertical", right: 4, top: "middle", width: 86, type: "scroll", itemWidth: 9, itemHeight: 9, itemGap: 3, textStyle: { color: dark.sub, fontSize: 11 } };
+        opt.legend = { orient: "vertical", left: "70%", top: "middle", width: 116, type: "scroll", itemWidth: 14, itemHeight: 14, itemGap: 7, textStyle: { color: dark.sub, fontSize: 13 } };
     } else {
         if (type === "hbar") {
             // 横向条形图：类别放到 y 轴，数值放到 x 轴
@@ -1811,20 +1819,38 @@ function buildChartOption(spec, type) {
             return item;
         });
         if (type === "hbar") {
-            // 横向条形图：类别多时可向上缩放/滚动 y 轴
-            opt.dataZoom = [{ type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true }];
-        } else {
-            // 底部可拖拽滑块调整横轴显示范围（常见于按日期查看区间），同时支持滚轮/拖拽缩放
-            // x 轴有名称时额外留出底部空间，避免“城市”等轴名被滑块盖住
-            opt.grid.bottom = norm.xName ? 84 : 58;
-            opt.grid.right = 52;
+            // 横向条形图：右侧纵滑块控制类别(y)，底部横滑块控制数值(x)，纵滑块底部与横轴滑块对齐
+            var _gb = norm.xName ? 96 : 56; // grid 底部给足轴标签+轴名空间；无轴名时 56，有轴名时 96
+            var _xb = _gb - 16 - 8; // 横滑块顶紧贴轴名区底部，下方留 8px，不遮挡图表
+            opt.grid.right = 130;
+            opt.grid.left = 10; // plot 左边界统一，与折线选项对齐
+            opt.grid.bottom = _gb;
             opt.dataZoom = [
-            { type: "slider", xAxisIndex: 0, height: 16, bottom: 6, showDataShadow: false,
+                { type: "slider", yAxisIndex: 0, right: 8, width: 14, bottom: _xb + 16, top: 56, showDataShadow: false,
+                  filterMode: "filter",
+                  borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
+                  fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
+                { type: "slider", xAxisIndex: 0, height: 16, bottom: _xb, showDataShadow: false,
+                  filterMode: "filter",
+                  borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
+                  fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
+                { type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" },
+                { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true }
+            ];
+        } else {
+            // 底部可拖拽滑块调整横轴显示范围；滑块贴近 plot 底边，纵轴滑块对齐成 L 形
+            var _gb = norm.xName ? 96 : 56; // grid 底部给足轴标签+轴名空间；无轴名时 56，有轴名时 96
+            var _xb = _gb - 16 - 8; // 横滑块顶紧贴轴名区底部，下方留 8px，不遮挡图表
+            opt.grid.bottom = _gb;
+            opt.grid.right = 130;
+            opt.grid.left = 10; // plot 左边界统一，与折线选项对齐
+            opt.dataZoom = [
+            { type: "slider", xAxisIndex: 0, height: 16, bottom: _xb, showDataShadow: false,
               filterMode: "filter",
               borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
               fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
             { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" },
-            { type: "slider", yAxisIndex: 0, right: 8, width: 14, bottom: 60, showDataShadow: false,
+            { type: "slider", yAxisIndex: 0, right: 8, width: 14, bottom: _xb + 16, top: 56, showDataShadow: false,
               borderColor: dark.line, textStyle: { color: dark.sub, fontSize: 10 },
               fillerColor: "rgba(" + cssRgb("--accent-rgb", "16, 163, 127") + ", 0.16)", handleStyle: { color: dark.text } },
             { type: "inside", yAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true, filterMode: "filter" }
