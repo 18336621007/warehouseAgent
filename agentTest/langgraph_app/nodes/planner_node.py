@@ -365,6 +365,32 @@ def _invoke_llm_with_retry(llm, messages, node_name="planner"):
     raise last_err
 
 
+def _looks_like_tool_leak(text):
+    # 工具调用/伪 XML 草稿标记检测：撞工具上限后模型可能把“还想继续调工具”的草稿当回答，
+    # 命中即不当作最终回答（杜绝工具调用标记上屏乱码，对齐 Codex）
+    if not text:
+        return False
+    low = text.lower()
+    markers = ("calls>", "invoke name=", "parameter name=", "close_calls>", "dsml", "antml", "\uff5c\uff5c")
+    return any(m in low for m in markers)
+
+
+def _finalize_after_tool_cap(chat_openai, react_messages):
+    # 撞工具上限后的纯文本定稿：明确禁止工具标记，检测到泄漏则重写一次，仍泄漏返回空由外层兜底
+    final_messages = react_messages + [
+        HumanMessage(content=(
+            "已达工具调用步数上限，此后禁止再调用任何工具，也禁止输出任何工具调用语法"
+            "（invoke/calls/parameter/DSML/antml/<|...|> 等标记）。"
+            "请直接基于上面已经获得的信息，用纯文本给出给用户的最终回答；信息不足就说明原因。"
+        ))
+    ]
+    for _attempt in range(2):
+        _text = str(getattr(_invoke_llm_with_retry(chat_openai, final_messages), "content", "") or "").strip()
+        if not _looks_like_tool_leak(_text):
+            return _text
+    return ""
+
+
 def build_planner_node(runtime):
     # M2：Planner 工具化，从统一注册表取只读安全工具（元数据检索 + 落盘结果预览）
     planner_tools = runtime["tool_registry"].get(group="planner")
@@ -647,11 +673,9 @@ def build_planner_node(runtime):
                         react_messages, used_tokens=_current_input_tokens, added_chars=_added_chars,
                     )
                 # 循环结束兜底：撞 MAX_PLANNER_TOOL_STEPS 上限仍无最终回答时，
-                # 用主模型（thinking）基于现有上下文定稿一次补充最终回答（对齐 Codex）
+                # 用主模型（thinking）强制纯文本定稿；严禁把工具调用草稿当回答上屏（对齐 Codex）
                 if not _final_text.strip():
-                    _final_text = str(getattr(
-                        _invoke_llm_with_retry(chat_openai, react_messages),
-                        "content", "") or "").strip()
+                    _final_text = _finalize_after_tool_cap(chat_openai, react_messages)
                 # 空文本仅做一次通用兜底，绝不重试（对齐 Codex）
                 if not _final_text.strip():
                     _final_text = "查询遇到问题，请稍后重试。"

@@ -21,7 +21,10 @@ MAX_PLANNER_RESPOND_RETRY = 2
 # 2026-09-17：模型端 response_format JSON 偶发异常（APIError 400/5xx）时，LLM 调用的瞬时重试次数（退避 0.5s 递增）
 MAX_LLM_RETRY = 2
 # 2026-09-17：execute_query 多段查询的并行度（不同来源表/独立指标并行执行，出错逐级降级到串行）
-MAX_QUERY_PARALLEL = 4
+# 2026-09-29：提到 6 支持多段多维度一次带全；失败段按 MAX_QUERY_DEGRADE_RETRIES 上限降级，风险可控
+MAX_QUERY_PARALLEL = 6
+# 2026-09-29：多段查询失败后降级重试的次数上限（方案2 收敛，单段最多重试一次即停止，避免反复耗时）
+MAX_QUERY_DEGRADE_RETRIES = 1
 # M2：Seeker 执行成功但 0 行时，回 Planner 自愈的最大轮次（防死循环）
 MAX_EMPTY_RESULT_ROUNDS = 2
 # M3：值探查工具参数（0 行自愈时用 LIKE 实时确认字段实际取值）

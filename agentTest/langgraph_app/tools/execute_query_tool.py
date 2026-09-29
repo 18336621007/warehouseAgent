@@ -343,7 +343,7 @@ def build_execute_query_tool(runtime):
         from concurrent.futures import ThreadPoolExecutor
         from contextvars import copy_context
 
-        from agentTest.config.planner import MAX_QUERY_PARALLEL
+        from agentTest.config.planner import MAX_QUERY_DEGRADE_RETRIES, MAX_QUERY_PARALLEL
         from agentTest.langgraph_app.services.result_store import save_query_script
 
         # 1. 收集执行单元（保持原始顺序，每段独立 request_id 保证落盘唯一）
@@ -381,10 +381,12 @@ def build_execute_query_tool(runtime):
                 return True
             return bool((_rs or {}).get("sql_exec_failed"))
 
-        # 2. 并行执行，出错逐级降级并行度（如 4→2→1），降级后仅重跑失败单元
+        # 2. 并行执行，出错按配置上限降级并行度（如 4→2），降级后仅重跑失败单元；
+        # 达重试上限即停止，保留最后一次失败结果（含具体错误），交给 Planner 修正，避免反复空转
         results = {}
         failed_keys = [_u["key"] for _u in units]
         _parallel = MAX_QUERY_PARALLEL
+        _retries_left = MAX_QUERY_DEGRADE_RETRIES
         while failed_keys:
             _todo = [_u for _u in units if _u["key"] in failed_keys]
             if len(_todo) == 1:
@@ -404,6 +406,9 @@ def build_execute_query_tool(runtime):
             _next_failed = [_k for _k, (_rs, _txt) in results.items() if _is_failed(_rs)]
             if not _next_failed:
                 break
+            if _retries_left <= 0:
+                # 已达降级重试上限（方案2 收敛）：停止重跑，保留最后一次失败原因返回
+                break
             # 并行度减半重试失败单元（可能是并发压力导致，降级后重试）
             _half = _parallel // 2
             if _half < 1:
@@ -413,6 +418,7 @@ def build_execute_query_tool(runtime):
                 node_name="execute_query",
             )
             _parallel = _half
+            _retries_left -= 1
             failed_keys = _next_failed
 
         # 3. 按原始顺序组装摘要与脚本元数据
@@ -450,6 +456,7 @@ def build_execute_query_tool(runtime):
           排名/比较类请给合理规模如 10，不要只取 1 条；用户明确只要 1 条时再给 1）
         - steps：可选，多段查询脚本的 JSON 数组字符串，每段 {id, sql, question, result_limit}；
           程序并行执行每段并各自落盘，出错自动降级串行，返回各段摘要与结果引用
+        - 需要多个视角（如不同分组维度、汇总、Top N）时，优先把它们放进同一次 steps 的多个独立段一次执行，分别落盘后直接基于结果写回答，避免逐个维度反复重查。
         返回 0 行时请自行判断是过滤值问题（可 probe_values 探查实际取值后改 SQL 重查）还是确实无数据；
         安全校验/执行失败返回具体错误，据此修正 SQL 后重试。
         """

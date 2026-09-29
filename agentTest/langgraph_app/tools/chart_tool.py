@@ -105,7 +105,8 @@ def detect_chart_fields(columns: list, rows: list) -> tuple:
 
 def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields: list,
                      title: str = "", x_name: str = "", y_name: str = "",
-                     series_names: list | None = None, max_rows: int = MAX_CHART_ROWS) -> tuple:
+                     series_names: list | None = None, max_rows: int = MAX_CHART_ROWS,
+                     pie_slices: int = 15) -> tuple:
     """从落盘结果条目 + 全量行构建规范图表 spec。
 
     校验字段、上限行数、数值化 y 字段；返回 (spec, "") 或 (None, 失败原因)，
@@ -165,6 +166,7 @@ def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields:
         chart_rows.append(item)
     if not chart_rows:
         return None, "落盘结果为空，无法生成图表。"
+    MAX_PIE_SLICES = max(1, min(int(pie_slices or 15), 300))
     spec = {
         "type": type,
         "title": title or "",
@@ -174,20 +176,20 @@ def build_chart_spec(entry: dict, rows: list, type: str, x_field: str, y_fields:
         "yName": y_name,
         "seriesNames": [str(sn) for sn in (series_names or [])],
         "data": chart_rows,
+        "pieMaxSlices": MAX_PIE_SLICES,
     }
     return spec, ""
 
 
-def build_charts_for_request(conversation_id: str, request_id: str, type: str = "line",
-                             x_field: str = "", y_fields=None, title: str = "") -> tuple:
-    """为某次请求生成图表 spec 列表：匹配该请求下的全部落盘结果（含 _pN 分段），
-    每段一个默认图（自动探测字段），供前端『生成图表』按钮使用。
+def _pick_primary_result(conversation_id: str, request_id: str, answer: str = ""):
+    """从某请求的全部落盘结果里选出一个主结果（供手动生图）。
 
-    返回 (specs, "") 或 ([], 原因)；不依赖工具会话上下文，纯读落盘索引。
+    『生成图表』按钮应该只画该回答真正展示的那一个结果；优先匹配回答中引用的落盘文件，
+    否则取可成图且行数最大的结果，避免把分区探查/探字段这类过程性小结果混进来。
     """
-    from agentTest.langgraph_app.services.result_store import list_result_index, read_result_full
+    from agentTest.langgraph_app.services.result_store import list_result_index
     if not conversation_id or not request_id:
-        return [], "缺少会话或请求参数。"
+        return None
     request_id = str(request_id).strip()
     entries = list_result_index(conversation_id, limit=20)
     matched = [
@@ -196,27 +198,54 @@ def build_charts_for_request(conversation_id: str, request_id: str, type: str = 
         or str(e.get("result_id") or "").startswith(request_id)
     ]
     if not matched:
-        return [], "该回答没有可查询的落盘结果，无法生成图表。"
-    specs = []
-    multiple = len(matched) > 1
+        return None
+    # 回答里显式引用了某个落盘文件时优先返回它（即“真正展示的那一个”）
+    answer_text = str(answer or "")
     for e in matched:
-        data = read_result_full(conversation_id, e.get("result_id"))
-        if not data:
+        csv_name = str(e.get("full_csv") or "")
+        csv_path = str(e.get("full_csv_path") or "")
+        if (csv_name and csv_name in answer_text) or (csv_path and csv_path in answer_text):
+            return e
+    # 否则挑可成图且行数最大的结果（探查类小结果行数少，自然排后）
+    best = None
+    for e in matched:
+        rows = list(e.get("preview_rows") or [])
+        x, ys = detect_chart_fields(list(e.get("columns") or []), rows)
+        if not x or not ys:
             continue
-        rows = list(data.get("rows") or [])
-        # type 缺省或 "auto" 时按数据形态/查询意图自动挑选（占比→pie、趋势→line、对比→bar）
-        per_type = type if type and type != "auto" else _auto_chart_type(
-            [str(c) for c in (e.get("columns") or [])], rows, e.get("effective_query") or "",
-        )
-        per_title = title
-        if multiple:
-            per_title = (title + " · " if title else "") + f"第{e.get('round_no')}段"
-        spec, err = build_chart_spec(e, rows, per_type, x_field, y_fields or [], per_title, "", "")
-        if spec:
-            specs.append(spec)
-    if not specs:
-        return [], "落盘结果没有适合可视化的数据，无法生成图表。"
-    return specs, ""
+        if best is None or (int(e.get("row_count") or 0) > int(best.get("row_count") or 0)):
+            best = e
+    return best
+
+
+def build_charts_for_request(conversation_id: str, request_id: str, type: str = "line",
+                             x_field: str = "", y_fields=None, title: str = "",
+                             answer: str = "") -> tuple:
+    """为某次请求生成图表 spec：只返回该回答的一个主结果图表，供前端『生成图表』按钮使用。
+
+    返回 (specs, "") 或 ([], 原因)；不依赖工具会话上下文，纯读落盘索引。
+    """
+    from agentTest.langgraph_app.services.result_store import read_result_full
+    if not conversation_id or not request_id:
+        return [], "缺少会话或请求参数。"
+    entry = _pick_primary_result(conversation_id, request_id, answer)
+    if entry is None:
+        return [], "该回答没有适合可视化的落盘结果，无法生成图表。"
+    data = read_result_full(conversation_id, entry.get("result_id"))
+    if not data:
+        return [], "主结果读取失败，无法生成图表。"
+    rows = list(data.get("rows") or [])
+    # type 缺省或 "auto" 时按数据形态/查询意图自动挑选（占比→pie、趋势→line、对比→bar）
+    per_type = type if type and type != "auto" else _auto_chart_type(
+        [str(c) for c in (entry.get("columns") or [])], rows, entry.get("effective_query") or "",
+    )
+    per_title = title or str(entry.get("effective_query") or "") or f"第{entry.get('round_no')}段"
+    spec, err = build_chart_spec(entry, rows, per_type, x_field, y_fields or [],
+                                per_title, "", "", [], MAX_CHART_ROWS, 15)
+    if not spec:
+        return [], err or "无法生成图表。"
+    return [spec], ""
+
 
 
 def has_chartable_result(conversation_id: str, request_id: str) -> bool:
@@ -288,6 +317,7 @@ def build_make_chart_tool():
         y_name: str = "",
         series_names: list = [],
         max_rows: int = MAX_CHART_ROWS,
+        pie_slices: int = 15,
     ) -> str:
         result_id = str(result_id or "").strip()
         x_field = str(x_field or "").strip()
@@ -314,7 +344,8 @@ def build_make_chart_tool():
         entry = data.get("entry") or {}
         rows = list(data.get("rows") or [])
         spec, err = build_chart_spec(
-            entry, rows, type, x_field, y_fields, title, x_name, y_name, series_names, max_rows,
+            entry, rows, type, x_field, y_fields, title, x_name, y_name,
+            series_names, max_rows, pie_slices,
         )
         if not spec:
             return err or "无法生成图表。"
@@ -330,6 +361,7 @@ def build_make_chart_tool():
             "根据 execute_query 已落盘的查询结果生成图表。"
             "参数 result_id 取 execute_query 返回的『结果已落盘』信息中的 result_id；"
             "type 可选 line/bar/pie/area/wordcloud；wordcloud 时 y_fields=[关键词列,数值列]；x_field/y_fields 为结果中的字段名（y_fields 支持数组）；"
+            "饼图/环形图默认展示分区数量由 pie_slices 指定（可选，默认 15，最大 300），该值会写入备注说明；"
             "title/x_name/y_name/series_names 用中文业务含义填写（如 新增订单数、平台），避免图表出现英文字段名；series_names 为 y 轴各系列的中文名，数量应与 y_fields 一致。"
             "返回一个规范 ```chart 代码块，请把它原样粘贴到最终回答中展示图表，不要手写 chart JSON。"
         ),

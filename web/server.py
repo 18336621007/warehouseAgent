@@ -422,8 +422,9 @@ def cancel_chat():
 def generate_chart():
     """按回答对应的落盘结果生成图表 spec（前端『生成图表』按钮，仿豆包）。
 
-    输入 conversation_id + 该回答的 request_id（含 _pN 分段时按前缀匹配全部落盘结果），
-    程序从落盘结果取真实数据并自动探测 x/y 字段，返回规范 chart spec 列表。
+    输入 conversation_id + 该回答的 request_id（含 _pN 分段时按前缀匹配落盘结果），
+    程序只返回该回答的一个主结果图表（避免把分区探查等过程性结果一次画多张），
+    自动探测 x/y 字段；若回答里显式引用了某个落盘文件则优先按该结果成图。
     复用 chart_tool 的 build_charts_for_request，与 make_chart 工具同一套取数与格式逻辑。
     """
     data = request.get_json() or {}
@@ -433,6 +434,12 @@ def generate_chart():
         return jsonify({"error": "invalid conversation_id"}), 400
     try:
         from agentTest.langgraph_app.tools.chart_tool import build_charts_for_request
+        # 传该回答文本，便于后端在多个落盘结果中匹配“回答真正展示的那一个”主结果
+        _answer = ""
+        for _msg in (sessions[conversation_id].get("messages") or []):
+            if _msg.get("role") == "assistant" and str(_msg.get("request_id") or "") == request_id:
+                _answer = str(_msg.get("content") or "")
+                break
         specs, err = build_charts_for_request(
             conversation_id,
             request_id,
@@ -440,6 +447,7 @@ def generate_chart():
             x_field=str(data.get("x_field") or ""),
             y_fields=data.get("y_fields") or [],
             title=str(data.get("title") or ""),
+            answer=_answer,
         )
     except Exception as error:
         return jsonify({"success": False, "error": f"图表生成失败：{error}"}), 200
