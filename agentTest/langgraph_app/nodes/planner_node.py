@@ -568,12 +568,14 @@ def build_planner_node(runtime):
                         except Exception as _err:
                             return f"工具调用失败: {_err}"
 
+                    # 主线程先捕获 context，传给工作线程（worker 里再 copy_context 拿不到 result_conversation 等 ContextVar）
+                    _tool_ctx = copy_context()
+
                     def _exec_tool_call(_tc, _idx, _tool):
                         # 推送工具执行事件到前端（实际执行的工具才推，去重跳过的不推）
                         _emit_tool_event(str(_tc.get("name") or ""))
-                        # 用 copy_context 传播主线程的日志/会话 ContextVar，保证子线程日志归属正确
-                        _ctx = copy_context()
-                        return _ctx.run(_invoke_tool, _tc, _idx, _tool)
+                        # 用主线程捕获的 context 传播日志/会话 ContextVar，保证子线程日志归属正确
+                        return _tool_ctx.run(_invoke_tool, _tc, _idx, _tool)
 
                     # 去重决策在主线程完成（避免并发竞争）；实际工具调用并行执行
                     _prepared = []

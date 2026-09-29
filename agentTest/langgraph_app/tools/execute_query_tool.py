@@ -365,10 +365,12 @@ def build_execute_query_tool(runtime):
         if not units:
             return "steps 中未找到有效的 SQL 段，请检查每段是否包含 sql 字段。"
 
+        # 主线程先捕获 context（子线程内再 copy_context 拿不到 planner 的会话 ContextVar，会导致落盘目录错误）
+        _main_ctx = copy_context()
+
         def _exec_unit(_u):
-            # 用 copy_context 传播主线程的日志/会话 ContextVar，保证日志归属与落盘正确
-            _ctx = copy_context()
-            return _ctx.run(
+            # 用主线程捕获的 context 传播日志/会话 ContextVar，保证日志归属与落盘正确
+            return _main_ctx.run(
                 _exec_one_sql, runtime, _u["sql"], _u["question"], _u["key"],
                 step_id=_u["step_id"], result_limit=_u["result_limit"],
             )
