@@ -79,15 +79,31 @@ def has_select_star(expression) -> bool:
     return False
 
 
-def has_partition_filter(expression, partition_fields: list[str]) -> bool:
-    # 判断 where 条件中是否包含时间/分区字段
-    normalized_partition_fields = {field.lower() for field in partition_fields}
+def _has_range_or_eq_condition(expression, column_name: str) -> bool:
+    # 判断某列在 where 中是否带比较条件（>=、<=、>、<、=、BETWEEN），避免只出现列名而没有实质过滤
+    compare_types = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)
+    for node in expression.find_all(*compare_types):
+        if any(c.name.lower() == column_name for c in node.find_all(exp.Column)):
+            return True
+    return False
+
+
+def has_partition_filter(expression, partition_fields: list[str] | None = None) -> bool:
+    # 判断 where 中是否包含时间/分区过滤：优先命中声明的 partition_fields，
+    # 同时允许 LLM 自行选择筛选时间类字段（列名含 time/date/dt/day 且带比较条件），
+    # 不把过滤字段名硬编码为 pt_dt
+    normalized_partition_fields = {field.lower() for field in (partition_fields or ["pt_dt"])}
+    time_marks = ("time", "date", "_dt", "day", "日期")
 
     for where_expression in expression.find_all(exp.Where):
-        for column in where_expression.find_all(exp.Column):
-            column_name = column.name.lower()
+        columns = [c.name.lower() for c in where_expression.find_all(exp.Column)]
+        for column_name in columns:
             if column_name in normalized_partition_fields:
                 return True
+        for column_name in columns:
+            if any(mark in column_name for mark in time_marks):
+                if _has_range_or_eq_condition(where_expression, column_name):
+                    return True
 
     return False
 

@@ -1586,18 +1586,20 @@ function animateChartSize(el) {
     })();
 }
 
-function animateChartSubIn(el) {
-    // 指标切换时逐帧做淡入过渡（opacity + 轻微上移），不依赖 CSS 样式切换，保证一定生效
+function animateChartSubSlide(el, dir) {
+    // 指标切换时逐帧做水平滑入过渡（类似左右滑动），指标标签/工具栏保持不动；dir=1 从右滑入，dir=-1 从左滑入
     if (!el) return;
     var oldTransition = el.style.transition;
     el.style.transition = "none";
     var t0 = Date.now();
-    var DUR = 420;
+    var DUR = 380;
+    dir = (dir >= 0) ? 1 : -1;
     (function frame() {
         var p = Math.min(1, (Date.now() - t0) / DUR);
         var e = 1 - Math.pow(1 - p, 3); // easeOutCubic，开头轻快结尾平滑
+        var x = dir * 56 * (1 - e);
         el.style.opacity = String(e);
-        el.style.transform = "translateY(" + (6 * (1 - e)).toFixed(2) + "px) scale(" + (1 - 0.005 * (1 - e)).toFixed(4) + ")";
+        el.style.transform = "translateX(" + x.toFixed(2) + "px)";
         if (p < 1) { setTimeout(frame, 16); }
         else { el.style.opacity = ""; el.style.transform = ""; el.style.transition = oldTransition; }
     })();
@@ -1632,7 +1634,7 @@ function switchChartType(el, type) {
     if (type === "hbar") {
         el.style.height = "560px";
     } else if (type === "pie" || type === "donut") {
-        el.style.height = "460px";
+        el.style.height = "430px";
     } else if (el.style.height) {
         el.style.height = "";
     }
@@ -1641,18 +1643,18 @@ function switchChartType(el, type) {
     try {
         var holder = el._chartHolder || el;
         el._chartRendered = false;
-        if (el._pieDefault === undefined) {
-            el._pieDefault = parseInt(spec.pieMaxSlices, 10) || 15;
-        }
+        // 默认不再固定分区数量：null 表示按累计占比自动展示，用户可通过 +/- 手动覆盖
+        if (el._pieDefault === undefined) el._pieDefault = null;
         if (el._pieMax === undefined) el._pieMax = el._pieDefault;
         spec._pieMax = el._pieMax;
+        spec._pieThreshold = 0.9; // 默认保留占比累计前 90% 的分区，其余合并为“其他”
         var norm = normalizeChartData(spec);
         // 饼图/环形图/词云不宜把两个指标叠在一张图里：用指标切换器一次只看一个指标，每张都带指标名副标题
         var split = (type === "pie" || type === "donut" || type === "wordcloud" || type === "heatmap") && norm.seriesList.length > 1;
         if (split) {
             // 多指标时一次只展示一个指标，用指标标签在饼/环/词云之间切换，避免两张图叠在一起或多图堆叠
             if (el._chartMetricIndex === undefined) el._chartMetricIndex = 0;
-            el.style.height = "520px";
+            el.style.height = "470px";
             holder.innerHTML = "";
             el._chartSubs = [];
             var tabs = document.createElement("div");
@@ -1669,13 +1671,18 @@ function switchChartType(el, type) {
                 tabs.appendChild(tb);
             });
             holder.appendChild(tabs);
-            var subDiv = document.createElement("div");
-            subDiv.className = "chart-sub";
-            subDiv.style.height = (type === "wordcloud") ? "300px" : (type === "heatmap") ? "420px" : "360px";
-            holder.appendChild(subDiv);
-            el._chartSubDiv = subDiv;
-            // 首次渲染由 switchChartType 的整体淡入覆盖，标记后避免再叠加一次子图淡入导致卡顿
+            // 指标切换滚动窗口：承载新旧两层图表，切换时旧层滑出淡出、新层滑入淡入
+            var win = document.createElement("div");
+            win.className = "chart-window";
+            win.style.position = "relative";
+            win.style.overflow = "hidden";
+            win.style.minHeight = (type === "wordcloud") ? "300px" : (type === "heatmap") ? "420px" : "360px"; // 自适应撑满剩余空间，统一各图表与备注间距
+            holder.appendChild(win);
+            // 首次渲染由类型切换的整体淡入覆盖，后续指标切换才做左右滑转场
             var isFirstRender = true;
+            el._chartWindow = win;
+            el._chartSubDiv = null;
+            el._prevMetricIndex = undefined;
             var renderMetric = function (idx) {
                 var ssn = norm.seriesList[idx].name || ("指标" + (idx + 1));
                 var subSpec = {
@@ -1684,23 +1691,51 @@ function switchChartType(el, type) {
                     xName: norm.xName,
                     yName: ssn,
                     seriesNames: [ssn],
-                    pieMaxSlices: spec.pieMaxSlices || 15,
+                    pieMaxSlices: spec.pieMaxSlices || 90,
                     _pieMax: el._pieMax,
+                    _pieThreshold: 0.9,
                     xAxis: norm.categories.slice(),
                     series: [{ name: ssn, data: norm.seriesList[idx].values.slice() }]
                 };
                 var subOpt = buildChartOption(subSpec, type);
-                if (type === "wordcloud" && el._chart) {
-                    // 词云切换指标时复用实例更新，避免重建 canvas 导致标题/副标题/内容闪烁
-                    el._chart.setOption(subOpt, true);
-                } else {
-                    if (el._chart) { try { el._chart.dispose(); } catch (e) {} el._chart = null; }
-                    el._chart = echarts.init(subDiv);
-                    el._chart.setOption(subOpt);
+                // 保留旧层用于滑出淡出，新层渲染在新容器上
+                var oldLayer = el._chartSubDiv;
+                var oldChart = el._chart;
+                var newDiv = document.createElement("div");
+                newDiv.className = "chart-sub";
+                newDiv.style.position = "absolute";
+                newDiv.style.top = "0";
+                newDiv.style.left = "0";
+                newDiv.style.width = "100%";
+                newDiv.style.height = "100%";
+                win.appendChild(newDiv);
+                el._chartSubDiv = newDiv;
+                el._chart = echarts.init(newDiv);
+                el._chart.setOption(subOpt);
+                var prevIdx = (el._prevMetricIndex === undefined) ? idx : el._prevMetricIndex;
+                if (!isFirstRender && oldLayer && oldLayer.parentNode === win) {
+                    // 左右滑动交叉过渡：新指标从一侧滑入并淡入到 100%，旧指标向另一侧滑出并淡出到 0
+                    var slideDir = idx > prevIdx ? 1 : -1; // 1=选中右侧指标（从右滑入），-1=选中左侧指标（从左滑入）
+                    oldLayer.style.transition = "none";
+                    newDiv.style.transition = "none";
+                    oldLayer.style.opacity = "1";
+                    oldLayer.style.transform = "translateX(0px)";
+                    newDiv.style.opacity = "0";
+                    newDiv.style.transform = "translateX(" + (slideDir * 110) + "px)";
+                    void win.offsetWidth; // 强制 reflow 后新旧两层同时开始过渡
+                    oldLayer.style.transition = "opacity 0.5s ease, transform 0.5s ease";
+                    newDiv.style.transition = "opacity 0.5s ease, transform 0.5s ease";
+                    oldLayer.style.opacity = "0";
+                    oldLayer.style.transform = "translateX(" + (-slideDir * 110) + "px)";
+                    newDiv.style.opacity = "1";
+                    newDiv.style.transform = "translateX(0px)";
+                    setTimeout(function () {
+                        if (oldLayer.parentNode === win) { win.removeChild(oldLayer); }
+                        if (oldChart) { try { oldChart.dispose(); } catch (e) {} }
+                    }, 540);
                 }
-                // 指标切换：调用逐帧淡入动画，切换时不会硬跳；首次渲染不重复淡入
-                if (el._chartSubDiv && !isFirstRender) { animateChartSubIn(el._chartSubDiv); }
                 isFirstRender = false;
+                el._prevMetricIndex = idx;
                 tabs.querySelectorAll(".chart-metric-tab").forEach(function (tb, ti) {
                     tb.classList.toggle("active", ti === idx);
                 });
@@ -1719,7 +1754,7 @@ function switchChartType(el, type) {
                 });
             }
             if (el._chartNote) {
-                el._chartNote.textContent = (type === "pie" || type === "donut") ? "默认展示 " + (el._pieDefault || 15) + " 个分区，优先显示占比最高的，其余合并为“其他”，下方 +/- 可调整；上方标签可切换指标。" : "上方标签可切换当前指标。";
+                el._chartNote.textContent = (type === "pie" || type === "donut") ? "默认展示占比累计前 90% 的分区，其余合并为“其他”。上方标签可切换指标。" : "上方标签可切换当前指标。";
             }
             // 多指标也保留默认扇区数量与 +/－ 调整，让每个指标独立生效
             ensurePieSlicesControl(el, type);
@@ -1741,7 +1776,7 @@ function switchChartType(el, type) {
             });
         }
         if (el._chartNote) {
-            el._chartNote.textContent = (type === "pie" || type === "donut") ? "备注：默认展示 " + (el._pieDefault || 15) + " 个分区，优先显示占比最高的，其余合并为“其他”。图下 +/- 可调整展示数量。" : "";
+            el._chartNote.textContent = (type === "pie" || type === "donut") ? "备注：默认展示占比累计前 90% 的分区，其余合并为“其他”。" : "";
         }
         ensurePieSlicesControl(el, type);
         chart.resize();
@@ -1751,93 +1786,11 @@ function switchChartType(el, type) {
     }
 }
 
-function computePieMaxSlices(spec) {
-    // 饼图最大可展示分区数 = 有效数值分区总数（按系列取最大），高于该值无实际意义
-    var norm;
-    try { norm = normalizeChartData(spec || {}); } catch (e) { return 15; }
-    var maxAllowed = 0;
-    (norm.seriesList || []).forEach(function (s) {
-        var cnt = 0;
-        (norm.categories || []).forEach(function (_, i) {
-            var v = Number((s.values || [])[i]);
-            if (!isNaN(v) && v > 0) cnt++;
-        });
-        if (cnt > maxAllowed) maxAllowed = cnt;
-    });
-    return maxAllowed || 15;
-}
-
-function clampPieMax(n, maxAllowed) {
-    // 分区数量限制在 1~实际分区总数，避免输入越界导致其余区合并异常
-    n = Math.floor(n);
-    var max = maxAllowed && maxAllowed >= 1 ? maxAllowed : 15;
-    if (isNaN(n) || n < 1) return 1;
-    return Math.min(n, max);
-}
-
-function rebuildPieChart(el) {
-    // 用户调整饼图分区数量后按当前图表类型重建
-    if (el && el._chartSpec) switchChartType(el, el._chartSpec.type);
-}
-
 function ensurePieSlicesControl(el, type) {
-    // 饼图/环形图下方提供 −/+ 调整展示分区数量；其他图表类型不上该控件
-    var isPie = type === "pie" || type === "donut";
-    var note = el._chartNote;
-    if (!isPie) {
-        if (note) note.textContent = "";
-        if (el._pieControl) { el._pieControl.remove(); el._pieControl = null; }
-        return;
-    }
-    var maxAllowed = computePieMaxSlices(el._chartSpec || {});
-    el._pieMaxLimit = maxAllowed;
-    var ctl = el._pieControl;
-    if (!ctl) {
-        ctl = document.createElement("div");
-        ctl.className = "chart-slices-control";
-        var minus = document.createElement("button");
-        minus.type = "button";
-        minus.textContent = "−";
-        var input = document.createElement("input");
-        input.type = "number";
-        input.min = 1;
-        input.className = "chart-slices-input";
-        var plus = document.createElement("button");
-        plus.type = "button";
-        plus.textContent = "+";
-        var applyMax = function (v) {
-            v = clampPieMax(v, el._pieMaxLimit || 15);
-            el._pieMax = v;
-            if (el._pieInput) el._pieInput.value = v;
-        };
-        minus.onclick = function () {
-            applyMax((el._pieMax || 15) - 1);
-            rebuildPieChart(el);
-        };
-        plus.onclick = function () {
-            applyMax((el._pieMax || 15) + 1);
-            rebuildPieChart(el);
-        };
-        input.addEventListener("change", function () {
-            applyMax(parseInt(this.value, 10));
-            rebuildPieChart(el);
-        });
-        input.addEventListener("keydown", function (e) {
-            if (e.key === "Enter") this.blur();
-        });
-        ctl.appendChild(minus);
-        ctl.appendChild(input);
-        ctl.appendChild(plus);
-        el.appendChild(ctl);
-        el._pieControl = ctl;
-        el._pieInput = input;
-    }
-    el._pieMax = clampPieMax(el._pieMax || 15, maxAllowed);
-    if (el._pieInput) {
-        el._pieInput.max = maxAllowed;
-        el._pieInput.value = el._pieMax;
-    }
-    if (note) note.textContent = "备注：默认展示 " + (el._pieDefault || 15) + " 个分区，优先显示占比最高的，其余合并为“其他”。图下 +/- 可调整展示数量。";
+    // 取消手动调整分区数量：只清理历史遗留的 −/+ 控件，数据展示由累计占比自动决定
+    if (el._pieControl) { try { el._pieControl.remove(); } catch (e) {} el._pieControl = null; }
+    el._pieInput = null;
+    el._pieMax = null;
 }
 
 function renderCharts(root) {
@@ -1974,24 +1927,32 @@ function fmtChartTime(v) {
     return d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate());
 }
 
-function buildPieData(categories, values, maxSlices) {
-    // 饼图数据预处理：数值化并过滤非正值；分区过多时只保留最大的前 N-1 个，
-    // 其余合并为“其他”；默认展示 15 个分区，用户可在图下用 +/- 调整
+function buildPieData(categories, values, maxSlices, thresholdPct) {
+    // 饼图数据预处理：数值化并过滤非正值；默认按累计占比保留占绝对主体的分区，
+    // maxSlices 为空时自动聚合（凑满 threshold），有值时按固定分区数合并，其余都归入“其他”
     var items = [];
     categories.forEach(function (c, i) {
         var v = Number(values[i]);
         if (!isNaN(v) && v > 0) items.push({ name: c, value: v });
     });
     items.sort(function (a, b) { return b.value - a.value; });
-    var MAX_SLICES = parseInt(maxSlices, 10) || 15;
-    if (items.length > MAX_SLICES) {
-        var keep = items.slice(0, MAX_SLICES - 1);
-        var rest = items.slice(MAX_SLICES - 1);
-        var restSum = rest.reduce(function (acc, x) { return acc + x.value; }, 0);
-        keep.push({ name: "其他", value: restSum });
-        items = keep;
+    var manual = (maxSlices && maxSlices >= 1) ? Math.floor(maxSlices) : 0;
+    var thr = Math.max(0.0001, Math.min(1, Number(thresholdPct) || 0.9));
+    var total = items.reduce(function (acc, x) { return acc + x.value; }, 0);
+    if (!total) return items;
+    var keep = [];
+    var cumulative = 0;
+    var keepBase = manual ? Math.max(1, manual - 1) : 0;
+    for (var i = 0; i < items.length; i++) {
+        if (manual && keep.length >= keepBase && i < items.length - 1) break; // 手动模式预留 1 个“其他”位置
+        keep.push(items[i]);
+        cumulative += items[i].value;
+        if (!manual && cumulative / total >= thr) break; // 自动模式凑满累计占比即停
     }
-    return items;
+    if (keep.length < items.length) {
+        keep.push({ name: "其他", value: total - cumulative });
+    }
+    return keep;
 }
 
 function buildChartOption(spec, type) {
@@ -2127,10 +2088,11 @@ function buildChartOption(spec, type) {
         opt.series = seriesList.map(function (s) {
             return {
                 name: s.name, type: "pie", radius: pieRadius, center: ["50%", "50%"],
-                data: buildPieData(categories, s.values, spec._pieMax),
+                data: buildPieData(categories, s.values, spec._pieMax, spec._pieThreshold),
                 minAngle: 2,
                 avoidLabelOverlap: true,
-                label: { color: dark.text, fontSize: 11, formatter: "{b}: {d}%", overflow: "truncate", width: 96 },
+                // 标签只显示维度名，百分比仅在悬停 tooltip 中展示，避免默认图上堆满百分比
+                label: { color: dark.text, fontSize: 11, formatter: "{b}", overflow: "truncate", width: 96 },
                 labelLine: { length: 10, length2: 8, lineStyle: { color: dark.sub } },
                 itemStyle: { borderColor: cssVar("--bg", "#212121"), borderWidth: 1 }
             };
@@ -2140,15 +2102,20 @@ function buildChartOption(spec, type) {
         opt.tooltip = {
             trigger: "item",
             formatter: function (p) {
+                // 悬停展示完整维度名称 + 数值 + 占比；优先用 ECharts 自带 percent，避免手工汇总误差
                 var nm = String(p.name != null ? p.name : "");
                 var val = p.value == null ? "-" : p.value;
                 var pct = "";
-                var d0 = p.series && p.series.data;
-                var total = 0;
-                if (Array.isArray(d0)) {
-                    d0.forEach(function (it) { if (it && typeof it.value === "number") total += it.value; });
+                if (typeof p.percent === "number" && isFinite(p.percent)) {
+                    pct = "（" + p.percent.toFixed(1) + "%）";
+                } else {
+                    var d0 = p.series && p.series.data;
+                    var total = 0;
+                    if (Array.isArray(d0)) {
+                        d0.forEach(function (it) { if (it && typeof it.value === "number") total += it.value; });
+                    }
+                    if (total > 0 && typeof p.value === "number") pct = "（" + (p.value / total * 100).toFixed(1) + "%）";
                 }
-                if (total > 0 && typeof p.value === "number") pct = "（" + (p.value / total * 100).toFixed(1) + "%）";
                 return nm + "<br/>" + (p.marker || "") + " " + val + (pct ? " " + pct : "");
             }
         };
@@ -2212,7 +2179,7 @@ function buildChartOption(spec, type) {
         });
         if (type === "hbar") {
             // 横向条形图：右侧纵滑块控制类别(y)，底部横滑块控制数值(x)，纵滑块底部与横轴滑块对齐
-            var _gb = norm.xName ? 96 : 56; // grid 底部给足轴标签+轴名空间；无轴名时 56，有轴名时 96
+            var _gb = norm.xName ? 78 : 50; // grid 底部只保留轴名/滑块必要空间，避免图表下方留白过大
             var _xb = _gb - 16 - 8; // 横滑块顶紧贴轴名区底部，下方留 8px，不遮挡图表
             opt.grid.right = 130;
             opt.grid.left = 10; // plot 左边界统一，与折线选项对齐
@@ -2231,7 +2198,7 @@ function buildChartOption(spec, type) {
             ];
         } else {
             // 底部可拖拽滑块调整横轴显示范围；滑块贴近 plot 底边，纵轴滑块对齐成 L 形
-            var _gb = norm.xName ? 96 : 56; // grid 底部给足轴标签+轴名空间；无轴名时 56，有轴名时 96
+            var _gb = norm.xName ? 78 : 50; // grid 底部只保留轴名/滑块必要空间，避免图表下方留白过大
             var _xb = _gb - 16 - 8; // 横滑块顶紧贴轴名区底部，下方留 8px，不遮挡图表
             opt.grid.bottom = _gb;
             opt.grid.right = 130;

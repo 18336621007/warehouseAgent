@@ -246,7 +246,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .chart-type-btn { background: var(--hover-bg); border: 1px solid var(--border-strong); color: var(--text-sub); border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; transition: all 0.15s ease; }
 .chart-type-btn:hover { border-color: var(--accent); color: var(--text); }
 .chart-type-btn.active { background: rgba(var(--accent-rgb),0.18); border-color: var(--accent); color: var(--accent); }
-.chart-holder { flex: 1; min-height: 280px; }
+.chart-holder { flex: 1; min-height: 280px; display: flex; flex-direction: column; }
+.chart-window { position: relative; overflow: hidden; flex: 1 1 auto; margin-bottom: 6px; }
 .chart-metric-tabs { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 0 6px; }
 .chart-metric-tab { background: var(--hover-bg); border: 1px solid var(--border-strong); color: var(--text-sub); border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; transition: border-color 0.15s ease, color 0.15s ease; }
 .chart-metric-tab:hover { border-color: var(--accent); color: var(--text); }
@@ -254,7 +255,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 @keyframes chart-switch-in { from { opacity: 0; transform: translateY(6px) scale(0.995); } to { opacity: 1; transform: translateY(0) scale(1); } }
 .chart-switch-anim { animation: chart-switch-in 0.5s ease; }
 .chart-sub { width: 100%; margin-bottom: 8px; transition: height 0.26s ease, width 0.26s ease, opacity 0.42s ease, transform 0.42s ease; }
-.chart-note { margin-top: -2px; font-size: 12px; color: var(--text-dim); font-style: italic; }
+.chart-note { margin-top: 4px; font-size: 12px; color: var(--text-dim); font-style: italic; }
 .chart-slices-control { display: inline-flex; align-items: center; gap: 8px; margin: 4px 2px 0; font-size: 12px; color: var(--text-dim); }
 .chart-slices-control button { min-width: 22px; height: 22px; border: 1px solid var(--border-strong); background: var(--hover-bg); color: var(--text-sub); border-radius: 5px; cursor: pointer; }
 .chart-slices-control button:hover { border-color: var(--accent); color: var(--accent); }
