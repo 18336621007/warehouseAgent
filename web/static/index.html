@@ -253,6 +253,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .chart-slices-control button:hover { border-color: var(--accent); color: var(--accent); }
 .chart-slices-control input { max-width: 52px; height: 22px; border: 1px solid var(--border-strong); background: var(--bg); color: var(--text-sub); border-radius: 5px; padding: 0 4px; font-size: 12px; text-align: center; }
 .chart-slices-control input:focus { outline: none; border-color: var(--accent); }
+.chart-slices-control input::-webkit-outer-spin-button,
+.chart-slices-control input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.chart-slices-control input { -moz-appearance: textfield; appearance: textfield; }
 .chart-pending { display: flex; align-items: center; justify-content: center; color: var(--text-dim); font-size: 13px; border: 1px dashed var(--border-dim); border-radius: 8px; height: 160px; }
 /* 生成图表按钮（仿豆包）：回答未含图表时展示，点击后按落盘结果生成图表 */
 .chart-gen-btn { margin-top: 10px; background: rgba(var(--accent-rgb), 0.12); color: var(--accent); border: 1px solid rgba(var(--accent-rgb), 0.5); border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer; transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease; }
