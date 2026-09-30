@@ -10,6 +10,29 @@ from langchain_core.tools import StructuredTool
 from agentTest.langgraph_app.services.result_store import read_result_full
 from agentTest.langgraph_app.tools.result_query_tool import get_result_conversation
 
+
+def _extract_chart_meta(answer_text: str) -> dict:
+    """从回答文本的 ```chart 块中复用模型已提供的中文元数据（字段/轴名/系列名/标题）。"""
+    m = re.search(r"```\s*chart\s*\n(.*?)```", answer_text or "", re.S)
+    if not m:
+        return {}
+    try:
+        spec = json.loads(m.group(1))
+    except (Exception, json.JSONDecodeError):
+        return {}
+    yf = spec.get("yFields") or spec.get("yField") or []
+    if not isinstance(yf, list):
+        yf = [yf] if yf else []
+    return {
+        "x_field": spec.get("xField") or "",
+        "y_fields": [str(v) for v in yf],
+        "x_name": spec.get("xName") or "",
+        "y_name": spec.get("yName") or "",
+        "series_names": [str(v) for v in (spec.get("seriesNames") or [])],
+        "title": spec.get("title") or "",
+    }
+
+
 # 图表最大行数上限（防止超大结果撑爆 prompt/前端）
 MAX_CHART_ROWS = 200
 # 支持的图表类型（折线/柱状/面积/饼图/词云）
@@ -240,8 +263,17 @@ def build_charts_for_request(conversation_id: str, request_id: str, type: str = 
         [str(c) for c in (entry.get("columns") or [])], rows, entry.get("effective_query") or "",
     )
     per_title = title or str(entry.get("effective_query") or "") or f"第{entry.get('round_no')}段"
-    spec, err = build_chart_spec(entry, rows, per_type, x_field, y_fields or [],
-                                per_title, "", "", [], MAX_CHART_ROWS, 15)
+    # 手动『生成图表』优先复用回答里 make_chart 已生成的中文元数据，避免丢失指标名导致图表无法区分
+    _meta = _extract_chart_meta(answer)
+    _xf = x_field or str(_meta.get("x_field") or "")
+    _yfs = y_fields or list(_meta.get("y_fields") or [])
+    _xn = str(_meta.get("x_name") or "")
+    _yn = str(_meta.get("y_name") or "")
+    _sns = list(_meta.get("series_names") or [])
+    if not title and _meta.get("title"):
+        per_title = _meta["title"]
+    spec, err = build_chart_spec(entry, rows, per_type, _xf, _yfs,
+                                per_title, _xn, _yn, _sns, MAX_CHART_ROWS, 15)
     if not spec:
         return [], err or "无法生成图表。"
     return [spec], ""

@@ -77,6 +77,7 @@ function reApplyCharts() {
         savedSpecs.push({ el: el, spec: el._chartSpec ? JSON.parse(JSON.stringify(el._chartSpec)) : null });
         try {
             if (el._chart) { try { el._chart.dispose(); } catch (e) {} el._chart = null; }
+            if (el._chartSubs) { el._chartSubs.forEach(function (c) { if (c) { try { c.dispose(); } catch (e) {} } }); el._chartSubs = []; }
             el._chartRendered = false;
             delete el._decorated;
             if (el._chartHolder) { el._chartHolder.innerHTML = ""; }
@@ -1542,6 +1543,9 @@ function chartResizeAll() {
         if (el._chart && typeof el._chart.resize === "function") {
             try { el._chart.resize(); } catch (e) {}
         }
+        if (el._chartSubs) {
+            el._chartSubs.forEach(function (c) { if (c && typeof c.resize === "function") { try { c.resize(); } catch (e) {} } });
+        }
     });
 }
 
@@ -1570,6 +1574,46 @@ function ensureChartDecor(el) {
     el._decorated = true;
 }
 
+function animateChartSize(el) {
+    // 图表容器高度/宽度变化时，按 CSS 过渡时长逐帧调用 echarts.resize，让图形跟随容器平滑缩放
+    if (!el) return;
+    clearTimeout(el._sizeAnimTimer);
+    var t0 = Date.now();
+    var DUR = 260;
+    (function tick() {
+        if (el._chart && typeof el._chart.resize === "function") { try { el._chart.resize(); } catch (e) {} }
+        if (Date.now() - t0 < DUR) { el._sizeAnimTimer = setTimeout(tick, 16); }
+    })();
+}
+
+function animateChartSubIn(el) {
+    // 指标切换时逐帧做淡入过渡（opacity + 轻微上移），不依赖 CSS 样式切换，保证一定生效
+    if (!el) return;
+    var oldTransition = el.style.transition;
+    el.style.transition = "none";
+    var t0 = Date.now();
+    var DUR = 420;
+    (function frame() {
+        var p = Math.min(1, (Date.now() - t0) / DUR);
+        var e = 1 - Math.pow(1 - p, 3); // easeOutCubic，开头轻快结尾平滑
+        el.style.opacity = String(e);
+        el.style.transform = "translateY(" + (6 * (1 - e)).toFixed(2) + "px) scale(" + (1 - 0.005 * (1 - e)).toFixed(4) + ")";
+        if (p < 1) { setTimeout(frame, 16); }
+        else { el.style.opacity = ""; el.style.transform = ""; el.style.transition = oldTransition; }
+    })();
+}
+
+function animateChartHolder(el) {
+    // 切换图表类型/指标后给容器加一次淡入过渡，避免突兀跳动
+    var h = (el && el._chartHolder) || el;
+    if (!h) return;
+    h.classList.remove("chart-switch-anim");
+    void h.offsetWidth; // 强制 reflow，保证连续切换也能重新触发动画
+    h.classList.add("chart-switch-anim");
+    clearTimeout(h._chartAnimTimer);
+    h._chartAnimTimer = setTimeout(function () { h.classList.remove("chart-switch-anim"); }, 520);
+}
+
 function renderChartFallback(el, txt) {
     // 图表解析/渲染失败时回退展示原始 JSON，保证内容可见
     try { txt = JSON.stringify(JSON.parse(txt || ""), null, 2); } catch (e) {}
@@ -1580,8 +1624,14 @@ function renderChartFallback(el, txt) {
 function switchChartType(el, type) {
     // 用户手动切换图表类型：重建 ECharts（折线/柱状/面积/饼图/环形/热力）
     if (!el || !el._chartSpec) return;
-    // 饼图/环形图需要更大画布，临时撑高图表容器，避免被压缩成缩略图
-    if (type === "pie" || type === "donut") {
+    // 先清理旧图：可能是单张图，也可能是拆分成多张子图（饼/环/词云多指标时）
+    var oldCharts = el._chart ? [el._chart] : (el._chartSubs || []);
+    oldCharts.forEach(function (c) { if (c) { try { c.dispose(); } catch (e) {} } });
+    el._chart = null; el._chartSubs = [];
+    // 饼图/环形/横向条形需要更大画布：饼/环固定高度，横向条形扩大高度让条形更粗更清楚
+    if (type === "hbar") {
+        el.style.height = "560px";
+    } else if (type === "pie" || type === "donut") {
         el.style.height = "460px";
     } else if (el.style.height) {
         el.style.height = "";
@@ -1590,13 +1640,91 @@ function switchChartType(el, type) {
     spec.type = type;
     try {
         var holder = el._chartHolder || el;
-        if (el._chart) { try { el._chart.dispose(); } catch (e) {} el._chart = null; }
         el._chartRendered = false;
         if (el._pieDefault === undefined) {
             el._pieDefault = parseInt(spec.pieMaxSlices, 10) || 15;
         }
         if (el._pieMax === undefined) el._pieMax = el._pieDefault;
         spec._pieMax = el._pieMax;
+        var norm = normalizeChartData(spec);
+        // 饼图/环形图/词云不宜把两个指标叠在一张图里：用指标切换器一次只看一个指标，每张都带指标名副标题
+        var split = (type === "pie" || type === "donut" || type === "wordcloud" || type === "heatmap") && norm.seriesList.length > 1;
+        if (split) {
+            // 多指标时一次只展示一个指标，用指标标签在饼/环/词云之间切换，避免两张图叠在一起或多图堆叠
+            if (el._chartMetricIndex === undefined) el._chartMetricIndex = 0;
+            el.style.height = "520px";
+            holder.innerHTML = "";
+            el._chartSubs = [];
+            var tabs = document.createElement("div");
+            tabs.className = "chart-metric-tabs";
+            norm.seriesList.forEach(function (sr, idx) {
+                var tb = document.createElement("button");
+                tb.type = "button";
+                tb.className = "chart-metric-tab";
+                tb.textContent = sr.name || ("指标" + (idx + 1));
+                tb.onclick = function () {
+                    el._chartMetricIndex = idx;
+                    renderMetric(el._chartMetricIndex);
+                };
+                tabs.appendChild(tb);
+            });
+            holder.appendChild(tabs);
+            var subDiv = document.createElement("div");
+            subDiv.className = "chart-sub";
+            subDiv.style.height = (type === "wordcloud") ? "300px" : (type === "heatmap") ? "420px" : "360px";
+            holder.appendChild(subDiv);
+            el._chartSubDiv = subDiv;
+            // 首次渲染由 switchChartType 的整体淡入覆盖，标记后避免再叠加一次子图淡入导致卡顿
+            var isFirstRender = true;
+            var renderMetric = function (idx) {
+                var ssn = norm.seriesList[idx].name || ("指标" + (idx + 1));
+                var subSpec = {
+                    type: type,
+                    title: spec.title || "",
+                    xName: norm.xName,
+                    yName: ssn,
+                    seriesNames: [ssn],
+                    pieMaxSlices: spec.pieMaxSlices || 15,
+                    _pieMax: el._pieMax,
+                    xAxis: norm.categories.slice(),
+                    series: [{ name: ssn, data: norm.seriesList[idx].values.slice() }]
+                };
+                var subOpt = buildChartOption(subSpec, type);
+                if (type === "wordcloud" && el._chart) {
+                    // 词云切换指标时复用实例更新，避免重建 canvas 导致标题/副标题/内容闪烁
+                    el._chart.setOption(subOpt, true);
+                } else {
+                    if (el._chart) { try { el._chart.dispose(); } catch (e) {} el._chart = null; }
+                    el._chart = echarts.init(subDiv);
+                    el._chart.setOption(subOpt);
+                }
+                // 指标切换：调用逐帧淡入动画，切换时不会硬跳；首次渲染不重复淡入
+                if (el._chartSubDiv && !isFirstRender) { animateChartSubIn(el._chartSubDiv); }
+                isFirstRender = false;
+                tabs.querySelectorAll(".chart-metric-tab").forEach(function (tb, ti) {
+                    tb.classList.toggle("active", ti === idx);
+                });
+                try { el._chart.resize(); } catch (e) {}
+                // 词云 resize 会重新布局造成内容闪烁，跳过逐帧缩放，动画与其他图表保持一致
+                if (type !== "wordcloud") { animateChartSize(el); }
+            };
+            el._renderMetric = renderMetric;
+            animateChartHolder(el); // 类型切换进入拆分视图时先整体淡入一次，避免切换瞬间直接硬换
+            renderMetric(el._chartMetricIndex);
+            el._chartSpec = spec;
+            el._chartRendered = true;
+            if (el._chartToolbar) {
+                el._chartToolbar.querySelectorAll(".chart-type-btn").forEach(function (b) {
+                    b.classList.toggle("active", b.dataset.type === type);
+                });
+            }
+            if (el._chartNote) {
+                el._chartNote.textContent = (type === "pie" || type === "donut") ? "默认展示 " + (el._pieDefault || 15) + " 个分区，优先显示占比最高的，其余合并为“其他”，下方 +/- 可调整；上方标签可切换指标。" : "上方标签可切换当前指标。";
+            }
+            // 多指标也保留默认扇区数量与 +/－ 调整，让每个指标独立生效
+            ensurePieSlicesControl(el, type);
+            return;
+        }
         var opt = buildChartOption(spec, type);
         var hasData = (opt.series || []).some(function (s) { return s.data && s.data.length; });
         if (!hasData) { renderChartFallback(el, el.dataset.chart || ""); return; }
@@ -1604,6 +1732,7 @@ function switchChartType(el, type) {
         var chart = echarts.init(holder);
         chart.setOption(opt);
         el._chart = chart;
+        animateChartHolder(el);
         el._chartSpec = spec;
         el._chartRendered = true;
         if (el._chartToolbar) {
@@ -1616,6 +1745,7 @@ function switchChartType(el, type) {
         }
         ensurePieSlicesControl(el, type);
         chart.resize();
+        animateChartSize(el);
     } catch (e) {
         renderChartFallback(el, el.dataset.chart || "");
     }
@@ -1900,13 +2030,20 @@ function buildChartOption(spec, type) {
     };
     // 标题兼容 LLM 放入 spec.options.title 的写法，未提供则回退到 spec.title
     var chartTitle = spec.title || (spec.options && spec.options.title) || "";
+    // 饼图/环形图/词云没有图例区分指标：主标题保留原标题，再补一行副标题专门显示指标中文名，保证多指标能分清
+    var chartSub = "";
+    if ((type === "pie" || type === "donut" || type === "wordcloud") && seriesList.length) {
+        var _sn = seriesList.map(function (x) { return x.name; }).filter(Boolean);
+        if (_sn.length) chartSub = _sn.join(" / ");
+    }
+    if (!chartTitle && chartSub) { chartTitle = chartSub; chartSub = ""; }
     var opt = {
         backgroundColor: "transparent",
         color: [cssVar("--accent", "#10A37F"), cssVar("--accent2", "#5C4EC2"), cssVar("--warn", "#F0C040"), cssVar("--danger2", "#E46C6C"), "#8A6CF0", "#3EC6E0"],
-        title: chartTitle ? { text: chartTitle, left: "center", top: 4, textStyle: { color: dark.text, fontSize: 14 } } : undefined,
+        title: chartTitle ? { text: chartTitle, subtext: chartSub || undefined, left: "center", top: 4, textStyle: { color: dark.text, fontSize: 14 }, subtextStyle: { color: cssVar("--text-sub", "#ACACBE"), fontSize: 12 } } : undefined,
         tooltip: (type === "wordcloud") ? { trigger: "item" } : (type === "heatmap") ? { trigger: "item" } : (type === "pie" || type === "donut") ? { trigger: "item" } : { trigger: "axis", formatter: axisTip },
         textStyle: { color: dark.text },
-        grid: { left: norm.yName ? 64 : 48, right: 24, top: chartTitle ? 44 : 24, bottom: norm.xName ? 44 : 36, containLabel: true },
+        grid: { left: norm.yName ? 64 : 48, right: 24, top: chartTitle ? (chartSub ? 60 : 44) : 24, bottom: norm.xName ? 44 : 36, containLabel: true },
     };
     if (type === "wordcloud") {
         // 词云（关键词云图）：字号大小代表频次，对应关键词的数值大小
@@ -1924,7 +2061,13 @@ function buildChartOption(spec, type) {
                 if (!isNaN(n) && n > 0) words.push({ name: String(categories[i] || ("词" + (i + 1))), value: n });
             });
         }
-        opt.series = [{ type: "wordCloud", shape: "circle", sizeRange: [14, 68], rotationRange: [-45, 45], rotationStep: 15, gridSize: 8, width: "94%", height: "90%", drawOutOfBound: false, textStyle: { color: cssVar("--accent", "#10A37F") }, emphasis: { textStyle: { color: cssVar("--text", "#ECECF1") } }, data: words }];
+        // 词云词过多会拖慢布局与切换：按词频降序只保留前 80 个
+        words.sort(function (a, b) { return (b.value || 0) - (a.value || 0); });
+        words = words.slice(0, 80);
+        // 词云绘制区域下移避开标题/副标题，关闭布局动画避免“卡一下才出现”
+        var wcTop = (chartTitle && chartSub) ? 58 : (chartTitle ? 42 : 18);
+        var wcHeight = (chartTitle && chartSub) ? "76%" : (chartTitle ? "82%" : "90%");
+        opt.series = [{ type: "wordCloud", shape: "circle", sizeRange: [12, 56], rotationRange: [-30, 30], rotationStep: 30, gridSize: 8, left: 8, top: wcTop, width: "96%", height: wcHeight, drawOutOfBound: false, layoutAnimation: false, animation: false, textStyle: { color: cssVar("--accent", "#10A37F") }, emphasis: { textStyle: { color: cssVar("--text", "#ECECF1") } }, data: words }];
         delete opt.xAxis; delete opt.yAxis; delete opt.dataZoom; delete opt.legend;
         opt.tooltip = { trigger: "item", formatter: function (p) { return (p.name || "") + ": " + (p.value == null ? "" : p.value); } };
         return opt;
@@ -2012,49 +2155,59 @@ function buildChartOption(spec, type) {
         // 图例贴右边缘并收窄，给饼图更大可用区域
         opt.legend = { orient: "vertical", right: 6, top: "middle", width: 100, type: "scroll", itemWidth: 14, itemHeight: 14, itemGap: 7, textStyle: { color: dark.sub, fontSize: 13 } };
     } else {
-        // 所有折线/柱状/条形统一切到 value 索引轴：滚轮缩放时轴与数据同一数值域联动
+        // 时间序列继续用 value 时间戳轴（缩放联动、日期格式化）；非时间维度用 category 轴并保留条间距，避免类别挤在一起
         var timeX = buildTimeX(categories);
         var xv = [];
         for (var xiv = 0; xiv < categories.length; xiv++) {
             xv.push(timeX ? timeX[xiv] : xiv);
         }
         if (type === "hbar") {
-            // 横向条形图：类别放 y 轴（category 轴，保证条形横向），数值放 x 轴
+            // 横向条形图：类别放 y 轴（category 轴），数值放 x 轴；边界留空并加宽条距避免条形挤在一起
             opt.xAxis = { type: "value", scale: true, name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
             opt.yAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub },
+                boundaryGap: true,
                 axisLine: { lineStyle: { color: dark.line, width: 1.5 } },
                 axisTick: { show: false },
                 axisLabel: { color: dark.text } };
-        } else {
-            // x 轴 value 轴（日期->时间戳，其他分类->0..n-1 索引），formatter 还原类别标签
+        } else if (timeX) {
+            // 时间维度保持 value 时间戳轴（缩放联动、日期格式化），边界贴合首尾数据点
             opt.xAxis = { type: "value", scale: true, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub },
                 axisLine: { lineStyle: { color: dark.line, width: 1.5 } },
-                splitNumber: !timeX ? Math.max(categories.length, 1) : undefined, minInterval: !timeX ? 1 : undefined, // 分类轴按类目数分刻度，横轴标签更密集
-                min: ((type === "bar" || type === "line" || type === "area") && !timeX) ? -0.5 : (xv.length ? xv[0] : undefined), // 折线/柱状/面积左右留出半个类目空距，避免首点贴坐标轴
-                max: ((type === "bar" || type === "line" || type === "area") && !timeX) ? (xv.length ? xv[xv.length - 1] + 0.5 : undefined) : (xv.length ? xv[xv.length - 1] : undefined),
+                min: xv.length ? xv[0] - ((xv[xv.length - 1] - xv[0]) || 0) * 0.05 : undefined,
+                max: xv.length ? xv[xv.length - 1] + ((xv[xv.length - 1] - xv[0]) || 0) * 0.05 : undefined,
                 axisLabel: {
-                    color: dark.text, hideOverlap: true, interval: "auto", // 横轴标签在保证不重叠的前提下尽量密集显示
-                    formatter: function (v) {
-                        var idx = timeX ? xv.indexOf(v) : Math.round(v);
-                        if (timeX && idx >= 0) return fmtChartTime(v);
-                        return (categories[idx] != null) ? String(categories[idx]) : String(v);
-                    }
+                    color: dark.text, hideOverlap: true, interval: "auto",
+                    formatter: function (v) { return fmtChartTime(v); }
                 },
+                splitLine: { show: false } };
+            opt.yAxis = { type: "value", scale: true, name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
+        } else {
+            // 非时间维度：category 轴，柱状/折线/面积都保留边缘间隔，避免最左段贴数轴
+            opt.xAxis = { type: "category", data: categories, name: norm.xName, nameGap: 26, nameTextStyle: { color: dark.sub },
+                boundaryGap: (type === "bar" || type === "line" || type === "area"),
+                axisLine: { lineStyle: { color: dark.line, width: 1.5 } },
+                axisTick: { show: false },
+                axisLabel: { color: dark.text, hideOverlap: true },
                 splitLine: { show: false } };
             opt.yAxis = { type: "value", scale: true, name: norm.yName, nameGap: 16, nameTextStyle: { color: dark.sub }, axisLine: { lineStyle: { color: dark.line, width: 1.5 } }, splitLine: { lineStyle: { color: dark.split } }, axisLabel: { color: dark.sub } };
         }
         opt.series = seriesList.map(function (s) {
-            var sd = s.values.map(function (v, i) {
-                var num = v == null ? null : Number(v);
-                // hbar：类别交由 category 轴自动排布，数据只需数值；其余图为 [索引/时间, 值]
-                return type === "hbar" ? num : [xv[i], num];
-            });
+            var sd;
+            if (type === "hbar") {
+                // 横向条形：数值进 x，类别由 category 轴排布
+                sd = s.values.map(function (v) { return v == null ? null : Number(v); });
+            } else if (timeX) {
+                sd = s.values.map(function (v, i) { var num = v == null ? null : Number(v); return [xv[i], num]; });
+            } else {
+                // 非时间 dimensions：category 轴按索引取类别，不再用索引数值避免挤在一起
+                sd = s.values.map(function (v) { return v == null ? null : Number(v); });
+            }
             var item = { name: s.name, type: type === "area" ? "line" : (type === "hbar" ? "bar" : type), data: sd };
             if (type === "line" || type === "area") { item.smooth = true; item.lineStyle = { width: 2 }; }
             if (type === "area") { item.areaStyle = {}; }
-            if (type === "bar" || type === "hbar") { item.barMaxWidth = 40; }
-            if (type === "bar") item.barWidth = 12; // value 轴柱状图固定宽度，避免缩放后压缩成不可见
-            if (type === "hbar") item.barWidth = "60%"; // 按类目带宽自适应条宽，保留间隔，避免挤在一起或过细
+            if (type === "bar" || type === "hbar") { item.barMaxWidth = 40; item.barCategoryGap = "40%"; } // 条间留出间隔
+            if (type === "bar") { if (!timeX) item.barWidth = "auto"; else item.barWidth = 12; }
+            if (type === "hbar") item.barWidth = "50%"; // 按类目带宽自适应条宽，保留间隔
             return item;
         });
         if (type === "hbar") {
