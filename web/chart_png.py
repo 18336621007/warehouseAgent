@@ -186,6 +186,7 @@ def render_spec_png(spec: dict, width: float = 9.0, height: float = 4.6) -> byte
                 ax.bar(idx + offset, [v if v is not None else 0 for v in s["values"]],
                        width=bar_w * 0.9, label=s["name"])
             ax.set_xticks(idx)
+            ax.set_xticklabels(x_vals)  # 条形/柱状图也需要显式挂上真实标签，避免显示成 0、1、2…
         # x 轴标签过多时旋转，避免重叠
         if len(x_vals) > 12:
             plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
