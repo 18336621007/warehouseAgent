@@ -33,6 +33,65 @@ from lark_oapi.api.contact.v3 import GetUserRequest
 _TEXT_MAX = 1800
 
 
+# 飞书互动卡片对单张卡片内的 Markdown 表格数量有限制，超限会报错：
+# card table number over limit。回答里常出现多个维度表格，拆成多张卡片下发，
+# 保证每张卡片内的表格都能被飞书正常解析。
+_MAX_CARD_TABLES = 1
+
+
+def _is_table_separator(line: str) -> bool:
+    """判断一行是否为 Markdown 表格分隔行（例如 |:---|---:|）。"""
+    s = line.strip().strip("|")
+    cells = [c.strip() for c in s.split("|") if c.strip()]
+    return bool(cells) and all(re.fullmatch(r":?-+:?", c) for c in cells)
+
+
+def _split_markdown_cards(markdown: str, max_tables: int = _MAX_CARD_TABLES) -> list:
+    """把回答按连续段落切分，使每张互动卡片最多包含 max_tables 个表格。
+
+    表格前紧邻的标题会与表格放在同一段；代码块（如 ```chart）内的竖线
+    不会误判为表格，避免把图表 JSON 拆进错误的分段。
+    """
+    if not (markdown or "").strip():
+        return []
+    blocks = re.split(r"\n\s*\n", markdown)
+    segments = []
+    current: list = []
+    table_count = 0
+    in_fence = False
+    trailing: list = []  # 当前段内最后一行的表格之后、尚未落在卡片里的非表格块（多为标题/结论）
+    for block in blocks:
+        # 统计本段在代码块外的表格分隔行个数
+        block_table_count = 0
+        for line in block.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence and _is_table_separator(stripped):
+                block_table_count += 1
+        if block_table_count and table_count + block_table_count > max_tables:
+            # 表格超限时把前面的标题等非表格块带到下一张卡片，
+            # 避免出现“标题在上一张、表格在下一张”的割裂
+            if trailing:
+                current = current[: len(current) - len(trailing)]
+            if current:
+                segments.append("\n\n".join(current).strip())
+            current = list(trailing)
+            table_count = 0
+            trailing = []
+        current.append(block)
+        table_count += block_table_count
+        if block_table_count:
+            trailing = []
+        else:
+            trailing.append(block)
+    tail = "\n\n".join(current).strip()
+    if tail:
+        segments.append(tail)
+    return [seg for seg in segments if seg]
+
+
 def _load_feishu_config():
     """读取 agentTest/.env 中的飞书凭证，返回 (app_id, app_secret)。"""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -187,12 +246,34 @@ class FeishuBot:
 
     def _send_markdown(self, receive_id: str, receive_id_type: str, markdown: str,
                         cid: str = "", request_id: str = ""):
-        """以飞书互动卡片（markdown 元素）发送 Markdown 内容，让飞书按卡片规则解析。
-        注意：content 必须传 JSON.stringify 后的字符串（内部 \n 为真换行），否则会被再次转义破坏格式。"""
-        content = markdown[:_TEXT_MAX * 2]
+        """以飞书互动卡片发送 Markdown 内容；回答含多个表格时拆成多张卡片下发。
+
+        每张卡片最多放 _MAX_CARD_TABLES 个 Markdown 表格，避免触发飞书
+        “card table number over limit”；失败的段落降级为纯文本，保证结论可达。
+        注意：content 必须传 JSON.stringify 后的字符串（内部 \n 为真换行），
+        否则会被再次转义破坏格式。
+        """
+        segments = _split_markdown_cards(markdown)
+        if not segments:
+            segments = [markdown[:_TEXT_MAX * 2]]
+        all_card_ok = True
+        for seg in segments:
+            ok = self._send_markdown_segment(receive_id, receive_id_type, seg, cid=cid, request_id=request_id)
+            if not ok:
+                all_card_ok = False
+                self._send_text(receive_id, receive_id_type, seg)
+                self._log_feishu_event(cid, request_id, "feishu.card.fallback",
+                                       "interactive card failed -> plain text fallback")
+        return all_card_ok
+
+    def _send_markdown_segment(self, receive_id: str, receive_id_type: str, content: str,
+                               cid: str = "", request_id: str = ""):
+        """发送单张飞书互动卡片；固定 schema 2.0（表格渲染依赖它）。
+
+        优先带 wide_screen_mode，若飞书拒绝则依次降级；失败信息写入日志便于定位。
+        """
+        content = content[:_TEXT_MAX * 2]
         body = {"elements": [{"tag": "markdown", "content": content}]}
-        # 固定 schema 2.0（表格渲染依赖它）；优先带 wide_screen_mode，若飞书拒绝则依次降级
-        # config/去掉 config，始终走 schema 2.0，并保留失败日志与 body 便于定位。
         card_variants = [
             {"schema": "2.0", "config": {"wide_screen_mode": True}, "body": body},
             {"schema": "2.0", "config": {}, "body": body},
@@ -590,11 +671,12 @@ class FeishuBot:
                                 f"系统暂时无法完成本次查询，请稍后重试。\n错误编号：{error_id}")
                 return
             reply = self._build_reply_text(answer, cid)
-            # 优先发互动卡片；卡片失败时兜底发纯文本并记录，保证飞书端能收到结论
+            # 优先发互动卡片；回答含多个表格时已在 _send_markdown 内按段降级，
+            # 这里不再整段重复发送，避免飞书端收到两份内容
             card_ok = self._send_markdown(receive_id, receive_id_type, reply, cid=cid, request_id=request_id)
             if not card_ok:
-                self._send_text(receive_id, receive_id_type, reply)
-                self._log_feishu_event(cid, request_id, "feishu.card.fallback", "interactive card failed -> plain text fallback")
+                self._log_feishu_event(cid, request_id, "feishu.card.fallback",
+                                       "interactive card failed -> handled by per-segment fallback")
             # 数值型结果统一补发一张静态 PNG 图：优先用回答里的 chart 块，没有则从落盘结果自动选图
             self._try_send_chart(cid, request_id, answer, receive_id, receive_id_type)
         except Exception as exc:
