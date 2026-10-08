@@ -14,6 +14,27 @@ from agentTest.langgraph_app.nodes.capture_user_message_node import capture_user
 from agentTest.langgraph_app.tools.registry import ToolSpec, ToolSecurity
 
 
+def _prune_expired_checkpoints():
+    """服务启动时清理超期 checkpoint（天数据 config/settings.get_checkpoint_retention_days）。
+
+    清理失败只打印日志，不阻断服务启动。
+    """
+    try:
+        from agentTest.config.settings import get_checkpoint_retention_days
+        from agentTest.langgraph_app.services.checkpoint_retention import prune_checkpoints
+
+        days = get_checkpoint_retention_days()
+        stats = prune_checkpoints(_CHECKPOINT_DB, retention_days=days)
+        if stats.get("expired"):
+            print(
+                f"[checkpoint] 清理超期对话 {len(stats['expired'])} 个"
+                f"（保留 {days} 天）：删除 checkpoints={stats['deleted_checkpoints']} "
+                f"writes={stats['deleted_writes']} vacuum={stats['vacuumed']}"
+            )
+    except Exception as error:
+        print(f"[checkpoint] 清理超期对话失败（不影响启动）: {error}")
+
+
 def build_supervisor_graph(runtime):
     # execute_query 工具内部内联执行原 Seeker 执行链（方案 B：不再嵌套子图）
     from agentTest.langgraph_app.tools.execute_query_tool import build_execute_query_tool
@@ -40,5 +61,7 @@ def build_supervisor_graph(runtime):
 
     # checkpoint 落盘到本地 sqlite（check_same_thread=False：Flask 后台线程并发访问 checkpoint）
     # 替代内存 MemorySaver：释放内存 + 跨重启保留会话历史
+    # 启动时先按保留天数清理超期对话，防止 checkpoint 只增不减把磁盘占满
+    _prune_expired_checkpoints()
     checkpointer = SqliteSaver(sqlite3.connect(_CHECKPOINT_DB, check_same_thread=False))
     return supervisor.compile(checkpointer=checkpointer)

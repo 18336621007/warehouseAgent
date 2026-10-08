@@ -116,3 +116,11 @@ def get_llm_wire_api() -> str:
 # 简要注释：技能索引披露预算（字符数，仿 Codex 渐进式披露：初始只给 name+description，选中才读全文）。
 def get_skill_index_max_chars() -> int:
     return int(os.getenv("SKILL_INDEX_MAX_CHARS", "4000").strip() or "4000")
+
+
+# 简要注释：Checkpoint 保留天数（与日志 backupCount=14 保持一致），超期对话的 checkpoint 会在服务启动时清理。
+def get_checkpoint_retention_days() -> int:
+    try:
+        return int(os.getenv("CHECKPOINT_RETENTION_DAYS", "14").strip() or "14")
+    except (TypeError, ValueError):
+        return 14
