@@ -24,7 +24,7 @@ class QueryResultSnapshot(TypedDict, total=False):
     source_request_id: str    # 产生该结果的请求 ID
     confirmed_plan: dict      # 当前查询方案（draft/locked/confirmed），不复制全量
     columns: list[str]        # 结果列名
-    preview_rows: list[dict]  # 预览行（数量上限见 persist_result_node）
+    preview_rows: list[dict]  # 预览行（数量上限见 result_store 落盘逻辑）
     row_count: int            # 总行数
     result_summary: str       # 一句话摘要
     entity_keys: list[str]    # 实体键（首个维度字段值），结果追问用

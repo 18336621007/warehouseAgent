@@ -138,7 +138,7 @@ Project/
 │   ├── scripts/             # 运维 / 构建 / 排查脚本
 │   └── tests*               # 单元测试与 SQL 安全守卫专项测试
 ├── web/                     # Flask 服务 + 前端静态资源 + 飞书机器人
-├── docs/                    # 架构、课程、指南、求职等文档
+├── docs/                    # 架构、指南等项目文档
 └── minesweeper/             # 附属小项目
 ```
 
@@ -209,7 +209,7 @@ Hive 表结构
 
 ### Skill（渐进式披露）
 
-- 位置：`agentTest/skills/<name>/`，入口 `SKILL.md`，可带 `references/` 等附属文件。
+- 位置：`agentTest/skills/<name>/`，入口 `SKILL.md`，可带 `references/` 等附属文件；每个 skill 单独一个文件夹，文件夹名即 skill 名称。
 - 模型先看到 skill 的名称与描述，判断相关后再读取正文与引用文件，避免提示词膨胀。
 - 当前用于问数场景的规范约束：回答模板、口径追问、图表选择、数据扩展分析等。
 
@@ -235,10 +235,11 @@ Hive 表结构
 
 ### 安全护栏
 
-- 只读 SQL：仅允许 `SELECT`。
-- 白名单：表必须同时存在于配置与实际元数据中。
+- 只读 SQL：仅允许 `SELECT` / `WITH`；无 LIMIT 时按安全兜底追加。
 - 强制分区过滤：所有参与表都必须带各自的日期分区条件（默认 `pt_dt`）。
-- AST 校验：字段归属、Join 对齐、危险语法拦截（如 `a.pt_dt = b.pt_dt` 不算独立过滤）。
+- AST 校验：表名解析、字段归属、危险语法拦截（`a.pt_dt = b.pt_dt` 只算 Join 对齐，不算过滤）。
+- Join 契约：未配置人工审核的连接关系时不启用 AI 推测。
+- 表级白名单已取消，SQL 能访问哪些表由底层数据库账号权限决定。
 
 ## 六、前端能力
 
@@ -334,7 +335,7 @@ FROM evaluated_dialogues WHERE is_high_quality = 1;
 
 当前部署在服务器 `TM6088`（Ubuntu 22.04）：
 
-- 代码目录：`/opt/gy-data-agent/bd-skills`（分支 `gy-data-agent`）
+- 代码目录：`/opt/gy-data-agent`（分支 `gy-data-agent`）
 - 虚拟环境：`/opt/gy-data-agent/.venv`
 - 服务托管：systemd，服务名 `dataagent`
 - 网页端：`http://10.14.50.4:5000`
@@ -342,7 +343,7 @@ FROM evaluated_dialogues WHERE is_high_quality = 1;
 ### 日常操作
 
 ```bash
-cd /opt/gy-data-agent/bd-skills
+cd /opt/gy-data-agent
 git pull                                             # 更新代码
 
 systemctl start dataagent.service                    # 启动
@@ -385,23 +386,12 @@ grep "feishu.card.failed"  agentTest/logs/langgraph_app.jsonl | tail -20
 grep "feishu.chart.skipped" agentTest/logs/langgraph_app.jsonl | tail -20
 ```
 
-### 双仓库同步（开发机）
-
-`D:\code\Project\test`（开发工作区）与 `D:\code\gy-data-agent\bd-skills`（部署源）两份代码必须保持一致：
-
-```powershell
-(Get-FileHash D:\code\Project\test\web\server.py -Algorithm MD5).Hash
-(Get-FileHash D:\code\gy-data-agent\bd-skills\web\server.py -Algorithm MD5).Hash
-```
-
-不一致时以 `bd-skills` 为部署源覆盖并重启服务。
-
 完整步骤见 [服务器部署与维护](docs/指南/服务器部署与维护.md)。
 
 ## 九、文档索引
 
 - [文档索引（全部文档入口）](docs/文档索引.md)
-- [多智能体 Text2SQL 系统架构](docs/架构/多智能体Text2SQL系统架构文档.md)
+- [Text2SQL 系统架构](docs/架构/Text2SQL系统架构文档.md)
 - [State 与记忆系统架构](docs/架构/State与记忆系统架构.md)
 - [语义层架构（权威口径层）](docs/架构/语义层架构.md)
 - [元数据与向量检索架构](docs/架构/元数据与向量检索架构.md)
@@ -409,4 +399,3 @@ grep "feishu.chart.skipped" agentTest/logs/langgraph_app.jsonl | tail -20
 - [多数据源架构（Hive / Doris / Trino）](docs/架构/多数据源架构.md)
 - [日志使用与问题排查指南](docs/指南/日志使用与问题排查指南.md)
 - [服务器部署与维护](docs/指南/服务器部署与维护.md)
-- [求职材料：项目面试问题与参考答案](docs/求职/项目面试问题与参考答案.md)

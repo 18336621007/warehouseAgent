@@ -2,7 +2,6 @@
 from agentTest.tests_guardrails.test_execution_guardrails import run_execution_guardrails_tests
 from agentTest.tests_guardrails.test_sql_ast_guardrails import run_sql_ast_guardrails_tests
 from agentTest.tests_guardrails.test_sql_query_tool_guardrails import run_sql_query_tool_guardrails_tests
-from agentTest.tests_guardrails.test_validate_sql_node import run_validate_sql_node_tests
 
 
 def run_guardrails_all_tests():
@@ -15,10 +14,6 @@ def run_guardrails_all_tests():
     total_count += count
 
     passed, count = run_sql_query_tool_guardrails_tests()
-    total_passed += passed
-    total_count += count
-
-    passed, count = run_validate_sql_node_tests()
     total_passed += passed
     total_count += count
 

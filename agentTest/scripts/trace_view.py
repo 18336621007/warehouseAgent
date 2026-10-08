@@ -42,12 +42,9 @@ KEY_BY_EVENT = {
     "node.degraded": ["error_message", "ms"],
     "node.event": ["message"],
     "node.detail": ["message"],
-    "route.decided": ["decision", "completeness", "plan_status", "has_confirmed_plan"],
     "state.changed": ["field", "previous", "current"],
     "tools.called": ["tools"],
     "example.retrieved": ["hit_count", "top_sim", "top_question", "hint"],
-    "plan.locked": ["table", "measures", "dimensions", "order_by", "result_limit"],
-    "advisor.mode": ["mode", "completeness"],
     "metric_ambiguity.detected": ["mention", "candidate_count"],
     "metric_resolution.user_required": ["mentions"],
     "metric_resolution.completed": ["mention", "field", "source"],
@@ -59,7 +56,6 @@ KEY_BY_EVENT = {
     "llm.error": ["model", "error_message", "ms"],
     "candidate_recall": ["mention", "table_scope_count", "raw_candidates", "ranked_candidates"],
     "candidate_rerank.selected": ["mention", "selected_fields"],
-    "search.scores": ["layer", "scores"],
 }
 
 
@@ -319,7 +315,7 @@ def _leaf_text(ev, full, color):
         event_show = colorize(event, "red", color)
     elif event in ("node.degraded",):
         event_show = colorize(event, "yellow", color)
-    elif event in ("plan.locked", "metric_resolution.completed"):
+    elif event == "metric_resolution.completed":
         event_show = colorize(event, "green", color)
     else:
         event_show = event
@@ -389,7 +385,7 @@ def cmd_list(events, limit, color):
             "",
         )
         route = next(
-            (e.get("decision", "") for e in evs if e.get("event") == "route.decided"),
+            (e.get("route", "") for e in evs if e.get("event") == "node.completed" and e.get("route")),
             "",
         )
         locked = any(

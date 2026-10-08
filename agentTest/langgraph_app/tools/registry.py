@@ -8,8 +8,8 @@ from typing import Any, List, Optional, Tuple
 class ToolSecurity:
     """工具安全元数据：只读 / 行数上限 / 是否仅限白名单表。
 
-    M1 仅做声明，校验逻辑仍在上层（validate_sql_node / sql_safety_validator /
-    execute_sql_node）执行，后续阶段再逐步收敛到安全层。
+    M1 仅做声明，实际校验在 sql_query_{engine} 工具内执行
+    （只读 / LIMIT / 分区过滤 / AST 校验），注册表只负责声明安全属性。
     """
     read_only: bool = True
     row_limit: int = 0  # 0 表示不限制（由上层 SQL 校验兜底）

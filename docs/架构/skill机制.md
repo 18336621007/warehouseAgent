@@ -95,7 +95,7 @@ scope: [planner]                        # 注入范围：planner（当前仅 pla
 
 - `skill.matched`：本次披露了哪些技能（`name` 列出全部、`hit_count`、`mode=progressive_disclosure`）。
 - `tools.called`：实际调用的工具，确认模型是否自主调了 `read_skill`（再配合 `search_semantic` / `query_stored_result` 判断整体走向）。
-- `semantic.match` / `search.scores`：语义层命中与 RAG 召回情况。
+- `tools.called`：本轮调用了哪些工具（含语义层检索与查数）。
 - 组合以上事件可审计「这次走了 skill / 语义层 / RAG / 落盘结果」。
 
 ## 九、演进记录

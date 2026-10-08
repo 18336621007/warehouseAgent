@@ -62,43 +62,6 @@ class DraftPlanSimplificationTest(unittest.TestCase):
         self.assertIn("company_name", covered)
         self.assertEqual(validate_query_plan(draft), [])
 
-    def test_fallback_sql_supports_detail_select_fields(self):
-        from agentTest.langgraph_app.nodes.generate_sql_node import _build_fallback_sql
-        plan = {
-            "detail_query": True,
-            "table": "ads_trip.ads_gundam_device_return_detail_hour",
-            "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
-            "select_fields": ["goods_no", "company_name"],
-            "time_field": "create_time",
-            "time_range": "昨天",
-            "filters": "region_name = '徐州大区'",
-            "measures": [],
-            "dimensions": [],
-            "result_limit": 1000,
-        }
-        sql = _build_fallback_sql(plan)
-        self.assertIn("SELECT goods_no, company_name", sql)
-        self.assertIn("WHERE", sql)
-        self.assertNotIn("GROUP BY", sql)
-
-    def test_fallback_sql_supports_detail_any_time_in_filters(self):
-        # 明细查询时间条件唯一在 filters 原文（程序不生成日期），任何时间范围都用 filters 构造
-        from agentTest.langgraph_app.nodes.generate_sql_node import _build_fallback_sql
-        plan = {
-            "detail_query": True,
-            "table": "ads_trip.ads_gundam_device_return_detail_hour",
-            "tables": ["ads_trip.ads_gundam_device_return_detail_hour"],
-            "select_fields": ["goods_no"],
-            "filters": "create_time >= '2026-01-01' AND create_time <= '2026-12-31'",
-            "measures": [],
-            "dimensions": [],
-            "result_limit": 1000,
-        }
-        sql = _build_fallback_sql(plan)
-        self.assertIn("SELECT goods_no", sql)
-        self.assertIn("create_time >= '2026-01-01'", sql)
-        self.assertNotIn("GROUP BY", sql)
-
 
 if __name__ == "__main__":
     unittest.main()

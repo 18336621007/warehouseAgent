@@ -1,316 +1,94 @@
-# Planner 检索阈值与观测指标校准指南
+# Planner 检索阈值与澄清策略指南
 
-> 最后更新：2026-08-13
-> 设计状态：候选数量仅作观测指标，已取消强制路由
-> ⚠️ 注（2026-09-17）：文中 Advisor 门禁与 `submit_query_plan` 流程已随 M4 单 Agent 改造删除（澄清由 Planner respond 承担），阈值校准结论仍适用。  
+> 最后更新：2026-10-08
 > [返回文档索引](../文档索引.md)
+
+本文说明 Planner 在"定位口径"这件事上的判定方式、可调参数与观测指标。当前架构见 [Text2SQL 系统架构文档](../架构/Text2SQL系统架构文档.md)。
 
 ## 一、设计结论
 
-Planner 的表级和字段级向量检索用于向 LLM 提供元数据证据，并帮助研发人员观察召回质量。
+**阈值只用于候选排序与观测，不用于硬门禁。**
 
-以下两个配置继续保留：
+- 语义层检索负责"给出候选与证据"；
+- Planner 负责"结合对话判断口径是否唯一、是否需要澄清"；
+- SQL 安全与字段正确性由程序做确定性校验。
 
-```python
-HIGH_SIMILARITY_THRESHOLD = 0.65
-MAX_HIGH_SIMILARITY_COUNT = 3
-```
+不把相似度分数直接翻译成"必须澄清"，是因为向量空间的相关性 ≠ 业务歧义：用户已明确选择某个口径后，同类字段仍可能保持高相似，硬门禁会导致重复追问同一件事。
 
-但它们的定位调整为：
-
-```text
-检索观测指标
-而不是
-业务完整度硬门禁
-```
-
-高相似候选数量不再直接把 LLM 已判定的 `completeness=full` 改成 `partial`。
-
-## 二、为什么删除候选数量硬规则
-
-候选数量只能说明向量空间中存在多个相关项，不能直接证明用户业务需求仍然模糊。
-
-例如用户询问“回流订单”，Advisor 给出多个候选后，用户明确选择 `reflow_addition_order`。即使用户已经解决歧义，以下字段仍可能同时具有较高相似度：
+## 二、检索顺序
 
 ```text
-reflow_addition_order
-extend_reflow_new_order
-extend_reflow_old_order
-reflow_addition_month_order
+1. 语义层（grep_semantic → read_metric）
+     命中唯一且口径明确 → 直接进入 SQL 生成
+2. RAG 双路召回（BM25 + 向量，仅 ENABLE_RAG=true）
+     语义层未覆盖时补充候选表/字段
+3. 仍未唯一 → Planner 输出澄清文案，或如实告知无法查询
 ```
 
-如果程序只按高相似字段数量判断，用户选择后仍会被强制退回 Advisor，形成重复追问。
+`ENABLE_RAG=false` 时第 2 步跳过，检索类工具安全返回空结果，系统表现为"只认语义层"。
 
-因此需要区分：
+## 三、相似度候选的使用边界
 
-- **检索相关性**：向量库返回了哪些相近元数据。
-- **业务歧义**：结合对话后，用户是否仍未明确业务口径。
+| 使用方式 | 是否允许 | 说明 |
+|---|---|---|
+| 候选排序 | ✅ | 相似度用于把更可能的候选排在前面 |
+| 日志观测与离线调参 | ✅ | 统计误召回、字段注释质量、同义词覆盖 |
+| 直接决定是否澄清 | ❌ | 澄清与否由 Planner 结合对话语义判断 |
+| 覆盖用户已明确选择的口径 | ❌ | 用户已确认的口径优先 |
 
-前者是证据，后者才决定是否澄清。
+## 四、可调参数
 
-## 三、调整后的门禁链路
+| 位置 | 参数 | 默认 | 说明 |
+|---|---|---|---|
+| `config/planner.py` | `TABLE_SEARCH_K` | 10 | 表级检索数量 |
+| | `COLUMN_SEARCH_K` | 15 | 字段检索数量 |
+| | `PER_TABLE_COLUMN_QUOTA` | 4 | 每张召回表进入候选的字段上限 |
+| | `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 高相似候选统计阈值（仅观测） |
+| | `MAX_HIGH_SIMILARITY_COUNT` | 3 | 高相似候选告警基线（仅观测） |
+| `config/advisor.py` | `SEARCH_DB_K` / `SEARCH_TABLE_K` / `SEARCH_COLUMN_K` | 3 / 3 / 5 | RAG 分层检索数量 |
+| | `MIN_CANDIDATE_SCORE` | 0.5 | 候选相似度下限，低于该分视为不相关 |
+| | `MAX_AMBIGUITY_CANDIDATES` | 6 | 澄清候选数量上限 |
+| | `RERANK_MIN_CANDIDATES` | 2 | 多候选精选下限 |
 
-```text
-用户问题和对话上下文
-    ↓
-表级、字段级向量召回
-    ↓
-Planner LLM 判断 full/partial/none
-    ↓
-partial/none → Advisor 检索并追问用户（门禁拦截未确认口径）
-full/已解决歧义 → Advisor submit_query_plan + lock_query_plan
-    ↓
-search_columns 核对真实字段
-    ↓
-submit_query_plan + lock_query_plan
-    ↓
-用户确认
-    ↓
-confirm_query_plan
-    ↓
-Seeker 精确执行
+> `config/advisor.py` 现仅作为检索常量配置，Advisor 节点已随单 Agent 改造删除。
+
+## 五、调参方法
+
+**先看日志，再动阈值。**
+
+```bash
+# 看本轮调用了哪些工具（语义层 grep/read 还是 RAG search_*）
+python agentTest/scripts/trace_view.py filter --event tools.called --request <request_id前缀>
+
+# 看 Planner 的输入输出（命中的指标与口径）
+python agentTest/scripts/trace_view.py prompt <request_id前缀> --caller planner
+
+# 按耗时排序找慢请求
+python agentTest/scripts/trace_view.py slow --top 10
 ```
 
-安全性不再依赖候选数量硬规则，而由以下机制保证：
-
-1. Planner 结构化输出。
-2. Advisor 澄清模式和方案模式的工具隔离。
-3. 目标表字段检索校验。
-4. QueryPlan 结构校验。
-5. `locked → confirmed` 两阶段确认。
-6. Seeker 只执行 `confirmed` 方案。
-
-## 四、配置项的新含义
-
-| 配置 | 当前值 | 调整后用途 |
-|---|---:|---|
-| `TABLE_SEARCH_K` | 10 | 提供给 Planner 的表级候选数量（先召回表） |
-| `COLUMN_SEARCH_K` | 15 | 单表内字段检索 k 与全局兜底检索 k |
-| `PER_TABLE_COLUMN_QUOTA` | 4 | 每张召回表最多进入候选的字段数 |
-| `HIGH_SIMILARITY_THRESHOLD` | 0.65 | 统计高相似候选的观测阈值 |
-| `MAX_HIGH_SIMILARITY_COUNT` | 3 | 历史告警基线，用于识别候选过宽场景 |
-| `EXAMPLE_SIMILARITY_THRESHOLD` | 0.7 | 历史优质示例最低采用相似度 |
-
-`MAX_HIGH_SIMILARITY_COUNT` 后续可以重命名为更符合观测语义的名称，例如：
-
-```python
-HIGH_SIMILARITY_COUNT_ALERT_THRESHOLD = 3
-```
-
-在代码尚未重命名前，文档统一按“观测基线”理解。
-
-## 五、日志字段
-
-Planner 完成日志保留：
-
-```text
-high_sim_tables
-high_sim_columns
-completeness
-route
-reason
-```
-
-示例：
-
-```json
-{
-  "event": "node.completed",
-  "node": "planner",
-  "completeness": "full",
-  "high_sim_tables": 0,
-  "high_sim_columns": 6,
-  "route": "advisor"
-}
-```
-
-这个结果不矛盾：
-
-- `high_sim_columns=6` 表示存在多个语义相关字段。
-- `completeness=full` 表示结合对话后，用户已经唯一确定所需字段。
-- `route=advisor` 表示还需要 Advisor 形成并展示 `locked` 方案，而不是继续澄清。
-
-日志查询方法见 [日志使用与问题排查指南](./日志使用与问题排查指南.md)。
-
-## 六、应该观察哪些指标
-
-### 6.1 澄清率
-
-```text
-Advisor澄清请求数 / 全部问数请求数
-```
-
-过高可能表示：
-
-- 元数据描述不完整。
-- Planner Prompt 过度保守。
-- 同义词和业务知识缺失。
-- 检索候选噪声过大。
-
-### 6.2 重复追问率
-
-```text
-用户已经选择具体候选后，Advisor再次询问相同口径的比例
-```
-
-该指标比“高相似候选数量”更能反映真实交互问题。
-
-### 6.3 locked 方案形成率
-
-```text
-Advisor plan模式中 locked=True 的请求数
-/
-Advisor plan模式请求数
-```
-
-如果 Planner 输出 `full`，但 Advisor 经常 `locked=False`，应检查：
-
-- Planner→Advisor State 字段是否正确透传。
-- Plan Agent 是否真正绑定了 `submit_query_plan`。
-- Agent 是否调用了 `search_columns`。
-- 工具协议重试是否生效。
-
-### 6.4 首次方案接受率
-
-```text
-用户第一次看到 locked 方案后直接确认的比例
-```
-
-该指标反映方案质量和业务语言表达能力。
-
-### 6.5 检索覆盖率
-
-检查成功问数中，真实目标表和字段是否出现在 Top-K 候选中。
-
-如果正确目标经常不在 Top-K，应调整：
-
-- 元数据描述。
-- Embedding 模型。
-- 检索问题构造。
-- `TABLE_SEARCH_K/COLUMN_SEARCH_K`。
-
-不应该通过增加硬门禁解决召回缺失。
-
-## 七、调参方法
-
-### 7.1 调整 Top-K
-
-提高 Top-K：
-
-- 优点：降低目标元数据漏召回概率。
-- 风险：Prompt 更长，噪声更多。
-
-降低 Top-K：
-
-- 优点：上下文更短、更聚焦。
-- 风险：可能漏掉正确口径。
-
-建议先分析成功和失败请求的日志，再调整 Top-K，不根据单个案例修改。
-
-### 7.2 调整 HIGH_SIMILARITY_THRESHOLD
-
-阈值降低会让更多候选被计入高相似统计；阈值提高会让统计更加严格。
-
-调整后只影响观测数据和告警，不应改变业务路由。
-
-### 7.3 调整告警基线
-
-当 `high_sim_columns` 长期高于基线时，应排查：
-
-- 字段描述是否过于相同。
-- 是否缺少业务口径说明。
-- 字段粒度和业务域是否需要加入检索过滤。
-- 是否应该先锁定目标表，再统计表内字段候选。
-
-告警的作用是提醒研发优化元数据，不是自动否决用户已经明确的选择。
-
-## 八、代码待办
-
-当前 `planner_node.py` 仍存在类似逻辑：
-
-```python
-elif has_excessive_candidates:
-    completeness = "partial"
-    route = "advisor"
-```
-
-下一次代码改造需要：
-
-1. 删除该分支对 `completeness` 和路由的覆盖。
-2. 保留高相似候选数量计算。
-3. 保留 `high_sim_tables/high_sim_columns` 日志。
-4. 根据需要将 `MAX_HIGH_SIMILARITY_COUNT` 重命名为告警阈值。
-5. 同步修复 Planner→Advisor Handoff State，避免 Planner 的 `full` 在子图入口丢失。
-
-## 九、验收场景
-
-### 场景一：首次问题确实模糊
-
-用户：
-
-```text
-昨天新增订单多少？
-```
-
-Planner 无法唯一确定指标字段，应返回 `partial`，进入 Advisor 澄清。
-
-### 场景二：用户选择具体口径
-
-Advisor 给出多个指标，用户选择其中一个。
-
-Planner 能结合上下文还原唯一字段时应返回 `full`。即使日志中的 `high_sim_columns` 大于告警基线，也不应再次询问相同口径。
-
-### 场景三：向量候选很多但业务问题明确
-
-用户直接使用准确业务名或字段名，且目标表字段能够唯一映射。
-
-候选数量只记录日志，不改变 `full`。
-
-### 场景四：LLM错误判断为full
-
-即使 Planner 误判，Advisor 仍必须：
-
-- 检索目标表字段。
-- 形成完整 QueryPlan。
-- 通过领域校验。
-- 展示方案并等待用户最终确认。
-
-因此删除候选数量硬规则不会让请求直接绕过 Advisor 和用户确认进入 Seeker。
-
-## 十、面试表达
-
-项目早期使用“高相似候选数超过阈值就强制澄清”的硬规则保护 Text2SQL，但线上日志发现用户明确选择字段后，其他同类字段仍会保持较高向量相似度，导致重复追问。我将候选数量从业务门禁调整为可观测指标：向量检索负责提供证据，Planner 负责结合对话判断完整度，Advisor 和 QueryPlan 负责领域校验，用户确认负责最终授权。这样既保留检索质量监控，又避免把向量空间中的相关性误当成业务歧义。
-
-## 十一、当前校准策略
-
-### 10.1 completeness 只做初步判断
-
-当前不再使用候选数量决定硬路由。Planner 的 `full/partial/none` 用于描述进入 Advisor 前的理解程度，Advisor 可以在本轮工具检索后更新事实状态：
-
-- 仍有多个有效业务口径：继续澄清。
-- 用户已回答上一轮关键问题，剩余字段唯一：同轮提交 QueryPlan。
-- Planner 判 full 但 Advisor 未调用 `submit_query_plan`：视为协议异常，不能展示伪锁定方案。
-
-### 10.2 推荐观测指标
-
-- `planner.completeness` 分布。
-- Advisor 平均澄清轮次。
-- 从用户解决最后一个歧义到生成 locked_plan 的额外轮次，目标值为 0。
-- locked_plan 到 confirmed 的轮次，正常值为 1。
-- SQL 首次满足逐表过滤规则的比例。
-- 确定性过滤修复触发率和成功率。
-
-### 10.3 当前阈值定位
-
-向量相似度用于候选排序、日志分析和离线调参，不直接覆盖 LLM 与程序契约判断。调优时应优先分析误召回、字段注释质量和业务同义词，而不是通过提高阈值掩盖元数据缺陷。
-## 十二、候选选择优先级（模型判断 + 白名单校验，去 pending 后）
-
-Planner 的相似度阈值、候选数量和 `completeness` 不能覆盖当轮候选选择：
-
-1. 用户本轮输入与【完整对话历史】一起进入 Planner LLM，由模型判断 `user_selection`；候选由当轮 `MetricClarificationService` 固化在澄清文案中。
-2. 程序 `validate_user_selection` 白名单校验：`field` 逐字命中候选集合，通过后生成 `explicit_user`。
-3. 模型未选择（询问解释、闲聊、补充条件）时不视为已选择，进入下一轮澄清。
-4. 后续召回顺序变化只能影响新候选，不能改变已展示 options 的编号语义。
-5. 去 pending 状态机后不再跨轮固化候选快照；隔数轮回复"第二个"由 Planner 结合对话历史还原，程序校验命中候选集合。
-
-该原则适用于所有指标/维度候选类型。
+排查顺序：
+
+1. **误召回**：候选里混进了不该出现的表/字段 → 优先修语义层字段注释、补充业务同义词，而不是调高阈值掩盖问题。
+2. **漏召回**：正确的指标没被检索到 → 检查语义层是否收录、关键词是否能命中。
+3. **重复澄清**：用户已明确选择仍被追问 → 检查 Planner 是否读到完整对话历史。
+
+## 六、观测指标
+
+| 指标 | 含义 | 期望 |
+|---|---|---|
+| 语义层命中率 | 问数请求中出现 `grep_semantic` + `read_metric` 的比例 | 越高越好，未命中说明语义层覆盖不足 |
+| 澄清请求占比 | 需要向用户追问的请求比例 | 与业务口径复杂度相关，突增需排查 |
+| 重复澄清率 | 用户已选择口径后仍被追问的比例 | 应为 0 |
+| SQL 首次校验通过率 | 第一次提交即通过安全校验的比例 | 越高说明模型生成质量越好 |
+| 端到端耗时 | 请求总耗时 | 关注多指标长查询的尾部耗时 |
+
+## 七、验收场景
+
+改动检索或提示词后，至少覆盖：
+
+1. 语义层唯一命中的单指标查询 —— 应直接出结果，不追问。
+2. 存在多口径的指标（如"推广订单数"）—— 应澄清，且候选数量正确。
+3. 用户隔轮回复选项编号 —— 应能正确还原并继续查询。
+4. 语义层未收录的指标 —— 应如实告知无法查询，不编造。
+5. 0 行结果 —— 应探查取值或说明原因，不伪造数据。

@@ -35,9 +35,6 @@ _EVENT_CATEGORY = {
     "llm.call": "llm",
     "llm.response": "llm",
     "llm.error": "llm",
-    "route.decided": "plan",
-    "plan.locked": "plan",
-    "advisor.mode": "plan",
     "metric_ambiguity.detected": "metric",
     "metric_resolution.user_required": "metric",
     "metric_resolution.completed": "metric",
@@ -45,7 +42,6 @@ _EVENT_CATEGORY = {
     "candidate_rerank.selected": "metric",
     "example.retrieved": "search",
     "tools.called": "search",
-    "search.scores": "search",
 }
 
 # 当前请求内的 LLM 调用计数（跨线程共享）：LLM 调用可能在子线程执行，
@@ -355,16 +351,6 @@ def log_node_event(node_name, message):
     )
 
 
-def log_route_decision(route_name, **kwargs):
-    # 记录路由器的最终分支选择
-    _write_log(
-        logging.INFO,
-        "route.decided",
-        node_name=route_name,
-        **kwargs,
-    )
-
-
 def log_user_input(message):
     # 记录CLI用户输入，限制长度避免保存过多敏感内容
     _write_log(
@@ -488,19 +474,6 @@ def log_state_change(
     )
 
 
-def log_metric_event(event, **kwargs):
-    """指标/语义层结构化日志，event 为 metric_ambiguity.detected / semantic.match 等稳定事件名。
-    默认归属 metric_ambiguity 节点，可通过 node_name 覆盖（如 planner / advisor）。"""
-    node_name = kwargs.pop("node_name", "metric_ambiguity")
-    _write_log(
-        logging.INFO,
-        event,
-        node_name=node_name,
-        category="metric",
-        **kwargs,
-    )
-
-
 def log_tools_called(node_name, tools):
     # 记录节点本轮实际调用的工具列表，替代自由文本“本轮工具调用”
     _write_log(
@@ -538,31 +511,6 @@ def log_skill_event(node_name, name, hit_count, **kwargs):
         **kwargs,
     )
 
-
-def log_plan_locked(node_name, table, measures, dimensions, order_by=None, result_limit=1000, table_plans=None):
-    # 记录最终锁定的查询方案，替代自由文本 locked_plan 摘要
-    _write_log(
-        logging.INFO,
-        "plan.locked",
-        node_name=node_name,
-        table=table,
-        measures=measures,
-        dimensions=dimensions,
-        order_by=order_by or [],
-        result_limit=result_limit,
-        table_plans=table_plans or [],
-    )
-
-
-def log_advisor_mode(node_name, mode, completeness):
-    # 记录 Advisor 本轮运行模式与 Planner 模糊度
-    _write_log(
-        logging.INFO,
-        "advisor.mode",
-        node_name=node_name,
-        mode=mode,
-        completeness=completeness,
-    )
 
 def _current_request_id():
     # 返回当前日志上下文的 request_id，无上下文返回空串
@@ -767,19 +715,3 @@ def log_llm_error(caller, model, error, ms, call_id="", **extra):
     )
 
 
-def log_search_scores(node_name, layer, scores):
-    # 记录检索评分列表（结构化），替代原来的自由文本表/字段评分
-    _write_log(
-        logging.INFO,
-        "search.scores",
-        node_name=node_name,
-        category="search",
-        layer=layer,
-        scores=[
-            {
-                "name": _short_text(item.get("name", ""), max_length=80),
-                "score": item.get("score", 0),
-            }
-            for item in (scores or [])
-        ],
-    )
