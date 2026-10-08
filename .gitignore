@@ -82,3 +82,4 @@ agentTest/logs/
 /package-lock.json
 /docs/给Cursor的改造指令_Advisor语义层对齐.md
 /agentTest/query_results/
+/agentTest/skills/gy-offline-nlq/
