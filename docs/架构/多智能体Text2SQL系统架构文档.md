@@ -401,7 +401,7 @@ Web 端采用 SSE（Server-Sent Events）实现 ChatGPT 式逐字输出：LangGr
 
 ## 八、入口命令
 
-启动与常用命令统一见 [README 快速开始与常用操作](../README.md)，避免命令清单多份维护导致与最新操作（如 `sync_metadata` 一键同步）不一致。
+启动与常用命令统一见 [README 快速开始与常用操作](../../README.md)，避免命令清单多份维护导致与最新操作（如 `sync_metadata` 一键同步）不一致。
 
 ---
 
