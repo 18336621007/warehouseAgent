@@ -5,6 +5,8 @@
 #       不依赖 MySQL、不需要改表结构，也不依赖文件 mtime。
 import datetime
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 # UUIDv1/v6 时间基准：1582-10-15 00:00:00 UTC，单位 100 纳秒
@@ -12,6 +14,18 @@ _UUID_EPOCH_OFFSET_SECONDS = 12219292800
 
 # 单次 DELETE 的线程数上限：SQLite 变量数有上限（默认 999），分批更稳妥
 _DELETE_BATCH = 400
+
+# 默认 checkpoint 库路径：agentTest/langgraph_app/cache/checkpoints.db
+DEFAULT_CHECKPOINT_DB = str(Path(__file__).resolve().parents[1] / "cache" / "checkpoints.db")
+
+# 按需清理的节流状态：扫描与 VACUUM 分开计时（VACUUM 会重写整库并短暂锁库，必须节制）
+_THROTTLE_LOCK = threading.Lock()
+_last_prune_at = 0.0
+_last_vacuum_at = 0.0
+
+# 默认节流参数：扫描 30 分钟一次；VACUUM 每天最多一次
+DEFAULT_MIN_INTERVAL_SECONDS = 1800
+DEFAULT_VACUUM_MIN_INTERVAL_SECONDS = 86400
 
 
 def parse_checkpoint_time(checkpoint_id: str):
@@ -67,11 +81,11 @@ def find_expired_threads(db_path, retention_days: int):
     return sorted(expired, key=lambda item: item[1])
 
 
-def prune_checkpoints(db_path, retention_days: int = 14, dry_run: bool = False) -> dict:
-    """删除超过保留天数的对话及其 checkpoint，并回收磁盘空间。
+def prune_checkpoints(db_path, retention_days: int = 14, dry_run: bool = False, vacuum: bool = True) -> dict:
+    """删除超过保留天数的对话及其 checkpoint，并按需回收磁盘空间。
 
     返回统计信息：{scanned, expired, deleted_writes, deleted_checkpoints, vacuumed}。
-    dry_run=True 时只统计不删除。
+    dry_run=True 时只统计不删除；vacuum=False 时删除后不做 VACUUM（供高频调用路径使用）。
     """
     path = Path(db_path)
     result = {
@@ -123,12 +137,48 @@ def prune_checkpoints(db_path, retention_days: int = 14, dry_run: bool = False) 
             ).rowcount
         conn.commit()
 
-        # VACUUM 真正回收文件空间（同时会把 -wal 合并回主库）
-        try:
-            cursor.execute("VACUUM")
-            result["vacuumed"] = True
-        except sqlite3.Error:
-            pass
+        # VACUUM 真正回收文件空间（同时会把 -wal 合并回主库）；调用方可按需关闭
+        if vacuum:
+            try:
+                cursor.execute("VACUUM")
+                result["vacuumed"] = True
+            except sqlite3.Error:
+                pass
         return result
     finally:
         conn.close()
+
+
+def maybe_prune_checkpoints(
+    db_path: str = None,
+    retention_days: int = 14,
+    min_interval_seconds: int = DEFAULT_MIN_INTERVAL_SECONDS,
+    vacuum_min_interval_seconds: int = DEFAULT_VACUUM_MIN_INTERVAL_SECONDS,
+    force: bool = False,
+) -> dict:
+    """按需清理（带节流）：供"每次请求结束"这类高频调用点使用。
+
+    - 距上次扫描不足 min_interval_seconds 时直接跳过，避免每个请求都扫表；
+    - VACUUM 额外按 vacuum_min_interval_seconds 节流（重操作，不能每次做）；
+    - force=True 时忽略节流，用于服务启动或手工调用。
+    任何异常都吞掉，返回带 skipped/error 信息的统计字典，绝不影响主流程。
+    """
+    global _last_prune_at, _last_vacuum_at
+
+    target = db_path or DEFAULT_CHECKPOINT_DB
+    now = time.time()
+    try:
+        with _THROTTLE_LOCK:
+            if not force and (now - _last_prune_at) < min_interval_seconds:
+                return {"skipped": True, "reason": "throttled", "db_path": str(target)}
+            do_vacuum = force or (now - _last_vacuum_at) >= vacuum_min_interval_seconds
+        stats = prune_checkpoints(target, retention_days=retention_days, vacuum=do_vacuum)
+        with _THROTTLE_LOCK:
+            _last_prune_at = now
+            if stats.get("vacuumed"):
+                _last_vacuum_at = now
+        stats["skipped"] = False
+        return stats
+    except Exception as error:
+        # 清理是旁路能力，失败不能影响查询主流程
+        return {"skipped": False, "error": str(error), "db_path": str(target)}

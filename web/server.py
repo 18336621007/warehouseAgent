@@ -939,6 +939,14 @@ def chat():
                 ACTIVE_REQUESTS.pop(conversation_id, None)
             broadcast_conversations()
 
+            # 请求结束：按节流策略清理超期 checkpoint（不依赖服务重启）
+            # 扫描默认 30 分钟一次、VACUUM 每天最多一次；失败只吞掉，不影响回答返回
+            try:
+                from agentTest.langgraph_app.services.checkpoint_retention import maybe_prune_checkpoints
+                maybe_prune_checkpoints()
+            except Exception:
+                pass
+
 
     def generate_with_log_context():
         # 为本次流式请求绑定独立日志上下文，避免并发日志相互混淆

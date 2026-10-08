@@ -21,10 +21,11 @@ def _prune_expired_checkpoints():
     """
     try:
         from agentTest.config.settings import get_checkpoint_retention_days
-        from agentTest.langgraph_app.services.checkpoint_retention import prune_checkpoints
+        from agentTest.langgraph_app.services.checkpoint_retention import maybe_prune_checkpoints
 
         days = get_checkpoint_retention_days()
-        stats = prune_checkpoints(_CHECKPOINT_DB, retention_days=days)
+        # force=True：启动这次不受节流限制，同时刷新节流时间，避免启动后立刻又扫一次
+        stats = maybe_prune_checkpoints(db_path=_CHECKPOINT_DB, retention_days=days, force=True)
         if stats.get("expired"):
             print(
                 f"[checkpoint] 清理超期对话 {len(stats['expired'])} 个"
